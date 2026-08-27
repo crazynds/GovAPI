@@ -1,0 +1,410 @@
+"""Pipeline de importacao: baixa -> descompacta -> apaga zip -> importa pra
+staging -> apaga CSV, um arquivo por vez (evita acumular todos os zips/CSVs
+de um grupo em disco ao mesmo tempo). Staging usa UPSERT (ON CONFLICT) com
+unique constraint em cnpj_basico -- ja chega deduplicada, então o JOIN final
+não precisa de DISTINCT ON/window function (caro numa tabela de dezenas de
+milhões de linhas). Progresso é gravado em import_progress a cada lote, e
+lido por GET /import/status."""
+
+import os
+import shutil
+import time
+import zipfile
+from datetime import datetime, timezone
+
+import httpx
+from sqlalchemy import text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.orm import Session
+
+from app.config import settings
+from app.db import SessionLocal
+from app.importer import client
+from app.importer.csv_reader import read_csv
+from app.importer.phone import parse as parse_phone
+from app.models import (
+    Cnae,
+    EmpresaStaging,
+    EstabelecimentoStaging,
+    ImportLog,
+    ImportProgress,
+    Municipio,
+    SimplesStaging,
+)
+
+GROUPS = ["reference", "simples", "empresas", "estabelecimentos"]
+
+STEP_PREFIXES = {
+    "reference": ["Cnaes", "Municipios"],
+    "simples": ["Simples"],
+    "empresas": ["Empresas"],
+    "estabelecimentos": ["Estabelecimentos"],
+}
+
+MAX_LENGTHS = {
+    "cnpj_basico": 8,
+    "cnpj_ordem": 4,
+    "cnpj_dv": 2,
+    "identificador_matriz_filial": 1,
+    "situacao_cadastral": 2,
+    "uf": 2,
+    "ddd_1": 4,
+    "opcao_simples": 1,
+    "opcao_mei": 1,
+    "porte_empresa": 2,
+}
+
+MAX_ATTEMPTS_PER_FILE = 3
+BATCH_SIZE = 2000
+
+
+def files_for_group(files: list[str], group: str) -> list[str]:
+    prefixes = STEP_PREFIXES[group]
+    return sorted(f for f in files if any(f.startswith(p) for p in prefixes))
+
+
+def run_import(period: str | None = None, only: list[str] | None = None) -> None:
+    db = SessionLocal()
+    try:
+        resolved_period = period or client.discover_latest_period()
+        all_files = client.list_files(resolved_period)
+        groups = [g for g in GROUPS if not only or g in only]
+        run_build = not only or "build" in only
+
+        _set_progress(db, period=resolved_period, status="running", message="iniciando")
+
+        for group in groups:
+            for file in files_for_group(all_files, group):
+                _process_file(db, resolved_period, group, file)
+
+        if run_build:
+            _build_final_table(db, resolved_period)
+
+        _set_progress(db, status="success", message="importação concluída")
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()  # sem isso, a sessão fica com a transação abortada e
+        # o próprio registro de falha abaixo falharia, mascarando o erro real.
+        _set_progress(db, status="failed", message=str(exc)[:255])
+        raise
+    finally:
+        db.close()
+
+
+def _process_file(db: Session, period: str, group: str, file: str) -> None:
+    if _already_imported(db, period, file):
+        _set_progress(db, period=period, group=group, current_file=file, step="skip", message="já importado")
+        return
+
+    period_dir = os.path.join(settings.download_dir, period)
+    os.makedirs(period_dir, exist_ok=True)
+    zip_path = os.path.join(period_dir, file)
+    csv_path = os.path.join(period_dir, file.removesuffix(".zip") + ".csv")
+
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            _download(db, period, group, file, zip_path)
+            _extract(db, period, group, file, zip_path, csv_path)
+            os.remove(zip_path)
+            rows = _import_file(db, period, group, file, csv_path)
+            os.remove(csv_path)
+            _mark_imported(db, period, file, rows)
+            return
+        except Exception:  # noqa: BLE001
+            for path in (zip_path, csv_path):
+                if os.path.exists(path):
+                    os.remove(path)
+            if attempt >= MAX_ATTEMPTS_PER_FILE:
+                raise
+            time.sleep(10 * attempt)
+
+
+def _download(db: Session, period: str, group: str, file: str, dest: str) -> None:
+    url = client.period_url(period) + file
+    total = client.file_size(url)
+    downloaded = 0
+
+    with httpx.stream("GET", url, timeout=None, follow_redirects=True) as response:
+        response.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                f.write(chunk)
+                downloaded += len(chunk)
+                _set_progress(
+                    db, period=period, group=group, current_file=file, step="download",
+                    processed_rows=downloaded,
+                    message=f"{downloaded}/{total or '?'} bytes",
+                )
+
+
+def _extract(db: Session, period: str, group: str, file: str, zip_path: str, csv_path: str) -> None:
+    _set_progress(db, period=period, group=group, current_file=file, step="extract", message="descompactando")
+
+    with zipfile.ZipFile(zip_path) as zf:
+        inner_name = zf.namelist()[0]
+        with zf.open(inner_name) as src, open(csv_path, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+
+
+def _import_file(db: Session, period: str, group: str, file: str, csv_path: str) -> int:
+    if group == "reference":
+        return _import_reference(db, period, group, file, csv_path)
+
+    spec = {
+        "simples": {
+            "columns": [
+                "cnpj_basico", "opcao_simples", "data_opcao_simples", "data_exclusao_simples",
+                "opcao_mei", "data_opcao_mei", "data_exclusao_mei",
+            ],
+            "model": SimplesStaging,
+            "keep": ["cnpj_basico", "opcao_simples", "opcao_mei"],
+            "unique": ["cnpj_basico"],
+        },
+        "empresas": {
+            "columns": [
+                "cnpj_basico", "razao_social", "natureza_juridica", "qualificacao_responsavel",
+                "capital_social", "porte_empresa", "ente_federativo",
+            ],
+            "model": EmpresaStaging,
+            "keep": ["cnpj_basico", "razao_social", "porte_empresa"],
+            "unique": ["cnpj_basico"],
+        },
+        "estabelecimentos": {
+            "columns": [
+                "cnpj_basico", "cnpj_ordem", "cnpj_dv", "identificador_matriz_filial", "nome_fantasia",
+                "situacao_cadastral", "data_situacao_cadastral", "motivo_situacao_cadastral",
+                "nome_cidade_exterior", "pais", "data_inicio_atividade", "cnae_fiscal_principal",
+                "cnae_fiscal_secundaria", "tipo_logradouro", "logradouro", "numero", "complemento",
+                "bairro", "cep", "uf", "municipio_codigo", "ddd_1", "telefone_1", "ddd_2", "telefone_2",
+                "ddd_fax", "fax", "correio_eletronico", "situacao_especial", "data_situacao_especial",
+            ],
+            "model": EstabelecimentoStaging,
+            "keep": [
+                "cnpj_basico", "cnpj_ordem", "cnpj_dv", "identificador_matriz_filial", "nome_fantasia",
+                "situacao_cadastral", "data_inicio_atividade", "cnae_fiscal_principal",
+                "cnae_fiscal_secundaria", "uf", "municipio_codigo", "ddd_1", "telefone_1", "correio_eletronico",
+            ],
+            "unique": ["cnpj_basico", "cnpj_ordem", "cnpj_dv"],
+            "date_fields": ["data_inicio_atividade"],
+        },
+    }[group]
+
+    table = spec["model"].__table__
+    date_fields = spec.get("date_fields", [])
+    count = 0
+    batch = []
+
+    def flush():
+        nonlocal count
+        if not batch:
+            return
+        stmt = pg_insert(table).values(batch)
+        update_cols = {c: stmt.excluded[c] for c in batch[0] if c not in spec["unique"]}
+        stmt = stmt.on_conflict_do_update(index_elements=spec["unique"], set_=update_cols)
+        db.execute(stmt)
+        db.commit()
+        count_local = len(batch)
+        batch.clear()
+        return count_local
+
+    for row in read_csv(csv_path, spec["columns"]):
+        mapped = {k: row.get(k) for k in spec["keep"]}
+        for field in date_fields:
+            mapped[field] = _parse_date(mapped.get(field))
+        for field, max_len in MAX_LENGTHS.items():
+            if mapped.get(field) and len(mapped[field]) > max_len:
+                mapped[field] = mapped[field][:max_len]
+        mapped["source_file"] = file
+        batch.append(mapped)
+
+        if len(batch) >= BATCH_SIZE:
+            count += flush()
+            _set_progress(
+                db, period=period, group=group, current_file=file, step="import",
+                processed_rows=count, message=f"{count} linhas",
+            )
+
+    count += flush() or 0
+    return count
+
+
+def _import_reference(db: Session, period: str, group: str, file: str, csv_path: str) -> int:
+    spec = {
+        "Cnaes.zip": (["code", "description"], Cnae, "code"),
+        "Municipios.zip": (["receita_code", "name"], Municipio, "receita_code"),
+    }[file]
+    columns, model, key = spec
+    table = model.__table__
+    count = 0
+
+    for row in read_csv(csv_path, columns):
+        stmt = pg_insert(table).values(**row)
+        update_cols = {c: stmt.excluded[c] for c in row if c != key}
+        stmt = stmt.on_conflict_do_update(index_elements=[key], set_=update_cols)
+        db.execute(stmt)
+        count += 1
+
+    db.commit()
+    _set_progress(db, period=period, group=group, current_file=file, step="import", processed_rows=count)
+    return count
+
+
+def _build_final_table(db: Session, period: str) -> None:
+    _set_progress(db, period=period, group="build", step="build", message="montando establishments a partir do staging")
+
+    db.execute(text("DROP TABLE IF EXISTS establishments_new"))
+    db.execute(text("CREATE TABLE establishments_new (LIKE establishments INCLUDING ALL)"))
+    # LIKE...INCLUDING ALL copia o DEFAULT nextval(...) literal -- a tabela
+    # nova ficaria presa à sequence da tabela antiga, e o DROP TABLE do
+    # swap falharia por dependência (visto na prática, não suposição).
+    # Sequence própria antes de qualquer INSERT usar o default.
+    db.execute(text("CREATE SEQUENCE IF NOT EXISTS establishments_new_id_seq OWNED BY establishments_new.id"))
+    db.execute(text("ALTER TABLE establishments_new ALTER COLUMN id SET DEFAULT nextval('establishments_new_id_seq')"))
+    db.commit()
+
+    imported = db.execute(text("""
+        INSERT INTO establishments_new
+            (cnpj, company_name, trade_name, is_headquarters, is_mei, is_simples,
+             company_size, main_cnae_code, secondary_cnae_codes, municipio_id,
+             uf, email, phone, cellphone, cellphone_confidence, opened_at)
+        SELECT
+            lpad(e.cnpj_basico, 8, '0') || lpad(e.cnpj_ordem, 4, '0') || lpad(e.cnpj_dv, 2, '0'),
+            coalesce(nullif(emp.razao_social, ''), nullif(e.nome_fantasia, ''), ''),
+            e.nome_fantasia,
+            coalesce(e.identificador_matriz_filial = '1', false),
+            coalesce(s.opcao_mei = 'S', false),
+            coalesce(s.opcao_simples = 'S', false),
+            emp.porte_empresa,
+            e.cnae_fiscal_principal,
+            '[]',
+            m.id,
+            e.uf,
+            e.correio_eletronico,
+            NULL,
+            NULL,
+            0,
+            e.data_inicio_atividade
+        FROM estabelecimentos_staging e
+        LEFT JOIN empresas_staging emp ON emp.cnpj_basico = e.cnpj_basico
+        LEFT JOIN simples_staging s ON s.cnpj_basico = e.cnpj_basico
+        LEFT JOIN municipios m ON m.receita_code = e.municipio_codigo
+        WHERE e.situacao_cadastral = '02'
+        ON CONFLICT (cnpj) DO NOTHING
+    """))
+    db.commit()
+
+    _fill_phones_and_secondary_cnaes(db, period)
+
+    db.execute(text("ALTER TABLE establishments RENAME TO establishments_old"))
+    db.execute(text("ALTER TABLE establishments_new RENAME TO establishments"))
+    db.execute(text("DROP TABLE establishments_old"))
+    db.execute(text("ALTER SEQUENCE establishments_new_id_seq RENAME TO establishments_id_seq"))
+    db.execute(text("TRUNCATE TABLE empresas_staging, simples_staging, estabelecimentos_staging"))
+    db.execute(text("DELETE FROM import_log WHERE period = :period"), {"period": period})
+    db.commit()
+
+    _set_progress(db, period=period, group="build", step="build", processed_rows=imported.rowcount, message="tabela final trocada atomicamente")
+
+
+def _fill_phones_and_secondary_cnaes(db: Session, period: str) -> None:
+    result = db.execute(text("""
+        SELECT cnpj_basico, cnpj_ordem, cnpj_dv, ddd_1, telefone_1, cnae_fiscal_secundaria
+        FROM estabelecimentos_staging
+        WHERE situacao_cadastral = '02'
+    """))
+
+    batch = []
+    processed = 0
+
+    def flush():
+        nonlocal batch
+        if not batch:
+            return
+
+        tuples = []
+        params = {}
+        for i, row in enumerate(batch):
+            names = [f"p{i}_{j}" for j in range(len(row))]
+            # Sem cast (`::json`) colado no bindparam aqui -- o parser de
+            # `text()` do SQLAlchemy não reconhece `:nome::tipo` como
+            # bindparam seguido de cast, e o valor sai sem substituir. O
+            # cast entra no SET, sobre a coluna já materializada da VALUES.
+            placeholders = ", ".join(f":{n}" for n in names)
+            tuples.append(f"({placeholders})")
+            params.update(dict(zip(names, row)))
+
+        sql = (
+            "UPDATE establishments_new AS t SET phone = v.phone, cellphone = v.cellphone, "
+            "cellphone_confidence = v.confidence, secondary_cnae_codes = v.secondary::json "
+            f"FROM (VALUES {', '.join(tuples)}) AS v(cnpj, phone, cellphone, confidence, secondary) "
+            "WHERE t.cnpj = v.cnpj"
+        )
+        db.execute(text(sql), params)
+        db.commit()
+        batch = []
+
+    for row in result:
+        secondary = [c for c in (row.cnae_fiscal_secundaria or "").split(",") if c]
+        phone = parse_phone((row.ddd_1 or "") + (row.telefone_1 or ""))
+
+        if not phone and not secondary:
+            continue
+
+        cnpj = f"{row.cnpj_basico:0>8}{row.cnpj_ordem:0>4}{row.cnpj_dv:0>2}"
+        batch.append((
+            cnpj,
+            phone["e164"] if phone and phone["type"] == "landline" else None,
+            phone["e164"] if phone and phone["type"] == "mobile" else None,
+            phone["confidence"] if phone and phone["type"] == "mobile" else 0,
+            _json_array(secondary),
+        ))
+        processed += 1
+
+        if len(batch) >= 500:
+            flush()
+            _set_progress(db, period=period, group="build", step="build", processed_rows=processed, message="telefone/celular")
+
+    flush()
+
+
+def _json_array(items: list[str]) -> str:
+    import json
+
+    return json.dumps(items)
+
+
+def _parse_date(value: str | None) -> str | None:
+    if not value or len(value) != 8 or value == "00000000":
+        return None
+    return f"{value[0:4]}-{value[4:6]}-{value[6:8]}"
+
+
+def _already_imported(db: Session, period: str, filename: str) -> bool:
+    return db.query(ImportLog).filter_by(period=period, filename=filename).first() is not None
+
+
+def _mark_imported(db: Session, period: str, filename: str, rows: int) -> None:
+    stmt = pg_insert(ImportLog.__table__).values(
+        period=period, filename=filename, rows_imported=rows, imported_at=datetime.now(timezone.utc),
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["period", "filename"],
+        set_={"rows_imported": stmt.excluded.rows_imported, "imported_at": stmt.excluded.imported_at},
+    )
+    db.execute(stmt)
+    db.commit()
+
+
+def _set_progress(db: Session, **fields) -> None:
+    fields["updated_at"] = datetime.now(timezone.utc)
+    if fields.get("status") == "running" and "started_at" not in fields:
+        existing = db.get(ImportProgress, 1)
+        if not existing or existing.status != "running":
+            fields["started_at"] = fields["updated_at"]
+
+    stmt = pg_insert(ImportProgress.__table__).values(id=1, **fields)
+    update_cols = {c: stmt.excluded[c] for c in fields}
+    stmt = stmt.on_conflict_do_update(index_elements=["id"], set_=update_cols)
+    db.execute(stmt)
+    db.commit()

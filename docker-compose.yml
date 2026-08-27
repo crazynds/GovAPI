@@ -1,0 +1,51 @@
+services:
+  # Postgres embutido, só pra quem não tem um servidor próprio -- fica atrás
+  # de um profile de propósito: apontando CNPJ_DATABASE_URL pro seu próprio
+  # Postgres (produção, RDS, o que for), esse serviço nem precisa subir.
+  # Rodar com ele: `docker compose --profile local-db up -d`
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    profiles: ["local-db"]
+    environment:
+      POSTGRES_USER: cnpj
+      POSTGRES_PASSWORD: cnpj
+      POSTGRES_DB: cnpj
+    volumes:
+      - cnpj_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cnpj"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      # Default aponta pro serviço `db` acima (profile local-db). Pra usar
+      # um Postgres seu, defina CNPJ_DATABASE_URL no .env -- ver .env.example.
+      CNPJ_DATABASE_URL: ${CNPJ_DATABASE_URL:-postgresql+psycopg2://cnpj:cnpj@db:5432/cnpj}
+      CNPJ_OPEN_DATA_URL: ${CNPJ_OPEN_DATA_URL:-https://dados-abertos-rf-cnpj.casadosdados.com.br/arquivos}
+      CNPJ_DOWNLOAD_DIR: /data/cnpj-import
+    ports:
+      - "${CNPJ_IMPORTER_PORT:-8000}:8000"
+    volumes:
+      - cnpj_download_data:/data/cnpj-import
+
+  # Roda a importação uma vez por mês (dia 20, 03:00) -- ver app/scheduler.py.
+  # Pra rodar manualmente: `docker compose run --rm app python -m app.cli import-cnpj`
+  scheduler:
+    build: .
+    restart: unless-stopped
+    environment:
+      CNPJ_DATABASE_URL: ${CNPJ_DATABASE_URL:-postgresql+psycopg2://cnpj:cnpj@db:5432/cnpj}
+      CNPJ_OPEN_DATA_URL: ${CNPJ_OPEN_DATA_URL:-https://dados-abertos-rf-cnpj.casadosdados.com.br/arquivos}
+      CNPJ_DOWNLOAD_DIR: /data/cnpj-import
+    volumes:
+      - cnpj_download_data:/data/cnpj-import
+    command: ["python", "-m", "app.scheduler"]
+
+volumes:
+  cnpj_db_data:
+  cnpj_download_data:
