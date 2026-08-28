@@ -229,12 +229,13 @@ def import_all(
                 continue
 
             typer.echo(f"== {label} ==")
+            # Só marca "running" antes e "success" depois -- sem try/except.
+            # Se `action()` for interrompida (Ctrl-C, crash, o que for), a
+            # fase fica parada em "running" (nunca chega a "success"), e é
+            # exatamente esse status que a retomada usa pra saber que ela não
+            # terminou e precisa ser refeita -- não precisa capturar nada.
             _set_import_all(db, **{key: "running"})
-            try:
-                action()
-            except BaseException as exc:  # noqa: BLE001 -- inclui KeyboardInterrupt: Ctrl-C também marca a fase como não concluída
-                _set_import_all(db, status="failed", message=f"{key}: {exc}"[:255], **{key: "failed"})
-                raise
+            action()
             _set_import_all(db, **{key: "success"})
 
         _set_import_all(db, status="success", message="import-all concluído")
