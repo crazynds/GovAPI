@@ -31,9 +31,21 @@ def read_csv(path: str, columns: list[str], on_progress: ProgressCallback | None
     def counted_lines(f):
         for raw_line in f:
             # ISO-8859-1 e 1 byte por caractere, então len() do texto já e o
-            # total de bytes consumidos nessa linha.
+            # total de bytes consumidos nessa linha -- conta ANTES de
+            # sanitizar, pra bater com o tamanho real do arquivo em disco.
             counters[0] += len(raw_line)
             counters[1] += 1
+
+            # Postgres nunca aceita 0x00 num campo de texto, seja qual for o
+            # encoding da coluna -- e uma regra do backend, nao negociacao de
+            # client_encoding (visto na pratica: CharacterNotInRepertoire no
+            # COPY, cancelando a carga inteira). ISO-8859-1 decodifica
+            # QUALQUER byte sem erro, 0x00 incluso, entao esse lixo passa
+            # batido pela leitura e só explode la na frente -- remove aqui,
+            # na origem, antes do csv.reader ver a linha.
+            if "\x00" in raw_line:
+                raw_line = raw_line.replace("\x00", "")
+
             yield raw_line
 
     with open(path, encoding="iso-8859-1", newline="") as f:
