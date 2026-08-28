@@ -772,6 +772,21 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
     db.execute(text("ALTER TABLE establishments_new SET (fillfactor = 100)"))
     db.commit()
 
+    # As tabelas de staging chegam aqui recem-carregadas via COPY, e o
+    # Postgres so atualiza as estatisticas do planner (pg_class.reltuples)
+    # atraves de VACUUM/ANALYZE -- nunca automaticamente so por causa do
+    # volume inserido. Sem isso, o JOIN logo abaixo (potencialmente dezenas de
+    # milhoes de linhas de cada lado) pode ser planejado com estatisticas
+    # zeradas/desatualizadas e sair como nested loop em vez de hash join --
+    # a diferenca entre minutos e nunca terminar. O autovacuum eventualmente
+    # faria isso sozinho, mas nao ha garantia de que rode a tempo desse INSERT
+    # que roda logo em seguida do bulk load.
+    _set_step(progress, "build", period=period, group="build", status="running", message="analisando staging")
+    display.set(slot, "  build: ANALYZE nas tabelas de staging")
+    for table in ("estabelecimentos_staging", "empresas_staging", "simples_staging"):
+        db.execute(text(f"ANALYZE {table}"))
+    db.commit()
+
     t0 = time.monotonic()
     display.set(slot, "  build: INSERT establishments_new ...")
     # A tabela existe sempre (e um model nosso), mas fica VAZIA ate
