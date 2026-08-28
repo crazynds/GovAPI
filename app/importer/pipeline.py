@@ -6,6 +6,8 @@ não precisa de DISTINCT ON/window function (caro numa tabela de dezenas de
 milhões de linhas). Progresso é gravado em import_progress a cada lote, e
 lido por GET /import/status."""
 
+import csv
+import io
 import logging
 import os
 import shutil
@@ -197,6 +199,25 @@ def _extract(db: Session, period: str, group: str, file: str, zip_path: str, csv
     logger.info("Extraído %s: %s", file, human_bytes(written))
 
 
+class _IteratorFile:
+    """Faz um gerador de strings parecer um arquivo pro `copy_expert` do
+    psycopg2 -- streama linha a linha pro COPY sem montar o CSV inteiro
+    em memória de uma vez."""
+
+    def __init__(self, lines):
+        self._lines = lines
+        self._buf = ""
+
+    def read(self, size: int = 8192) -> str:
+        while len(self._buf) < size:
+            try:
+                self._buf += next(self._lines)
+            except StopIteration:
+                break
+        result, self._buf = self._buf[:size], self._buf[size:]
+        return result
+
+
 def _import_file(db: Session, period: str, group: str, file: str, csv_path: str) -> int:
     if group == "reference":
         return _import_reference(db, period, group, file, csv_path)
@@ -240,59 +261,85 @@ def _import_file(db: Session, period: str, group: str, file: str, csv_path: str)
         },
     }[group]
 
-    table = spec["model"].__table__
+    table_name = spec["model"].__table__.name
+    keep = spec["keep"]
+    unique = spec["unique"]
     date_fields = spec.get("date_fields", [])
-    count = 0
-    batch = []
+    copy_columns = keep + ["source_file"]
+
+    # COPY (protocolo nativo do Postgres) pra uma tabela temporária, depois
+    # UM upsert em massa pro staging real -- ao invés de milhares de INSERT
+    # ... ON CONFLICT parametrizados. Testado: isso é a diferença entre
+    # minutos e horas num arquivo de dezenas de milhões de linhas -- um
+    # INSERT com VALUES parametrizado paga o preço de montar/serializar/
+    # transmitir/planejar uma instrução SQL gigante por lote; COPY não.
+    tmp_table = "tmp_staging_load"
+    cols_def = ", ".join(f'"{c}" text' for c in copy_columns)
+    db.execute(text(f"DROP TABLE IF EXISTS {tmp_table}"))
+    db.execute(text(f"CREATE TEMP TABLE {tmp_table} ({cols_def})"))
+    db.commit()
 
     bar = ProgressBar(f"  importando {file}", total=os.path.getsize(csv_path), unit="bytes")
-    last_db_write = 0.0
-
-    def flush():
-        # Sem commit aqui de propósito -- comitar a cada lote de milhões de
-        # linhas é o maior gargalo (fsync do WAL por commit). O commit
-        # acontece no ritmo do on_progress abaixo (~1x/s) e no final do
-        # arquivo; se cair no meio, o arquivo é refeito do zero de qualquer
-        # forma (UPSERT idempotente, ver ImportLog), então perder alguns
-        # lotes não-comitados de um crash não muda o resultado final.
-        nonlocal count
-        if not batch:
-            return
-        stmt = pg_insert(table).values(batch)
-        update_cols = {c: stmt.excluded[c] for c in batch[0] if c not in spec["unique"]}
-        stmt = stmt.on_conflict_do_update(index_elements=spec["unique"], set_=update_cols)
-        db.execute(stmt)
-        count_local = len(batch)
-        batch.clear()
-        return count_local
+    rows_read_box = [0]
 
     def on_progress(bytes_read: int, _total_bytes: int, rows_read: int) -> None:
-        nonlocal last_db_write
+        # Só a barra local aqui -- nenhuma escrita no banco. O COPY abaixo
+        # usa a MESMA conexão da sessão (precisa, pra participar da mesma
+        # transação); uma query nessa conexão nesse meio tempo quebraria o
+        # protocolo do COPY (visto na prática: "no COPY in progress").
+        rows_read_box[0] = rows_read
         bar.update(bytes_read, extra=f"{rows_read} linhas")
-        now = time.monotonic()
-        if now - last_db_write >= DB_PROGRESS_INTERVAL:
-            last_db_write = now
-            _set_progress(
-                db, period=period, group=group, current_file=file, step="import",
-                processed_rows=rows_read, message=f"{rows_read} linhas", log=False,
-            )
 
-    for row in read_csv(csv_path, spec["columns"], on_progress=on_progress):
-        mapped = {k: row.get(k) for k in spec["keep"]}
-        for field in date_fields:
-            mapped[field] = _parse_date(mapped.get(field))
-        for field, max_len in MAX_LENGTHS.items():
-            if mapped.get(field) and len(mapped[field]) > max_len:
-                mapped[field] = mapped[field][:max_len]
-        mapped["source_file"] = file
-        batch.append(mapped)
+    def csv_lines():
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        for row in read_csv(csv_path, spec["columns"], on_progress=on_progress):
+            mapped = {k: row.get(k) for k in keep}
+            for field in date_fields:
+                mapped[field] = _parse_date(mapped.get(field))
+            for field, max_len in MAX_LENGTHS.items():
+                if mapped.get(field) and len(mapped[field]) > max_len:
+                    mapped[field] = mapped[field][:max_len]
+            mapped["source_file"] = file
+            writer.writerow([mapped.get(c) or "" for c in copy_columns])
+            yield buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
 
-        if len(batch) >= BATCH_SIZE:
-            count += flush()
+    raw_cursor = db.connection().connection.cursor()
+    quoted_cols = ", ".join(f'"{c}"' for c in copy_columns)
+    raw_cursor.copy_expert(
+        f"COPY {tmp_table} ({quoted_cols}) FROM STDIN WITH (FORMAT csv, NULL '')",
+        _IteratorFile(csv_lines()),
+    )
+    count = rows_read_box[0]
 
-    count += flush() or 0
-    bar.update(os.path.getsize(csv_path), extra=f"{count} linhas", force=True)
+    bar.update(os.path.getsize(csv_path), extra=f"{count} linhas copiadas", force=True)
     bar.close()
+    logger.info("Copiado %s pro staging temporário: %d linhas", file, count)
+
+    _set_progress(
+        db, period=period, group=group, current_file=file, step="import",
+        message=f"mesclando {count} linhas no staging final", log=True,
+    )
+
+    select_cols = [
+        (f'NULLIF("{c}", \'\')::date' if c in date_fields else f'"{c}"') for c in keep
+    ] + ['"source_file"']
+    update_cols = [c for c in copy_columns if c not in unique]
+    set_clause = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in update_cols)
+
+    t0 = time.monotonic()
+    db.execute(text(f"""
+        INSERT INTO {table_name} ({quoted_cols})
+        SELECT {", ".join(select_cols)}
+        FROM {tmp_table}
+        ON CONFLICT ({", ".join(f'"{c}"' for c in unique)}) DO UPDATE SET {set_clause}
+    """))
+    db.execute(text(f"DROP TABLE {tmp_table}"))
+    db.commit()
+    logger.info("Mesclado %s no staging final em %.1fs", file, time.monotonic() - t0)
+
     _set_progress(
         db, period=period, group=group, current_file=file, step="import",
         processed_rows=count, message=f"{count} linhas", log=False,
