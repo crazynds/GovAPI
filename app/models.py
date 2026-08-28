@@ -142,8 +142,9 @@ class Establishment(Base):
     #
     # NULL quando o CEP da Receita nao existe na base dos Correios (digitacao
     # errada, extinto, endereco no exterior). Nesses casos o endereco bruto vai
-    # inteiro pra coluna `address` -- ver _build_final_table.
-    cep: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # inteiro pra coluna `address` -- ver _build_final_table. E justamente por
+    # virar NULL nesses casos que a FOREIGN KEY abaixo e possivel.
+    cep: Mapped[int | None] = mapped_column(ForeignKey("correios_cep.cep"), nullable=True)
     opened_at: Mapped[date | None] = mapped_column(Date, nullable=True)
     uf: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)  # ver app/regions.py
     company_size: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
@@ -227,8 +228,11 @@ class EstabelecimentoStaging(Base):
 
     # Corpo do CNPJ (raiz + ordem) em base 36. O DV do CSV nao e guardado: e
     # derivado do corpo, e o import so o usa pra conferir a fonte.
+    # Sem `cnpj_basico`: ele e o proprio cnpj sem as 4 ultimas posicoes, o que
+    # em base 36 e uma divisao inteira por 36^4. Guardar 8 bytes por linha pra
+    # repetir o que ja esta no cnpj custaria ~500MB nas ~63M linhas; o JOIN do
+    # build calcula na hora (ver ORDEM_SPAN em app/cnpj.py).
     cnpj: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
-    cnpj_basico: Mapped[int] = mapped_column(BigInteger)
     phone: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     cellphone: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     cnae_fiscal_principal: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -269,7 +273,10 @@ class Socio(Base):
         Index("ix_socios_cpf_cnpj_socio", "cpf_cnpj_socio", postgresql_where=text("cpf_cnpj_socio IS NOT NULL")),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    # Integer e nao BigInteger: sao ~24M linhas, e o TRUNCATE do inicio do
+    # grupo reinicia a sequence (RESTART IDENTITY), entao o contador nao
+    # acumula import a import ate estourar os 2,1 bilhoes.
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
     cnpj_basico: Mapped[int] = mapped_column(BigInteger)
     # PF: a Receita ja entrega o CPF mascarado (LGPD, "***123456**") -- so os 6
     # digitos do meio variam, e e isso que fica guardado aqui. PJ/estrangeiro:
@@ -286,16 +293,42 @@ class Socio(Base):
     nome_representante: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class CorreiosCep(Base):
+    """Base unificada de CEP dos Correios (e-DNE Básico).
+
+    O esquema veio do edne-correios-loader, mas a tabela é nossa: o
+    `import-ceps` manda a lib montar a base nova numa tabela de scratch e faz
+    UPSERT daqui (ver app/ceps.py). Como nada aqui é apagado, dá pra referenciar
+    -- `establishments.cep` tem FOREIGN KEY pra cá.
+
+    `cep` é INTEGER (4 bytes) e não os 8 dígitos como texto: além do espaço, é
+    o que permite a FK, já que establishments.cep também é INTEGER e o Postgres
+    exige tipos comparáveis. A formatação com zero à esquerda sai na leitura.
+    """
+
+    __tablename__ = "correios_cep"
+
+    cep: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    logradouro: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    complemento: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    bairro: Mapped[str | None] = mapped_column(String(72), nullable=True)
+    municipio: Mapped[str] = mapped_column(String(72))
+    municipio_cod_ibge: Mapped[int] = mapped_column(Integer)
+    uf: Mapped[str] = mapped_column(String(2))
+    nome: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+
 class CepCoordenada(Base):
-    """Latitude/longitude por CEP -- tabela própria, gerenciada por nós
-    (não pelo edne-correios-loader, que reconstrói `correios_cep` do zero
-    a cada import-ceps e destruiria qualquer coluna extra que a gente
-    tentasse colar nela). Preenchida sob demanda quando alguém consulta
+    """Latitude/longitude por CEP -- tabela separada de `correios_cep` porque é
+    cache nosso (BrasilAPI sob demanda, ou o extrato do OSM em massa), não dado
+    dos Correios. Preenchida sob demanda quando alguém consulta
     GET /enderecos/cep/{cep} e o CEP ainda não tem coordenada salva."""
 
     __tablename__ = "cep_coordenadas"
 
-    cep: Mapped[str] = mapped_column(String(8), primary_key=True)
+    # INTEGER pra casar com correios_cep.cep, com quem é joinada na busca por
+    # proximidade (ver _COORD_JOIN_SQL em app/routers/enderecos.py).
+    cep: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
     latitude: Mapped[float | None] = mapped_column(Numeric(10, 7), nullable=True)
     longitude: Mapped[float | None] = mapped_column(Numeric(10, 7), nullable=True)
     source: Mapped[str | None] = mapped_column(String(30), nullable=True)

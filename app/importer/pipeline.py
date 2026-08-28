@@ -46,6 +46,7 @@ from app.importer import client
 from app.importer.csv_reader import read_csv
 from app.importer.progress import ProgressDisplay, human_bytes, log_through
 from app.importer.rows import GROUP_SPECS, Counters
+from app.cnpj import ORDEM_SPAN
 from app.regions import CODE_TO_UF
 from app.models import (
     Cnae,
@@ -289,7 +290,10 @@ class ImportPipeline:
                 # arquivo do grupo ainda marcado em ImportLog), senao um
                 # reimport mensal ficaria empilhando linha repetida. Numa
                 # RETOMADA nao zera, senao perderia os arquivos ja concluidos.
-                db.execute(text("TRUNCATE socios"))
+                # RESTART IDENTITY pro `id` (Integer) nao acumular import a
+                # import -- sem isso a sequence seguiria subindo e um dia
+                # estouraria os 2,1 bilhoes.
+                db.execute(text("TRUNCATE socios RESTART IDENTITY"))
                 db.commit()
 
             for file in pending:
@@ -756,19 +760,15 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
 
     t0 = time.monotonic()
     display.set(slot, "  build: INSERT establishments_new ...")
-    # `correios_cep` so existe depois de `import-ceps` (e o esquema dela vem do
-    # edne-correios-loader, nao do nosso metadata).
-    has_cep_table = db.execute(text("SELECT to_regclass('correios_cep')")).scalar() is not None
-    if has_cep_table:
+    # A tabela existe sempre (e um model nosso), mas fica VAZIA ate
+    # `import-ceps` rodar -- e ai nenhum estabelecimento casaria, o que jogaria
+    # as ~63M linhas pro JSON de excecao. Por isso o teste e "tem CEP", nao
+    # "tem tabela".
+    has_ceps = db.execute(text("SELECT EXISTS (SELECT 1 FROM correios_cep)")).scalar()
+    if has_ceps:
         logger.info("Vinculando endereços a correios_cep")
-        # Cast do lado da tabela de CEP (~1,2M linhas) e nao do staging (~63M),
-        # e filtrado a 8 digitos pro cast nunca estourar numa linha estranha.
-        cep_join = """
-        LEFT JOIN (
-            SELECT cep::integer AS cep, logradouro, bairro
-            FROM correios_cep WHERE cep ~ '^[0-9]{8}$'
-        ) c ON c.cep = e.cep
-        """
+        # Os dois lados sao INTEGER agora -- join direto, sem cast nenhum.
+        cep_join = "LEFT JOIN correios_cep c ON c.cep = e.cep"
         # Ou o estabelecimento esta vinculado a um CEP -- e ai o endereco vive
         # nas colunas, com logradouro/bairro vindo do join -- ou nao esta, e ai
         # o registro bruto da Receita vai inteiro pro JSON. Nunca os dois.
@@ -800,8 +800,8 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
         """
     else:
         logger.warning(
-            "Tabela correios_cep ausente -- rode `import-ceps` antes pra não duplicar "
-            "logradouro/bairro que já viriam do CEP."
+            "Base de CEP vazia -- rode `import-ceps` antes pra vincular os endereços "
+            "(sem ela, logradouro/bairro ficam duplicados e não há FK de cep)."
         )
         # Sem a tabela de CEP nao da pra saber quem casa: mantem tudo nas
         # colunas, como veio da Receita. Jogar as ~63M linhas no JSON seria o
@@ -847,8 +847,11 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
             {district_sql},
             {address_sql}
         FROM estabelecimentos_staging e
-        LEFT JOIN empresas_staging emp ON emp.cnpj_basico = e.cnpj_basico
-        LEFT JOIN simples_staging s ON s.cnpj_basico = e.cnpj_basico
+        -- `e.cnpj / {ORDEM_SPAN}` e a raiz do CNPJ: em base 36, tirar as 4
+        -- ultimas posicoes e uma divisao inteira. Assim o staging nao precisa
+        -- guardar uma coluna `cnpj_basico` repetindo 8 bytes por linha.
+        LEFT JOIN empresas_staging emp ON emp.cnpj_basico = e.cnpj / {ORDEM_SPAN}
+        LEFT JOIN simples_staging s ON s.cnpj_basico = e.cnpj / {ORDEM_SPAN}
         LEFT JOIN municipios m ON m.receita_code = e.municipio_codigo
         {cep_join}
         ON CONFLICT (cnpj) DO NOTHING
@@ -856,7 +859,7 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
     db.commit()
     logger.info("establishments_new: %d linhas em %.1fs", imported.rowcount, time.monotonic() - t0)
 
-    if has_cep_table:
+    if has_ceps:
         # Cobertura do vinculo por CEP. E o numero que decide se uma FOREIGN
         # KEY de establishments.cep -> correios_cep.cep e possivel: ela so pode
         # existir se este "orfaos" for zero, porque a Receita tambem publica CEP
@@ -894,6 +897,20 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
         WHERE v.municipio_codigo = m.receita_code AND m.uf IS DISTINCT FROM codes.sigla
     """))
     db.commit()
+
+    if has_ceps:
+        # Depois do bulk load, nao antes: validar 63M linhas durante o INSERT
+        # sairia bem mais caro que uma varredura unica no fim. So com a base de
+        # CEP populada -- sem ela o `cep` fica como veio da Receita e nao ha
+        # garantia de que casa.
+        _set_step(progress, "build", period=period, group="build", status="running", message="FK de cep")
+        display.set(slot, "  build: validando FK de cep")
+        db.execute(text("""
+            ALTER TABLE establishments_new
+            ADD CONSTRAINT establishments_cep_fkey
+            FOREIGN KEY (cep) REFERENCES correios_cep (cep)
+        """))
+        db.commit()
 
     for name, cols, where, using in DEFERRED_INDEXES:
         _set_step(progress, "build", period=period, group="build", status="running", message=f"índice {name}")

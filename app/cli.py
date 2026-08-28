@@ -187,7 +187,6 @@ def _import_ceps(source: str | None) -> None:
         )
         loader.load(table_set=TableSetEnum.UNIFIED_CEP_ONLY)
 
-        ceps.ensure_table(db)
         inserted, updated, stale = ceps.upsert_from(db, ceps.SCRATCH_TABLE)
 
         db.execute(text(f"DROP TABLE {ceps.SCRATCH_TABLE}"))

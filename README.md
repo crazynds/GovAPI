@@ -235,6 +235,14 @@ the vast majority of rows match a CEP and leave `address` NULL, which costs
 nothing beyond its bit in the null bitmap. Each build logs the split — look for
 the `CEP: N vinculados ... N sem vínculo` line.
 
+Because an unmatched CEP becomes NULL, and because the CEP import upserts
+instead of deleting, `establishments.cep` carries a real foreign key to
+`correios_cep`. The build adds it after the bulk load rather than before, so
+the check is one pass at the end instead of a per-row cost across the whole
+insert. `correios_cep` is an ordinary model now (`models.CorreiosCep`) — the
+loader only ever populates the scratch table — so Alembic manages it like any
+other.
+
 Note: `correios_cep` (the e-DNE table) is **not** managed by Alembic — it's owned by `edne-correios-loader`, which rebuilds it on every `import-ceps` run.
 
 ## API reference

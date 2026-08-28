@@ -163,12 +163,17 @@ def _cpf(raw: str | None) -> int | None:
     return int(digits) if digits else None
 
 
-def _transform_simples(row: dict, _counters: Counters) -> list | None:
-    return [
-        cnpj_codec.basico_to_int(row["cnpj_basico"] or ""),
-        _bool(row.get("opcao_simples")),
-        _bool(row.get("opcao_mei")),
-    ]
+def _transform_simples(row: dict, counters: Counters) -> list | None:
+    simples, mei = _bool(row.get("opcao_simples")), _bool(row.get("opcao_mei"))
+    if not simples and not mei:
+        # Linha que diz "nao e Simples nem MEI" nao carrega informacao: o build
+        # faz LEFT JOIN com `coalesce(..., false)`, entao a ausencia da linha da
+        # exatamente o mesmo resultado. O arquivo lista tambem quem ja optou e
+        # saiu, entao isso descarta uma fatia grande das ~45M linhas.
+        counters.skipped += 1
+        return None
+
+    return [cnpj_codec.basico_to_int(row["cnpj_basico"] or ""), simples, mei]
 
 
 def _transform_empresas(row: dict, _counters: Counters) -> list | None:
@@ -201,7 +206,6 @@ def _transform_estabelecimentos(row: dict, counters: Counters) -> list | None:
 
     return [
         value,
-        cnpj_codec.basico_to_int(basico),
         phone,
         cellphone,
         _int(row.get("cnae_fiscal_principal")),
@@ -279,7 +283,7 @@ GROUP_SPECS: dict[str, GroupSpec] = {
         ],
         table="estabelecimentos_staging",
         columns=[
-            "cnpj", "cnpj_basico", "phone", "cellphone", "cnae_fiscal_principal", "municipio_codigo",
+            "cnpj", "phone", "cellphone", "cnae_fiscal_principal", "municipio_codigo",
             "cep", "data_inicio_atividade", "uf", "situacao_cadastral", "motivo_situacao_cadastral",
             "cellphone_confidence", "is_headquarters", "cnae_fiscal_secundaria", "nome_fantasia",
             "correio_eletronico", "logradouro", "numero", "complemento", "bairro",

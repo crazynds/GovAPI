@@ -1,14 +1,13 @@
-"""Contrato da tabela unificada de CEP dos Correios (e-DNE).
+"""Import e leitura da base unificada de CEP dos Correios (e-DNE).
 
-`correios_cep` e a unica tabela do banco que nao e um model nosso: o esquema
-dela vem do edne-correios-loader. Este modulo e o dono desse contrato --
-nome, colunas e DDL num lugar so -- porque tres lugares diferentes precisam
-dele (o import em app/cli.py, a busca de endereco em app/routers/enderecos.py
-e o vinculo por CEP no build em app/importer/pipeline.py).
+A tabela `correios_cep` e um model nosso (ver app/models.py). O esquema veio do
+edne-correios-loader, mas quem cria e popula somos nos: o `import-ceps` manda a
+lib montar a base nova numa tabela de scratch e daqui sai um UPSERT. A lib
+nunca toca na tabela real -- e isso que permite `establishments.cep` ter uma
+FOREIGN KEY pra ca, porque nenhuma linha e apagada debaixo de quem referencia.
 
-A tabela e nossa, nao da lib: o import monta a base nova numa tabela de
-scratch e faz UPSERT daqui (ver `_import_ceps`). Assim ninguem apaga linha
-que outra tabela referencia, e a base nunca fica vazia no meio de um import.
+O `cep` e INTEGER (4 bytes em vez dos 8 digitos como texto), e a formatacao com
+zero a esquerda acontece na leitura -- ver `SELECT_COLUMNS`.
 """
 
 from sqlalchemy import text
@@ -16,8 +15,8 @@ from sqlalchemy.orm import Session
 
 TABLE = "correios_cep"
 
-# Tabela onde o edne-correios-loader monta a base nova; a real nunca e
-# entregue a lib.
+# Tabela onde o edne-correios-loader monta a base nova. Ele a cria com o
+# esquema dele (cep como VARCHAR(8)), e o cast pra INTEGER acontece no upsert.
 SCRATCH_TABLE = "correios_cep_import"
 
 COLUMNS = (
@@ -31,44 +30,58 @@ COLUMNS = (
     "nome",
 )
 
-# Mesmo esquema que o edne-correios-loader cria, pra continuar compativel
-# quando ele rodar (ele faz CREATE TABLE IF NOT EXISTS na de scratch).
-_DDL = f"""
-CREATE TABLE IF NOT EXISTS {TABLE} (
-    cep VARCHAR(8) PRIMARY KEY,
-    logradouro VARCHAR(100),
-    complemento VARCHAR(100),
-    bairro VARCHAR(72),
-    municipio VARCHAR(72) NOT NULL,
-    municipio_cod_ibge INTEGER NOT NULL,
-    uf VARCHAR(2) NOT NULL,
-    nome VARCHAR(100)
-)
-"""
+CEP_WIDTH = 8
 
 
-def ensure_table(db: Session) -> None:
-    """Cria a tabela se `import-ceps` ainda nao rodou -- assim a busca de
-    endereco e o build do CNPJ funcionam (vazios) num banco novo."""
-    db.execute(text(_DDL))
-    db.commit()
+def to_int(raw: str | int | None) -> int | None:
+    """CEP em qualquer forma ("01310-100", "01310100", 1310100) -> int.
+
+    None quando nao sao 8 digitos -- CEP malformado nao vira consulta.
+    """
+    if raw is None:
+        return None
+    digits = "".join(c for c in str(raw) if c.isdigit())
+    return int(digits) if len(digits) == CEP_WIDTH else None
+
+
+def to_str(value: int | None) -> str | None:
+    """Inverso: o CEP de 8 posicoes com zero a esquerda, como a API expoe."""
+    return f"{value:0{CEP_WIDTH}d}" if value is not None else None
+
+
+def select_columns(prefix: str = "") -> str:
+    """Colunas pra um SELECT, com o `cep` ja formatado como texto.
+
+    A coluna e INTEGER no banco, mas a API sempre falou em CEP de 8 posicoes com
+    zero a esquerda -- e "01310100" nao sobrevive a um int sem o lpad.
+    """
+    p = f"{prefix}." if prefix else ""
+    return ", ".join(
+        f"lpad({p}cep::text, {CEP_WIDTH}, '0') AS cep" if c == "cep" else f"{p}{c}"
+        for c in COLUMNS
+    )
 
 
 def upsert_from(db: Session, source_table: str) -> tuple[int, int, int]:
     """Mescla `source_table` em `correios_cep`. Devolve (novos, atualizados, stale).
 
-    UPSERT e nao DELETE + INSERT: nada some debaixo de quem referencia a
-    tabela, e a base nunca fica vazia no meio do caminho.
+    UPSERT e nao DELETE + INSERT: nada some debaixo de quem referencia a tabela
+    (a FK de establishments.cep depende disso), e a base nunca fica vazia no
+    meio de um import.
     """
     cols = ", ".join(COLUMNS)
     updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in COLUMNS if c != "cep")
+    # A scratch vem da lib com `cep` VARCHAR -- cast aqui, filtrando a 8 digitos
+    # pro cast nunca estourar numa linha estranha.
+    incoming_cols = ", ".join(f"{c}::integer" if c == "cep" else c for c in COLUMNS)
+    incoming = f"SELECT {incoming_cols} FROM {source_table} WHERE cep ~ '^[0-9]{{8}}$'"
 
     before = db.execute(text(f"SELECT count(*) FROM {TABLE}")).scalar() or 0
-    incoming = db.execute(text(f"SELECT count(*) FROM {source_table}")).scalar() or 0
+    total_in = db.execute(text(f"SELECT count(*) FROM ({incoming}) s")).scalar() or 0
 
     db.execute(text(f"""
         INSERT INTO {TABLE} ({cols})
-        SELECT {cols} FROM {source_table}
+        {incoming}
         ON CONFLICT (cep) DO UPDATE SET {updates}
     """))
     db.commit()
@@ -81,8 +94,8 @@ def upsert_from(db: Session, source_table: str) -> tuple[int, int, int]:
     # conta-los evita acumular CEP morto sem ninguem perceber.
     stale = db.execute(text(f"""
         SELECT count(*) FROM {TABLE} c
-        WHERE NOT EXISTS (SELECT 1 FROM {source_table} s WHERE s.cep = c.cep)
+        WHERE NOT EXISTS (SELECT 1 FROM ({incoming}) s WHERE s.cep = c.cep)
     """)).scalar() or 0
 
     inserted = after - before
-    return inserted, incoming - inserted, stale
+    return inserted, total_in - inserted, stale

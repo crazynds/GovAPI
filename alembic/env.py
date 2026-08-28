@@ -25,17 +25,19 @@ config.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# `correios_cep` (criada pelo edne-correios-loader / bootstrap em
-# app/routers/enderecos.py) não é gerenciada pelo Alembic -- é dona externa
-# do próprio esquema, reconstruído do zero a cada `import-ceps`.
 target_metadata = Base.metadata
 
-TABLES_NOT_MANAGED_BY_ALEMBIC = {"correios_cep"}
+# `correios_cep` era excluída daqui, quando o edne-correios-loader era dono do
+# esquema dela. Hoje é um model nosso (models.CorreiosCep): a lib só popula uma
+# tabela de scratch e nós fazemos o upsert, então o Alembic gerencia a tabela
+# como qualquer outra -- e é isso que permite a FK de establishments.cep.
+
+# `correios_cep_import` é a tabela de scratch daquele import: criada e
+# destruída dentro de `import-ceps`, nunca deve aparecer num autogenerate.
+TABLES_NOT_MANAGED_BY_ALEMBIC = {"correios_cep_import"}
 
 
 def include_object(object, name, type_, reflected, compare_to):
-    # Sem isso, autogenerate acha `correios_cep` (existe no banco, não está
-    # em Base.metadata) e sugere um DROP TABLE -- ela é de outra ferramenta.
     if type_ == "table" and name in TABLES_NOT_MANAGED_BY_ALEMBIC:
         return False
     return True

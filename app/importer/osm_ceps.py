@@ -149,7 +149,9 @@ def import_ceps_from_osm(db: Session) -> int:
 
         result = db.execute(text("""
             INSERT INTO cep_coordenadas (cep, latitude, longitude, source, updated_at)
-            SELECT cep, latitude::numeric, longitude::numeric, 'osm_extract', :now
+            -- cep é INTEGER na tabela (casa com correios_cep.cep); a temp
+            -- recebe texto direto do COPY e o cast sai aqui.
+            SELECT cep::integer, latitude::numeric, longitude::numeric, 'osm_extract', :now
             FROM tmp_osm_ceps
             ON CONFLICT (cep) DO NOTHING
         """), {"now": datetime.now(timezone.utc)})

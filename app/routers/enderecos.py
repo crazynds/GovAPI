@@ -1,11 +1,9 @@
-import re
 from datetime import datetime, timezone
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 
 from app import ceps
@@ -15,12 +13,13 @@ from app.regions import ufs_for_regiao
 
 router = APIRouter(prefix="/enderecos", tags=["enderecos"])
 
-# Base oficial e gratuita dos Correios (e-DNE Básico). O esquema vem do
-# edne-correios-loader, então não é um model SQLAlchemy nosso e falamos com ela
-# via SQL direto -- nome, colunas e DDL vivem em app/ceps.py.
+# Base oficial e gratuita dos Correios (e-DNE Básico). É um model nosso
+# (models.CorreiosCep), mas as buscas aqui são SQL direto por causa do cálculo
+# de distância e dos filtros dinâmicos. `cep` é INTEGER no banco e sai
+# formatado com zero à esquerda -- ver ceps.select_columns.
 CORREIOS_CEP_TABLE = ceps.TABLE
-CORREIOS_CEP_COLUMNS = ", ".join(ceps.COLUMNS)
-_CORREIOS_CEP_COLUMNS_PREFIXED_E = ", ".join(f"e.{c.strip()}" for c in CORREIOS_CEP_COLUMNS.split(","))
+CORREIOS_CEP_COLUMNS = ceps.select_columns()
+_CORREIOS_CEP_COLUMNS_PREFIXED_E = ceps.select_columns("e")
 
 # UF -> nome, IBGE não muda isso com frequência (dado estático).
 ESTADOS = [
@@ -53,23 +52,22 @@ def buscar_cep(cep: str, db: Session = Depends(get_db)):
     consulta o ViaCEP (gratuito, sem chave) e grava o resultado na mesma
     tabela -- assim a próxima consulta pro mesmo CEP já vem local.
 
-    Nota: como `import-ceps` reconstrói a tabela do zero a cada execução,
-    um CEP adicionado aqui via ViaCEP é perdido no próximo import oficial
-    -- aceitável, já que o e-DNE atualizado tende a cobrir o que faltava.
+    Um CEP adicionado aqui via ViaCEP sobrevive ao próximo `import-ceps`: o
+    import é upsert, não substituição (ver app/ceps.py).
     """
-    digits = re.sub(r"\D", "", cep)
-    if len(digits) != 8:
+    value = ceps.to_int(cep)
+    if value is None:
         raise HTTPException(422, "CEP deve ter 8 dígitos")
 
-    from_correios = _query_correios_cep(db, digits)
+    from_correios = _query_correios_cep(db, value)
     if from_correios:
-        coords = _get_or_fetch_coordinates(db, digits)
+        coords = _get_or_fetch_coordinates(db, value)
         from_correios["latitude"] = coords[0] if coords else None
         from_correios["longitude"] = coords[1] if coords else None
         return from_correios
 
     try:
-        response = httpx.get(f"https://viacep.com.br/ws/{digits}/json/", timeout=10)
+        response = httpx.get(f"https://viacep.com.br/ws/{ceps.to_str(value)}/json/", timeout=10)
         response.raise_for_status()
         data = response.json()
     except httpx.HTTPError as exc:
@@ -79,7 +77,7 @@ def buscar_cep(cep: str, db: Session = Depends(get_db)):
         raise HTTPException(404, "CEP não encontrado")
 
     row = {
-        "cep": digits,
+        "cep": value,
         "logradouro": data.get("logradouro") or None,
         "complemento": data.get("complemento") or None,
         "bairro": data.get("bairro") or None,
@@ -93,10 +91,9 @@ def buscar_cep(cep: str, db: Session = Depends(get_db)):
     # persiste se o ViaCEP realmente trouxe esses três; senão só devolve a
     # resposta sem gravar (ainda é melhor que dar erro pro cliente).
     if row["municipio"] and row["uf"] and row["municipio_cod_ibge"]:
-        _ensure_correios_cep_table(db)
         db.execute(
             text(f"""
-                INSERT INTO {CORREIOS_CEP_TABLE} ({CORREIOS_CEP_COLUMNS})
+                INSERT INTO {CORREIOS_CEP_TABLE} ({", ".join(ceps.COLUMNS)})
                 VALUES (:cep, :logradouro, :complemento, :bairro, :municipio, :municipio_cod_ibge, :uf, :nome)
                 ON CONFLICT (cep) DO UPDATE SET
                     logradouro = excluded.logradouro, complemento = excluded.complemento,
@@ -107,7 +104,9 @@ def buscar_cep(cep: str, db: Session = Depends(get_db)):
         )
         db.commit()
 
-    coords = _get_or_fetch_coordinates(db, digits)
+    coords = _get_or_fetch_coordinates(db, value)
+    # De volta pras 8 posições com zero à esquerda, que é o que a API expõe.
+    row["cep"] = ceps.to_str(value)
     row["latitude"] = coords[0] if coords else None
     row["longitude"] = coords[1] if coords else None
     return row
@@ -131,7 +130,7 @@ _DISTANCE_KM_SQL = """
 # fallback de baixa precisão -- sem isso, a busca por proximidade só
 # funcionaria pra CEPs já consultados individualmente, o que na prática é
 # quase nenhum. `exata` diz qual das duas foi usada.
-_COORD_JOIN_SQL = f"""
+_COORD_JOIN_SQL = """
     LEFT JOIN cep_coordenadas cc ON cc.cep = e.cep
     LEFT JOIN municipios mu ON mu.ibge_code = e.municipio_cod_ibge::text
     CROSS JOIN LATERAL (
@@ -158,7 +157,8 @@ def buscar_endereco(
     db: Session = Depends(get_db),
 ):
     """Busca por texto/filtros na base oficial dos Correios (e-DNE) -- precisa
-    do `import-ceps` já ter rodado, senão retorna lista vazia.
+    do `import-ceps` já ter rodado, senão a tabela está vazia e o resultado
+    também.
 
     Passando `lat`+`lon`, ordena por distância em vez de município/logradouro
     -- usa a coordenada exata do CEP quando já foi consultado (ver
@@ -212,12 +212,8 @@ def buscar_endereco(
             LIMIT :limit OFFSET :offset
         """
 
-    try:
-        result = db.execute(text(query_sql), params)
-        return [dict(row._mapping) for row in result]
-    except ProgrammingError:
-        db.rollback()
-        return []
+    result = db.execute(text(query_sql), params)
+    return [dict(row._mapping) for row in result]
 
 
 @router.get("/proximos")
@@ -234,29 +230,21 @@ def enderecos_proximos(
     `import-municipios-geo`) -- cada item vem com `exata: true/false`
     dizendo qual das duas foi usada. Município ainda não geocodificado
     fica de fora até `import-municipios-geo` rodar."""
-    try:
-        result = db.execute(
-            text(f"""
-                SELECT {_CORREIOS_CEP_COLUMNS_PREFIXED_E}, coord.exata, {_DISTANCE_KM_SQL} AS distancia_km
-                FROM {CORREIOS_CEP_TABLE} e
-                {_COORD_JOIN_SQL}
-                WHERE coord.lat_final IS NOT NULL AND {_DISTANCE_KM_SQL} <= :raio_km
-                ORDER BY distancia_km ASC
-                LIMIT :limit
-            """),
-            {"lat": lat, "lon": lon, "raio_km": raio_km, "limit": limit},
-        )
-        return [dict(row._mapping) for row in result]
-    except ProgrammingError:
-        db.rollback()
-        return []
+    result = db.execute(
+        text(f"""
+            SELECT {_CORREIOS_CEP_COLUMNS_PREFIXED_E}, coord.exata, {_DISTANCE_KM_SQL} AS distancia_km
+            FROM {CORREIOS_CEP_TABLE} e
+            {_COORD_JOIN_SQL}
+            WHERE coord.lat_final IS NOT NULL AND {_DISTANCE_KM_SQL} <= :raio_km
+            ORDER BY distancia_km ASC
+            LIMIT :limit
+        """),
+        {"lat": lat, "lon": lon, "raio_km": raio_km, "limit": limit},
+    )
+    return [dict(row._mapping) for row in result]
 
 
-def _ensure_correios_cep_table(db: Session) -> None:
-    ceps.ensure_table(db)
-
-
-def _get_or_fetch_coordinates(db: Session, cep: str) -> tuple[float, float] | None:
+def _get_or_fetch_coordinates(db: Session, cep: int) -> tuple[float, float] | None:
     """Lat/long por CEP, cacheadas em `cep_coordenadas` (tabela nossa,
     imune ao rebuild do e-DNE). Se ainda não tem, busca na BrasilAPI
     (gratuita, sem chave) -- best-effort: nunca falha a consulta de
@@ -271,7 +259,7 @@ def _get_or_fetch_coordinates(db: Session, cep: str) -> tuple[float, float] | No
     latitude = longitude = None
     source = "brasilapi_sem_coordenada"
     try:
-        response = httpx.get(f"https://brasilapi.com.br/api/cep/v2/{cep}", timeout=8)
+        response = httpx.get(f"https://brasilapi.com.br/api/cep/v2/{ceps.to_str(cep)}", timeout=8)
         if response.status_code == 200:
             coords = response.json().get("location", {}).get("coordinates", {})
             if coords.get("latitude") and coords.get("longitude"):
@@ -295,16 +283,9 @@ def _get_or_fetch_coordinates(db: Session, cep: str) -> tuple[float, float] | No
     return (latitude, longitude) if latitude and longitude else None
 
 
-def _query_correios_cep(db: Session, cep: str) -> dict | None:
-    try:
-        result = db.execute(
-            text(f"SELECT {CORREIOS_CEP_COLUMNS} FROM {CORREIOS_CEP_TABLE} WHERE cep = :cep LIMIT 1"),
-            {"cep": cep},
-        ).first()
-    except ProgrammingError:
-        # Tabela ainda não existe -- `import-ceps` nunca rodou nem nenhum
-        # fallback de ViaCEP criou ela ainda. Cai pro ViaCEP normalmente.
-        db.rollback()
-        return None
-
+def _query_correios_cep(db: Session, cep: int) -> dict | None:
+    result = db.execute(
+        text(f"SELECT {CORREIOS_CEP_COLUMNS} FROM {CORREIOS_CEP_TABLE} WHERE cep = :cep LIMIT 1"),
+        {"cep": cep},
+    ).first()
     return dict(result._mapping) if result else None
