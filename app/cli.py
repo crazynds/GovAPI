@@ -116,76 +116,18 @@ def import_municipios_geo_command():
         db.close()
 
 
-@cli.command("import-ceps-osm")
-def import_ceps_osm_command():
-    """
-    Baixa o extrato do Brasil do OpenStreetMap (Geofabrik, ~2GB, sem
-    limite de taxa) e carrega em massa os CEPs com coordenada nele em
-    `cep_coordenadas` -- só preenche o que ainda não existe (nunca
-    sobrescreve uma coordenada exata já cacheada via BrasilAPI).
-
-    Alternativa a geocodificar CEP a CEP contra o Nominatim: pra ~1.6
-    milhão de CEPs isso violaria a política de uso da API pública deles
-    (que pede uso local pra geocodificação em massa) e levaria semanas.
-    Cobertura é parcial (depende de quanto o OSM foi mapeado na região),
-    mas cai de uma vez, sem chamadas de API.
-    """
-    from app.importer.osm_ceps import import_ceps_from_osm
-
-    db = SessionLocal()
-    try:
-        inserted = import_ceps_from_osm(db)
-        typer.echo(f"OSM: {inserted} CEPs novos carregados.")
-    finally:
-        db.close()
-
-
-@cli.command("geo-worker")
-def geo_worker_command():
-    """
-    Roda até preencher toda a latitude/longitude que dá pra preencher sem
-    violar limite de taxa de API nenhuma: geocodifica os municípios
-    pendentes (Nominatim, ~1h40 na primeira vez) e carrega os CEPs do
-    extrato do OpenStreetMap (`import-ceps-osm`). Feito isso, termina --
-    não é um serviço contínuo, é um job de uma vez só (ver o serviço
-    `geo-worker` no docker-compose.yml).
-    """
-    from app.importer.geocoding import geocode_municipios
-    from app.importer.osm_ceps import import_ceps_from_osm
-
-    db = SessionLocal()
-    try:
-        typer.echo("== Municípios (Nominatim) ==")
-        geocoded, total = geocode_municipios(db)
-        typer.echo(f"{geocoded}/{total} município(s) pendente(s) geocodificado(s).")
-
-        typer.echo("== CEPs (extrato OpenStreetMap) ==")
-        inserted = import_ceps_from_osm(db)
-        typer.echo(f"{inserted} CEP(s) novo(s) carregado(s).")
-
-        typer.echo("geo-worker concluído.")
-    finally:
-        db.close()
-
-
 @cli.command("import-all")
 def import_all():
     """
-    Roda todas as importações de uma vez só: CEPs dos Correios (e-DNE) e
-    CNPJ da Receita Federal. Use os comandos `import-ceps`/`import-cnpj`
+    Roda todas as importações de uma vez só: CNPJ da Receita Federal e
+    CEPs dos Correios (e-DNE). Use os comandos `import-cnpj`/`import-ceps`
     em separado se só precisar atualizar uma das bases.
-
-    CEPs primeiro, e a ordem importa: o build do CNPJ liga cada
-    estabelecimento ao seu CEP em `correios_cep` e, quando o CEP já resolve
-    o endereço, deixa de guardar logradouro/bairro (vêm do join na leitura).
-    Sem a tabela de CEP no lugar, esse dado é duplicado em dezenas de
-    milhões de linhas -- ver _build_final_table.
     """
-    typer.echo("== CEPs (Correios / e-DNE) ==")
-    _import_ceps(source=None)
-
     typer.echo("== CNPJ (Receita Federal) ==")
     _import_cnpj(period=None, only=None)
+
+    typer.echo("== CEPs (Correios / e-DNE) ==")
+    _import_ceps(source=None)
 
     typer.echo("Todas as importações concluídas.")
 

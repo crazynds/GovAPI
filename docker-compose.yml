@@ -42,25 +42,5 @@ services:
       # Scratch de zips/CSVs do import -- some com o container, não precisa
       # de volume nomeado (ver APP_DOWNLOAD_DIR em app/config.py).
 
-  # Job de uma vez só: preenche latitude/longitude de municípios (Nominatim)
-  # e CEPs (extrato OpenStreetMap/Geofabrik) -- ver `python -m app.cli
-  # geo-worker`. Sem `restart`, então ele sobe, termina e fica parado
-  # (não reinicia sozinho); não sobe por padrão com `docker compose up`,
-  # precisa pedir explicitamente: `docker compose up geo-worker`.
-  geo-worker:
-    build: .
-    profiles: ["geo-worker"]
-    environment:
-      APP_DB_HOST: ${APP_DB_HOST:-db}
-      APP_DB_PORT: ${APP_DB_PORT:-5432}
-      APP_DB_USER: ${APP_DB_USER:-cnpj}
-      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-cnpj}
-      APP_DB_NAME: ${APP_DB_NAME:-cnpj}
-    volumes:
-      - ./app:/srv/app
-      - ./alembic:/srv/alembic
-      - ./alembic.ini:/srv/alembic.ini
-    command: ["python", "-m", "app.cli", "geo-worker"]
-
 volumes:
   cnpj_db_data:
