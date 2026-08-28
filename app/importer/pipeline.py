@@ -762,10 +762,19 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
     _set_step(progress, "build", period=period, group="build", status="running", message="montando establishments")
 
     db.execute(text("DROP TABLE IF EXISTS establishments_new"))
+    # UNLOGGED aqui, LOGGED soh antes do swap (ver mais abaixo): o INSERT de
+    # dezenas de milhoes de linhas e a criacao dos indices deferidos, feitos
+    # numa tabela LOGGED comum, geram WAL completo pra cada linha e cada
+    # entrada de indice -- o unico trecho pesado do pipeline que ainda pagava
+    # esse custo, quando o staging inteiro ja evita WAL de proposito (ver
+    # `_staging()`). UNLOGGED elimina isso durante o bulk load; `SET LOGGED`
+    # no fim grava tudo de uma vez, como uma operacao so, em vez de
+    # incrementalmente a cada INSERT/CREATE INDEX.
+    #
     # Sem INCLUDING INDEXES: os secundarios sao criados depois do bulk load
     # (ver DEFERRED_INDEXES). So a PK de cnpj entra antes, porque o ON CONFLICT
     # do INSERT abaixo precisa dela.
-    db.execute(text("CREATE TABLE establishments_new (LIKE establishments INCLUDING DEFAULTS)"))
+    db.execute(text("CREATE UNLOGGED TABLE establishments_new (LIKE establishments INCLUDING DEFAULTS)"))
     db.execute(text("ALTER TABLE establishments_new ADD CONSTRAINT establishments_new_pkey PRIMARY KEY (cnpj)"))
     # Sem UPDATE depois do bulk load, entao nao ha por que reservar espaco
     # livre por pagina pra HOT update (LIKE nao copia storage parameters).
@@ -948,6 +957,13 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
         where_sql = f" WHERE {where}" if where else ""
         db.execute(text(f'CREATE INDEX "{name}_new" ON establishments_new{using_sql} {cols}{where_sql}'))
         db.commit()
+
+    # Grava a tabela inteira no WAL de uma vez -- unico ponto em que o bulk
+    # load paga esse custo, em vez de a cada linha/indice.
+    _set_step(progress, "build", period=period, group="build", status="running", message="tornando establishments_new durável (SET LOGGED)")
+    display.set(slot, "  build: SET LOGGED (grava no WAL)")
+    db.execute(text("ALTER TABLE establishments_new SET LOGGED"))
+    db.commit()
 
     display.set(slot, "  build: swap atômico")
     db.execute(text("ALTER TABLE establishments RENAME TO establishments_old"))
