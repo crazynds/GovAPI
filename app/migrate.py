@@ -1,7 +1,6 @@
 """Aplica as migrations pendentes (Alembic) no boot do container -- roda
-antes do uvicorn/scheduler subir (ver docker-entrypoint.sh). Usa um
-advisory lock do Postgres pra `app` e `scheduler` não tentarem migrar ao
-mesmo tempo quando sobem juntos."""
+antes do uvicorn subir (ver docker-entrypoint.sh). Usa um advisory lock do
+Postgres pra evitar duas instâncias migrando ao mesmo tempo."""
 
 import logging
 import time

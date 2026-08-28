@@ -6,6 +6,5 @@ pydantic==2.10.4
 pydantic-settings==2.7.0
 httpx==0.28.1
 typer==0.19.2
-apscheduler==3.10.4
 edne-correios-loader==1.2.0
 alembic==1.14.0

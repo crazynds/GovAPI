@@ -64,13 +64,13 @@ The same `docker-compose.yml` runs in production, just with different environmen
    APP_DB_PASSWORD=password
    APP_DB_NAME=cnpj
    ```
-3. **Bring up only the app and scheduler** — skip `--profile local-db` so the bundled `db` container never starts:
+3. **Bring up just the app** — skip `--profile local-db` so the bundled `db` container never starts:
    ```bash
    cp .env.example .env
    $EDITOR .env   # set APP_DB_* (step 2) and anything else you need
-   docker compose up -d app scheduler
+   docker compose up -d app
    ```
-   Both containers apply pending database migrations on boot — see [Database migrations](#database-migrations).
+   It applies pending database migrations on boot — see [Database migrations](#database-migrations).
 4. **Put a reverse proxy in front of it** for TLS and a domain, e.g. with [Caddy](https://caddyserver.com):
    ```
    api.yourdomain.com {
@@ -84,8 +84,8 @@ To update to a new version of the code later:
 
 ```bash
 git pull
-docker compose build app scheduler
-docker compose up -d app scheduler
+docker compose build app
+docker compose up -d app
 ```
 
 ## Configuration
@@ -123,7 +123,7 @@ docker compose run --rm app python -m app.cli import-cnpj --only estabelecimento
 docker compose run --rm app python -m app.cli import-ceps
 ```
 
-Both also run automatically on the 20th of every month at 03:00, via the `scheduler` service. Progress:
+Neither runs automatically — schedule `import-all` yourself (e.g. cron, an external scheduler) if you want periodic refreshes. Progress:
 
 ```bash
 curl http://localhost:8000/import/status
@@ -131,7 +131,7 @@ curl http://localhost:8000/import/status
 
 ## Database migrations
 
-Schema is managed with [Alembic](https://alembic.sqlalchemy.org/). Both `app` and `scheduler` apply pending migrations automatically on boot (see `docker-entrypoint.sh` / `app/migrate.py`).
+Schema is managed with [Alembic](https://alembic.sqlalchemy.org/). `app` applies pending migrations automatically on boot (see `docker-entrypoint.sh` / `app/migrate.py`).
 
 To run migrations by hand:
 
@@ -200,7 +200,6 @@ app/
 ├── schemas.py        # Pydantic response models
 ├── db.py             # Session/engine setup
 ├── migrate.py        # Alembic runner used on container boot
-├── scheduler.py      # Monthly import job (APScheduler)
 ├── cli.py            # `python -m app.cli ...` commands
 ├── regions.py        # UF ↔ region mapping
 ├── tax_tables.py      # Simples Nacional Anexos I–V (static tables)

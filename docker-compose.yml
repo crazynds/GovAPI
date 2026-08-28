@@ -36,22 +36,6 @@ services:
     volumes:
       - cnpj_download_data:/data/cnpj-import
 
-  # Roda a importação uma vez por mês (dia 20, 03:00) -- ver app/scheduler.py.
-  # Pra rodar manualmente: `docker compose run --rm app python -m app.cli import-cnpj`
-  scheduler:
-    build: .
-    restart: unless-stopped
-    environment:
-      APP_DB_HOST: ${APP_DB_HOST:-db}
-      APP_DB_PORT: ${APP_DB_PORT:-5432}
-      APP_DB_USER: ${APP_DB_USER:-cnpj}
-      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-cnpj}
-      APP_DB_NAME: ${APP_DB_NAME:-cnpj}
-      APP_DOWNLOAD_DIR: /data/cnpj-import
-    volumes:
-      - cnpj_download_data:/data/cnpj-import
-    command: ["python", "-m", "app.scheduler"]
-
 volumes:
   cnpj_db_data:
   cnpj_download_data:
