@@ -193,25 +193,43 @@ class ImportPipeline:
         self.display = ProgressDisplay(len(STEPS))
         # Uma sessao por thread: Session do SQLAlchemy nao e thread-safe.
         self._sessions: dict[int, Session] = {}
+        self._progress_sessions: dict[int, Session] = {}
         self._sessions_lock = threading.Lock()
         self.imported_rows = 0  # total carregado no run, logado no fim
 
     # -- sessoes ----------------------------------------------------------
 
     def session(self) -> Session:
+        """Sessao de dados da thread atual (COPY, UPSERT, build)."""
+        return self._session_from(self._sessions)
+
+    def progress_session(self) -> Session:
+        """Sessao SO pra escrever progresso, separada da de dados.
+
+        Duas razoes. A primeira e correcao: gravar progresso na sessao de dados
+        faz um commit no meio do carregamento, e um commit devolve a conexao ao
+        pool -- com tres threads disputando o mesmo pool, o proximo uso pode
+        pegar OUTRA conexao, e a tabela TEMP do COPY (que e por conexao) some
+        no meio do caminho. A segunda e semantica: progresso e escrituracao,
+        nao deve ser desfeito junto com um rollback dos dados.
+        """
+        return self._session_from(self._progress_sessions)
+
+    def _session_from(self, pool: dict[int, Session]) -> Session:
         key = threading.get_ident()
         with self._sessions_lock:
-            db = self._sessions.get(key)
+            db = pool.get(key)
             if db is None:
                 db = SessionLocal()
-                self._sessions[key] = db
+                pool[key] = db
             return db
 
     def close_sessions(self) -> None:
         with self._sessions_lock:
-            for db in self._sessions.values():
-                db.close()
-            self._sessions.clear()
+            for pool in (self._sessions, self._progress_sessions):
+                for db in pool.values():
+                    db.close()
+                pool.clear()
 
     # -- execucao ---------------------------------------------------------
 
@@ -225,8 +243,9 @@ class ImportPipeline:
         main_db = self.session()
         logger.info("Orçamento de disco: %s", human_bytes(self.budget.total))
 
-        _set_run(main_db, period=self.period, status="running", message="iniciando")
-        _reset_steps(main_db, self.period)
+        progress = self.progress_session()
+        _set_run(progress, period=self.period, status="running", message="iniciando")
+        _reset_steps(progress, self.period)
 
         jobs = self._plan(main_db)
         logger.info("%d arquivo(s) a processar em %s", len(jobs), self.period)
@@ -242,15 +261,15 @@ class ImportPipeline:
             thread.join()
 
         self.display.close()
-        _finish_steps(self.session())
+        _finish_steps(self.progress_session())
 
         if self.error:
             raise self.error
 
         if self.run_build:
-            _build_final_table(main_db, self.period, self.display)
+            _build_final_table(main_db, progress, self.period, self.display)
 
-        _set_run(main_db, period=self.period, status="success", message="importação concluída")
+        _set_run(progress, period=self.period, status="success", message="importação concluída")
 
     def _plan(self, db: Session) -> list[Job]:
         all_files = client.list_files(self.period)
@@ -400,7 +419,7 @@ class ImportPipeline:
 
     def _download(self, job: Job, slot: int, total: int) -> None:
         url = client.period_url(job.period) + job.file
-        db = self.session()
+        db = self.progress_session()
         downloaded = 0
         logger.info("Baixando %s/%s (%s)", job.group, job.file, human_bytes(total) if total else "tamanho desconhecido")
 
@@ -435,7 +454,7 @@ class ImportPipeline:
         logger.info("Download de %s concluído: %s", job.file, human_bytes(downloaded))
 
     def _extract(self, job: Job, slot: int) -> None:
-        db = self.session()
+        db = self.progress_session()
         written = 0
 
         with zipfile.ZipFile(job.zip_path) as zf:
@@ -487,10 +506,11 @@ class ImportPipeline:
         # teto aproximado, e o CSV_EXPANSION_FACTOR e folgado de proposito.
 
     def _import(self, db: Session, job: Job, slot: int) -> None:
+        progress = self.progress_session()
         if job.group == "reference":
-            job.rows = _import_reference(db, job, self.display, slot)
+            job.rows = _import_reference(db, progress, job, self.display, slot)
         else:
-            job.rows = _import_group(db, job, self.display, slot)
+            job.rows = _import_group(db, progress, job, self.display, slot)
 
 
 def _put(q: queue.Queue, item, abort: threading.Event) -> None:
@@ -527,9 +547,8 @@ def run_import(period: str | None = None, only: list[str] | None = None) -> None
     try:
         pipeline.run()
     except BaseException as exc:  # noqa: BLE001
-        db = pipeline.session()
-        db.rollback()  # senao o proprio registro de falha abaixo falharia
-        _set_run(db, status="failed", message=str(exc)[:255])
+        pipeline.session().rollback()  # senao a sessao fica com a transacao abortada
+        _set_run(pipeline.progress_session(), status="failed", message=str(exc)[:255])
         raise
     finally:
         pipeline.display.close()
@@ -560,7 +579,7 @@ class _IteratorFile:
         return result
 
 
-def _import_group(db: Session, job: Job, display: ProgressDisplay, slot: int) -> int:
+def _import_group(db: Session, progress: Session, job: Job, display: ProgressDisplay, slot: int) -> int:
     spec = GROUP_SPECS[job.group]
     quoted_cols = ", ".join(f'"{c}"' for c in spec.columns)
 
@@ -570,6 +589,12 @@ def _import_group(db: Session, job: Job, display: ProgressDisplay, slot: int) ->
     # minutos e horas num arquivo de dezenas de milhoes de linhas. Como a temp
     # ja tem os tipos finais, o COPY faz o parse em C e o INSERT ... SELECT
     # abaixo nao precisa de um unico CAST.
+    # Tudo daqui ate o commit final roda numa transacao SO. Nao e detalhe: a
+    # tabela TEMP pertence a CONEXAO, e um commit no meio devolveria a conexao
+    # ao pool -- com os tres estagios disputando o mesmo pool, o passo seguinte
+    # poderia pegar outra conexao e a temp sumiria (visto na pratica, no COPY
+    # de 50M linhas do Simples.zip: "relation tmp_staging_load does not exist").
+    # Por isso tambem o progresso vai por `progress`, uma sessao separada.
     tmp_table = "tmp_staging_load"
     db.execute(text(f"DROP TABLE IF EXISTS {tmp_table}"))
     # `AS SELECT ... WITH NO DATA` e nao `LIKE`: da exatamente as colunas que o
@@ -577,10 +602,12 @@ def _import_group(db: Session, job: Job, display: ProgressDisplay, slot: int) ->
     # traria tambem as colunas que nao carregamos -- inclusive o `id` de
     # socios, que vem NOT NULL mas sem o default da sequence (LIKE nao copia
     # default), e o COPY morria com NotNullViolation.
+    # ON COMMIT DROP: some sozinha no commit e no rollback, entao uma tentativa
+    # que falhou no meio nao deixa lixo pra proxima.
     db.execute(text(
-        f"CREATE TEMP TABLE {tmp_table} AS SELECT {quoted_cols} FROM {spec.table} WITH NO DATA"
+        f"CREATE TEMP TABLE {tmp_table} ON COMMIT DROP AS "
+        f"SELECT {quoted_cols} FROM {spec.table} WITH NO DATA"
     ))
-    db.commit()
 
     csv_size = os.path.getsize(job.csv_path)
     bar = display.bar(slot, f"  importando {job.file}", total=csv_size, unit="bytes")
@@ -619,7 +646,7 @@ def _import_group(db: Session, job: Job, display: ProgressDisplay, slot: int) ->
         logger.warning("%s: %s", job.file, job.counters.summary())
 
     _set_step(
-        db, "import", period=job.period, group=job.group, current_file=job.file, status="running",
+        progress, "import", period=job.period, group=job.group, current_file=job.file, status="running",
         processed_rows=count, message=f"mesclando {count} linhas no staging",
     )
 
@@ -646,18 +673,17 @@ def _import_group(db: Session, job: Job, display: ProgressDisplay, slot: int) ->
     else:
         db.execute(text(f"INSERT INTO {spec.table} ({quoted_cols}) SELECT {quoted_cols} FROM {tmp_table}"))
 
-    db.execute(text(f"DROP TABLE {tmp_table}"))
-    db.commit()
+    db.commit()  # a temp cai junto (ON COMMIT DROP)
     logger.info("Mesclado %s no destino em %.1fs", job.file, time.monotonic() - t0)
 
     _set_step(
-        db, "import", period=job.period, group=job.group, current_file=job.file, status="running",
+        progress, "import", period=job.period, group=job.group, current_file=job.file, status="running",
         processed_rows=count, message=f"{count} linhas",
     )
     return count
 
 
-def _import_reference(db: Session, job: Job, display: ProgressDisplay, slot: int) -> int:
+def _import_reference(db: Session, progress: Session, job: Job, display: ProgressDisplay, slot: int) -> int:
     columns, model, key = REFERENCE_SPECS[job.file]
     table = model.__table__
     count = 0
@@ -686,7 +712,7 @@ def _import_reference(db: Session, job: Job, display: ProgressDisplay, slot: int
     db.commit()
     bar.update(csv_size, extra=f"{count} linhas", force=True)
     _set_step(
-        db, "import", period=job.period, group=job.group, current_file=job.file, status="running",
+        progress, "import", period=job.period, group=job.group, current_file=job.file, status="running",
         processed_rows=count, message=f"{count} linhas",
     )
     logger.info("Importado %s: %d linhas", job.file, count)
@@ -712,9 +738,9 @@ DEFERRED_INDEXES = [
 ]
 
 
-def _build_final_table(db: Session, period: str, display: ProgressDisplay) -> None:
+def _build_final_table(db: Session, progress: Session, period: str, display: ProgressDisplay) -> None:
     slot = STEPS.index("import")
-    _set_step(db, "build", period=period, group="build", status="running", message="montando establishments")
+    _set_step(progress, "build", period=period, group="build", status="running", message="montando establishments")
 
     db.execute(text("DROP TABLE IF EXISTS establishments_new"))
     # Sem INCLUDING INDEXES: os secundarios sao criados depois do bulk load
@@ -768,7 +794,7 @@ def _build_final_table(db: Session, period: str, display: ProgressDisplay) -> No
     # ainda existe. Sem isso Municipio.uf fica sempre NULL, o filtro por UF de
     # /municipios/search devolve vazio e o import-ibge (que casa por nome+UF)
     # nao casa nada.
-    _set_step(db, "build", period=period, group="build", status="running", message="preenchendo UF dos municípios")
+    _set_step(progress, "build", period=period, group="build", status="running", message="preenchendo UF dos municípios")
     # `municipios.uf` continua em texto (e a sigla que a API expoe, e a tabela
     # tem ~5,5k linhas), enquanto o staging guarda o codigo numerico -- dai o
     # join contra a lista de codigos, montada do mapa de app/regions.py pra nao
@@ -785,7 +811,7 @@ def _build_final_table(db: Session, period: str, display: ProgressDisplay) -> No
     db.commit()
 
     for name, cols, where, using in DEFERRED_INDEXES:
-        _set_step(db, "build", period=period, group="build", status="running", message=f"índice {name}")
+        _set_step(progress, "build", period=period, group="build", status="running", message=f"índice {name}")
         display.set(slot, f"  build: criando índice {name}")
         using_sql = f" USING {using}" if using else ""
         where_sql = f" WHERE {where}" if where else ""
@@ -807,7 +833,7 @@ def _build_final_table(db: Session, period: str, display: ProgressDisplay) -> No
 
     display.set(slot, "")
     _set_step(
-        db, "build", period=period, group="build", status="success",
+        progress, "build", period=period, group="build", status="success",
         processed_rows=imported.rowcount, message="tabela final trocada atomicamente",
     )
 
