@@ -823,6 +823,30 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
     db.commit()
     logger.info("establishments_new: %d linhas em %.1fs", imported.rowcount, time.monotonic() - t0)
 
+    if has_cep_table:
+        # Cobertura do vinculo por CEP. E o numero que decide se uma FOREIGN
+        # KEY de establishments.cep -> correios_cep.cep e possivel: ela so pode
+        # existir se este "orfaos" for zero, porque a Receita tambem publica CEP
+        # com digitacao errada, extinto, ou de endereco no exterior.
+        # `e.` obrigatorio no NOT EXISTS: sem qualificar, o `cep` de dentro
+        # resolve pra coluna da PROPRIA correios_cep (escopo mais interno
+        # primeiro), a condicao vira `c.cep = c.cep` e o contador da sempre 0.
+        cov = db.execute(text("""
+            SELECT count(*) FILTER (WHERE e.cep IS NOT NULL) AS com_cep,
+                   count(*) FILTER (WHERE e.cep IS NOT NULL AND e.street IS NULL) AS resolvidos,
+                   count(*) FILTER (
+                       WHERE e.cep IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM correios_cep c WHERE c.cep = lpad(e.cep::text, 8, '0')
+                       )
+                   ) AS orfaos
+            FROM establishments_new e
+        """)).mappings().one()
+        logger.info(
+            "CEP: %d com CEP, %d resolvidos pelos Correios, %d órfãos (CEP fora do e-DNE)",
+            cov["com_cep"], cov["resolvidos"], cov["orfaos"],
+        )
+
     # `Municipios.zip` da Receita so tem codigo+nome, sem UF -- pega o UF de
     # qualquer estabelecimento daquele municipio (sao 1:1) enquanto o staging
     # ainda existe. Sem isso Municipio.uf fica sempre NULL, o filtro por UF de

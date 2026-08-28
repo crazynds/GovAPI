@@ -8,20 +8,18 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 
+from app import ceps
 from app.db import get_db
 from app.models import CepCoordenada
 from app.regions import ufs_for_regiao
 
 router = APIRouter(prefix="/enderecos", tags=["enderecos"])
 
-# Nome/esquema da tabela unificada criada pelo comando `import-ceps` (ver
-# app/cli.py) via edne-correios-loader -- base oficial e gratuita dos
-# Correios (e-DNE Básico). Não é um model SQLAlchemy nosso (a lib é dona da
-# tabela e a reconstrói do zero a cada import), então falamos com ela via
-# SQL direto -- inclusive pra criar via CREATE TABLE IF NOT EXISTS antes do
-# primeiro `import-ceps` já ter rodado (ver _ensure_correios_cep_table).
-CORREIOS_CEP_TABLE = "correios_cep"
-CORREIOS_CEP_COLUMNS = "cep, logradouro, complemento, bairro, municipio, municipio_cod_ibge, uf, nome"
+# Base oficial e gratuita dos Correios (e-DNE Básico). O esquema vem do
+# edne-correios-loader, então não é um model SQLAlchemy nosso e falamos com ela
+# via SQL direto -- nome, colunas e DDL vivem em app/ceps.py.
+CORREIOS_CEP_TABLE = ceps.TABLE
+CORREIOS_CEP_COLUMNS = ", ".join(ceps.COLUMNS)
 _CORREIOS_CEP_COLUMNS_PREFIXED_E = ", ".join(f"e.{c.strip()}" for c in CORREIOS_CEP_COLUMNS.split(","))
 
 # UF -> nome, IBGE não muda isso com frequência (dado estático).
@@ -255,20 +253,7 @@ def enderecos_proximos(
 
 
 def _ensure_correios_cep_table(db: Session) -> None:
-    """Cria a tabela se `import-ceps` nunca rodou -- mesmo esquema usado
-    pelo edne-correios-loader, pra ficar compatível quando ele rodar depois."""
-    db.execute(text(f"""
-        CREATE TABLE IF NOT EXISTS {CORREIOS_CEP_TABLE} (
-            cep VARCHAR(8) PRIMARY KEY,
-            logradouro VARCHAR(100),
-            complemento VARCHAR(100),
-            bairro VARCHAR(72),
-            municipio VARCHAR(72) NOT NULL,
-            municipio_cod_ibge INTEGER NOT NULL,
-            uf VARCHAR(2) NOT NULL,
-            nome VARCHAR(100)
-        )
-    """))
+    ceps.ensure_table(db)
 
 
 def _get_or_fetch_coordinates(db: Session, cep: str) -> tuple[float, float] | None:

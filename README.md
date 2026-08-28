@@ -214,11 +214,21 @@ why `import-ceps` has to run before `import-cnpj` — that is the order
 address still works, it is just stored unresolved (the import warns). Each
 address in the API carries a `source` field saying which way it went.
 
-There is deliberately no foreign key. `correios_cep` belongs to
-`edne-correios-loader`, which deletes every row and repopulates on each
-`import-ceps`: a foreign key would block that delete, and `CASCADE`/`SET NULL`
-would wipe the address off tens of millions of companies. The Revenue also ships
-CEPs that do not exist, which no foreign key would accept.
+`import-ceps` upserts rather than replaces. `DneLoader.load()` deletes every row
+of its target table before repopulating, which would leave the CEP base empty
+mid-import and would block on any foreign key pointing at it. So the loader is
+pointed at a scratch table (via the `table_names` option it already exposes) and
+the merge into `correios_cep` is our own `INSERT ... ON CONFLICT DO UPDATE`; the
+library never touches the real table. CEPs the Post Office retired are kept
+rather than deleted — that is what makes the table safe to reference — and the
+import reports how many it is holding on to.
+
+There is still no foreign key on `establishments.cep`, for one remaining
+reason: the Revenue publishes CEPs that are mistyped, defunct, or foreign, and
+a foreign key cannot be added while any row violates it. Adding one would mean
+discarding those CEPs. Each CNPJ build logs the number, so the decision can be
+made against the real figure — look for the `CEP: ... órfãos` line in the build
+log, which counts establishments whose CEP is absent from `correios_cep`.
 
 Note: `correios_cep` (the e-DNE table) is **not** managed by Alembic — it's owned by `edne-correios-loader`, which rebuilds it on every `import-ceps` run.
 
