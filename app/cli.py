@@ -1,5 +1,7 @@
 import typer
+from sqlalchemy import text
 
+from app import ceps
 from app.config import settings
 from app.db import SessionLocal
 from app.importer.pipeline import run_import
@@ -7,9 +9,8 @@ from app.migrate import run_migrations
 
 cli = typer.Typer()
 
-# Nome da tabela unificada de CEP gerada pelo edne-correios-loader -- ver
-# app/routers/enderecos.py, que consulta essa tabela por nome fixo.
-CORREIOS_CEP_TABLE = "correios_cep"
+# Nome/esquema da tabela de CEP vivem em app/ceps.py -- ver o módulo.
+CORREIOS_CEP_TABLE = ceps.TABLE
 
 
 @cli.command()
@@ -116,6 +117,30 @@ def import_municipios_geo_command():
         db.close()
 
 
+@cli.command("import-ceps-osm")
+def import_ceps_osm_command():
+    """
+    Baixa o extrato do Brasil do OpenStreetMap (Geofabrik, ~2GB, sem
+    limite de taxa) e carrega em massa os CEPs com coordenada nele em
+    `cep_coordenadas` -- só preenche o que ainda não existe (nunca
+    sobrescreve uma coordenada exata já cacheada via BrasilAPI).
+
+    Alternativa a geocodificar CEP a CEP contra o Nominatim: pra ~1.6
+    milhão de CEPs isso violaria a política de uso da API pública deles
+    (que pede uso local pra geocodificação em massa) e levaria semanas.
+    Cobertura é parcial (depende de quanto o OSM foi mapeado na região),
+    mas cai de uma vez, sem chamadas de API.
+    """
+    from app.importer.osm_ceps import import_ceps_from_osm
+
+    db = SessionLocal()
+    try:
+        inserted = import_ceps_from_osm(db)
+        typer.echo(f"OSM: {inserted} CEPs novos carregados.")
+    finally:
+        db.close()
+
+
 @cli.command("import-all")
 def import_all():
     """
@@ -137,14 +162,46 @@ def _import_cnpj(period: str | None, only: list[str] | None) -> None:
 
 
 def _import_ceps(source: str | None) -> None:
+    """Importa o e-DNE fazendo UPSERT, não DELETE + INSERT.
+
+    O `DneLoader.load()` limpa a tabela alvo com um DELETE de todas as linhas
+    antes de repovoar. Isso é ruim por dois motivos: qualquer FOREIGN KEY
+    apontando pra `correios_cep` travaria esse DELETE, e durante a importação
+    (que roda numa transação só) a base fica sem CEP nenhum.
+
+    Em vez de mexer nas entranhas da lib, usamos o `table_names` que ela já
+    expõe: ela monta a base nova numa tabela de scratch, e o merge pra tabela
+    real é um UPSERT nosso. A lib nunca toca em `correios_cep`.
+    """
     from edne_correios_loader import DneLoader, TableSetEnum
 
-    loader = DneLoader(
-        settings.database_url,
-        dne_source=source,
-        table_names={"cep_unificado": CORREIOS_CEP_TABLE},
-    )
-    loader.load(table_set=TableSetEnum.UNIFIED_CEP_ONLY)
+    db = SessionLocal()
+    try:
+        db.execute(text(f"DROP TABLE IF EXISTS {ceps.SCRATCH_TABLE}"))
+        db.commit()
+
+        loader = DneLoader(
+            settings.database_url,
+            dne_source=source,
+            table_names={"cep_unificado": ceps.SCRATCH_TABLE},
+        )
+        loader.load(table_set=TableSetEnum.UNIFIED_CEP_ONLY)
+
+        ceps.ensure_table(db)
+        inserted, updated, stale = ceps.upsert_from(db, ceps.SCRATCH_TABLE)
+
+        db.execute(text(f"DROP TABLE {ceps.SCRATCH_TABLE}"))
+        db.commit()
+
+        typer.echo(f"CEPs: {inserted} novos, {updated} atualizados.")
+        if stale:
+            typer.echo(
+                f"Atenção: {stale} CEP(s) na tabela não vieram nesta versão do e-DNE "
+                "(extintos ou remanejados). Mantidos de propósito -- o import é upsert, "
+                "não substituição."
+            )
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":
