@@ -2,6 +2,7 @@ from datetime import date, datetime
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     Date,
     DateTime,
@@ -139,7 +140,10 @@ class ImportProgress(Base):
     group: Mapped[str | None] = mapped_column(String(20), nullable=True)
     current_file: Mapped[str | None] = mapped_column(String(60), nullable=True)
     step: Mapped[str | None] = mapped_column(String(20), nullable=True)  # download|extract|import|build
-    processed_rows: Mapped[int] = mapped_column(Integer, default=0)
+    # BigInteger -- no passo "download"/"extract" isso conta bytes, não
+    # linhas, e um arquivo de >2GB (ex. Estabelecimentos) já passa do
+    # limite de um Integer de 32 bits (visto na prática: NumericValueOutOfRange).
+    processed_rows: Mapped[int] = mapped_column(BigInteger, default=0)
     message: Mapped[str | None] = mapped_column(String(255), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime)
