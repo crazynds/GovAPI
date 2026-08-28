@@ -80,10 +80,16 @@ The same `docker-compose.yml` runs in production, just with different environmen
 5. **Run the first import** — see [Importing the data](#importing-the-data).
 6. **Lock down `POST /import/trigger`** at the reverse proxy if the API is public — it has no authentication.
 
-To update to a new version of the code later:
+The app's code (`app/`, `alembic/`) is bind-mounted from the host, not baked into the image — after `git pull`, restart the container to pick up the change:
 
 ```bash
 git pull
+docker compose restart app
+```
+
+Rebuild the image only when `requirements.txt` changes (dependencies do live in the image):
+
+```bash
 docker compose build app
 docker compose up -d app
 ```

@@ -35,6 +35,12 @@ services:
       - "${APP_PORT:-8000}:8000"
     volumes:
       - cnpj_download_data:/data/cnpj-import
+      # Código montado direto do host -- editar aqui já reflete no
+      # container, sem rebuild. Só precisa rebuildar (`docker compose build
+      # app`) quando requirements.txt mudar (dependências ficam na imagem).
+      - ./app:/srv/app
+      - ./alembic:/srv/alembic
+      - ./alembic.ini:/srv/alembic.ini
 
 volumes:
   cnpj_db_data:
