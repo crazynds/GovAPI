@@ -25,8 +25,8 @@ def import_cnpj(
     only: list[str] = typer.Option(None, help="Grupos a rodar: reference, simples, empresas, estabelecimentos, build."),
 ):
     """Baixa, descompacta e importa a base pública de CNPJ da Receita Federal."""
-    run_import(period=period, only=only or None)
-    typer.echo("Importação concluída.")
+    _import_cnpj(period=period, only=only)
+    typer.echo("Importação de CNPJ concluída.")
 
 
 @cli.command("import-ceps")
@@ -39,6 +39,31 @@ def import_ceps(
     (`correios_cep`), usando o pacote edne-correios-loader
     (https://github.com/cauethenorio/edne-correios-loader).
     """
+    _import_ceps(source=source)
+    typer.echo(f"Importação de CEPs concluída — tabela `{CORREIOS_CEP_TABLE}`.")
+
+
+@cli.command("import-all")
+def import_all():
+    """
+    Roda todas as importações de uma vez só: CNPJ da Receita Federal e
+    CEPs dos Correios (e-DNE). Use os comandos `import-cnpj`/`import-ceps`
+    em separado se só precisar atualizar uma das bases.
+    """
+    typer.echo("== CNPJ (Receita Federal) ==")
+    _import_cnpj(period=None, only=None)
+
+    typer.echo("== CEPs (Correios / e-DNE) ==")
+    _import_ceps(source=None)
+
+    typer.echo("Todas as importações concluídas.")
+
+
+def _import_cnpj(period: str | None, only: list[str] | None) -> None:
+    run_import(period=period, only=only or None)
+
+
+def _import_ceps(source: str | None) -> None:
     from edne_correios_loader import DneLoader, TableSetEnum
 
     loader = DneLoader(
@@ -47,7 +72,6 @@ def import_ceps(
         table_names={"cep_unificado": CORREIOS_CEP_TABLE},
     )
     loader.load(table_set=TableSetEnum.UNIFIED_CEP_ONLY)
-    typer.echo(f"Importação de CEPs concluída — tabela `{CORREIOS_CEP_TABLE}`.")
 
 
 if __name__ == "__main__":

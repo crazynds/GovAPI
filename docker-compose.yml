@@ -1,6 +1,6 @@
 services:
   # Postgres embutido, só pra quem não tem um servidor próprio -- fica atrás
-  # de um profile de propósito: apontando CNPJ_DATABASE_URL pro seu próprio
+  # de um profile de propósito: apontando APP_DATABASE_URL pro seu próprio
   # Postgres (produção, RDS, o que for), esse serviço nem precisa subir.
   # Rodar com ele: `docker compose --profile local-db up -d`
   db:
@@ -24,12 +24,12 @@ services:
     restart: unless-stopped
     environment:
       # Default aponta pro serviço `db` acima (profile local-db). Pra usar
-      # um Postgres seu, defina CNPJ_DATABASE_URL no .env -- ver .env.example.
-      CNPJ_DATABASE_URL: ${CNPJ_DATABASE_URL:-postgresql+psycopg2://cnpj:cnpj@db:5432/cnpj}
-      CNPJ_OPEN_DATA_URL: ${CNPJ_OPEN_DATA_URL:-https://dados-abertos-rf-cnpj.casadosdados.com.br/arquivos}
-      CNPJ_DOWNLOAD_DIR: /data/cnpj-import
+      # um Postgres seu, defina APP_DATABASE_URL no .env -- ver .env.example.
+      APP_DATABASE_URL: ${APP_DATABASE_URL:-postgresql+psycopg2://cnpj:cnpj@db:5432/cnpj}
+      APP_OPEN_DATA_URL: ${APP_OPEN_DATA_URL:-https://dados-abertos-rf-cnpj.casadosdados.com.br/arquivos}
+      APP_DOWNLOAD_DIR: /data/cnpj-import
     ports:
-      - "${CNPJ_IMPORTER_PORT:-8000}:8000"
+      - "${APP_PORT:-8000}:8000"
     volumes:
       - cnpj_download_data:/data/cnpj-import
 
@@ -39,9 +39,9 @@ services:
     build: .
     restart: unless-stopped
     environment:
-      CNPJ_DATABASE_URL: ${CNPJ_DATABASE_URL:-postgresql+psycopg2://cnpj:cnpj@db:5432/cnpj}
-      CNPJ_OPEN_DATA_URL: ${CNPJ_OPEN_DATA_URL:-https://dados-abertos-rf-cnpj.casadosdados.com.br/arquivos}
-      CNPJ_DOWNLOAD_DIR: /data/cnpj-import
+      APP_DATABASE_URL: ${APP_DATABASE_URL:-postgresql+psycopg2://cnpj:cnpj@db:5432/cnpj}
+      APP_OPEN_DATA_URL: ${APP_OPEN_DATA_URL:-https://dados-abertos-rf-cnpj.casadosdados.com.br/arquivos}
+      APP_DOWNLOAD_DIR: /data/cnpj-import
     volumes:
       - cnpj_download_data:/data/cnpj-import
     command: ["python", "-m", "app.scheduler"]

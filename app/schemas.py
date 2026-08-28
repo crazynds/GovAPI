@@ -11,8 +11,11 @@ class EstablishmentOut(BaseModel):
     is_mei: bool
     is_simples: bool
     company_size: str | None
+    company_size_label: str | None
     main_cnae_code: str | None
+    main_cnae_description: str | None
     secondary_cnae_codes: list[str]
+    secondary_cnae_descriptions: list[str]
     municipio_name: str | None
     uf: str | None
     email: str | None
@@ -32,11 +35,62 @@ class EstablishmentPage(BaseModel):
     last_page: int
 
 
+class CnaeCountOut(BaseModel):
+    cnae_code: str
+    total: int
+
+
+class EstablishmentStatsOut(BaseModel):
+    total: int
+    with_cellphone: int
+    with_email: int
+    by_uf: dict[str, int]
+    by_regiao: dict[str, int]
+    by_company_size: dict[str, int]
+    top_cnaes: list[CnaeCountOut]
+
+
 class CnaeOut(BaseModel):
     code: str
     description: str
 
     model_config = {"from_attributes": True}
+
+
+class AnexoOut(BaseModel):
+    anexo: str
+    descricao: str
+
+
+class FaixaOut(BaseModel):
+    faixa: int
+    rbt12_ate: float
+    aliquota_nominal: float
+    valor_a_deduzir: float
+
+
+class AnexoTabelaOut(BaseModel):
+    anexo: str
+    descricao: str
+    faixas: list[FaixaOut]
+
+
+class CalculoSimplesOut(BaseModel):
+    anexo: str
+    rbt12: float
+    faixa: int
+    aliquota_nominal: float
+    valor_a_deduzir: float
+    aliquota_efetiva: float
+    receita_mes: float
+    valor_imposto: float
+
+
+class FatorROut(BaseModel):
+    fator_r: float
+    limite: float
+    elegivel_anexo_iii: bool
+    anexo_sugerido: str
 
 
 class ImportStatusOut(BaseModel):

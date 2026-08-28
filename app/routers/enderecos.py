@@ -7,6 +7,7 @@ from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 
 from app.db import get_db
+from app.regions import ufs_for_regiao
 
 router = APIRouter(prefix="/enderecos", tags=["enderecos"])
 
@@ -107,31 +108,51 @@ def buscar_cep(cep: str, db: Session = Depends(get_db)):
 @router.get("/buscar")
 def buscar_endereco(
     logradouro: str | None = Query(None),
+    bairro: str | None = Query(None),
     municipio: str | None = Query(None),
-    uf: str | None = Query(None),
-    limit: int = Query(20, ge=1, le=100),
+    uf: list[str] | None = Query(None, description="Uma ou mais UFs, ex: ?uf=SP&uf=RJ"),
+    regiao: str | None = Query(None, description="norte/nordeste/centro-oeste/sudeste/sul, combina com uf"),
+    municipio_cod_ibge: int | None = Query(None),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
-    """Busca por texto na base oficial dos Correios (e-DNE) -- precisa do
-    `import-ceps` já ter rodado, senão retorna lista vazia."""
+    """Busca por texto/filtros na base oficial dos Correios (e-DNE) -- precisa
+    do `import-ceps` já ter rodado, senão retorna lista vazia."""
     conditions = []
-    params: dict = {"limit": limit}
+    params: dict = {"limit": per_page, "offset": (page - 1) * per_page}
 
     if logradouro:
         conditions.append("logradouro ILIKE :logradouro")
         params["logradouro"] = f"%{logradouro}%"
+    if bairro:
+        conditions.append("bairro ILIKE :bairro")
+        params["bairro"] = f"%{bairro}%"
     if municipio:
         conditions.append("municipio ILIKE :municipio")
         params["municipio"] = f"%{municipio}%"
-    if uf:
-        conditions.append("uf = :uf")
-        params["uf"] = uf.upper()
+    if municipio_cod_ibge:
+        conditions.append("municipio_cod_ibge = :municipio_cod_ibge")
+        params["municipio_cod_ibge"] = municipio_cod_ibge
+
+    ufs = {u.upper() for u in (uf or [])}
+    if regiao:
+        regiao_ufs = ufs_for_regiao(regiao)
+        if not regiao_ufs:
+            raise HTTPException(422, f"Região desconhecida: {regiao!r} (use norte/nordeste/centro-oeste/sudeste/sul)")
+        ufs |= set(regiao_ufs)
+    if ufs:
+        conditions.append("uf = ANY(:ufs)")
+        params["ufs"] = list(ufs)
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
     try:
         result = db.execute(
-            text(f"SELECT {CORREIOS_CEP_COLUMNS} FROM {CORREIOS_CEP_TABLE} {where} LIMIT :limit"),
+            text(
+                f"SELECT {CORREIOS_CEP_COLUMNS} FROM {CORREIOS_CEP_TABLE} {where} "
+                "ORDER BY municipio, logradouro LIMIT :limit OFFSET :offset"
+            ),
             params,
         )
         return [dict(row._mapping) for row in result]

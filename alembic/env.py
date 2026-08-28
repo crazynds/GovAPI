@@ -14,7 +14,7 @@ from app.db import Base
 config = context.config
 
 # Sobrescreve o valor do alembic.ini -- uma fonte só de configuração
-# (CNPJ_DATABASE_URL), sem duplicar a URL em dois lugares.
+# (APP_DATABASE_URL), sem duplicar a URL em dois lugares.
 config.set_main_option("sqlalchemy.url", settings.database_url)
 
 # Interpret the config file for Python logging.

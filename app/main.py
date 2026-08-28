@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 
-from app.routers import cnaes, enderecos, establishments, import_status, municipios
+from app.routers import cnaes, enderecos, establishments, impostos, import_status, municipios
 
 app = FastAPI(
     title="dados-gov-br",
@@ -13,6 +13,7 @@ app.include_router(cnaes.router)
 app.include_router(municipios.router)
 app.include_router(enderecos.router)
 app.include_router(import_status.router)
+app.include_router(impostos.router)
 
 
 @app.get("/health")

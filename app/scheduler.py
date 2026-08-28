@@ -1,21 +1,23 @@
 """Processo separado (container `scheduler` no docker-compose) que dispara
-`run_import` uma vez por mês -- mesmo horário usado antes no scheduler do
-Laravel (dia 20, 03:00), dando folga pro mirror publicar o período novo."""
+todas as importações (CNPJ + CEPs) uma vez por mês -- mesmo horário usado
+antes no scheduler do Laravel (dia 20, 03:00), dando folga pro mirror
+publicar o período novo da Receita."""
 
 import logging
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 
-from app.importer.pipeline import run_import
+from app.cli import _import_ceps, _import_cnpj
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scheduler")
 
 
 def scheduled_import():
-    logger.info("Iniciando importação agendada da base de CNPJ...")
+    logger.info("Iniciando importação agendada (CNPJ + CEPs)...")
     try:
-        run_import()
+        _import_cnpj(period=None, only=None)
+        _import_ceps(source=None)
         logger.info("Importação agendada concluída.")
     except Exception:
         logger.exception("Falha na importação agendada")

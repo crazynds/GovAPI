@@ -1,73 +1,206 @@
-# dados-gov-br
+# Gov API
 
-> Open API for Brazilian government public data.
+> Open API for Brazilian government public data — CNPJ/CNAE, municipalities, ZIP codes/addresses, and states.
 
-Currently covers:
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-- **CNPJ/CNAE** — imports the Brazilian Federal Revenue's public CNPJ (company registry) database into its own Postgres and exposes search by CNAE (business activity code), state, company size, etc.
-- **Municipalities** — official list of Brazilian municipalities (IBGE/Revenue codes).
-- **CEP/Address** — imports the **e-DNE Básico** (the official, free Brazilian Post Office database, ~1.6 million ZIP codes, no login required) via [edne-correios-loader](https://github.com/cauethenorio/edne-correios-loader), with search by ZIP code (CEP) and by text (street/municipality/state). Falls back to [ViaCEP](https://viacep.com.br) for ZIP codes not yet covered by e-DNE or before the import has run.
-- **States** — static list of Brazilian states.
+## What's inside
 
-Originally built to power a B2B prospecting system without keeping this data in the main application database — published here because it may be useful for any project that needs this data without reinventing the import pipeline.
+| Dataset | Source | What you get |
+|---|---|---|
+| **CNPJ / CNAE** | Federal Revenue's public CNPJ database | Company search by CNAE (business activity), state, region, size, MEI/Simples status, etc. |
+| **Municipalities** | Official IBGE/Revenue list | Municipality lookup by name, state, region, or code. |
+| **CEP / Address** | [e-DNE Básico](https://github.com/cauethenorio/edne-correios-loader) | Address lookup by ZIP code or free text. Falls back to [ViaCEP](https://viacep.com.br) for anything not yet covered, and saves the result for next time. |
+| **States** | Static list | Brazilian states (UF + name + region). |
+| **Taxes (Simples Nacional)** | LC 123/2006 Anexos I–V | Effective tax rate and DAS amount calculation, Fator R calculation. Pure math, no import needed. |
+
+Originally built to power a B2B prospecting system without keeping this data in the main application database. Published here because it may be useful for any project that needs it without reinventing the import pipeline.
 
 Contributions adding other public data sources (IBGE, tax records, public tenders, etc.) are welcome.
 
-## Getting started
+---
 
-With the bundled Postgres from the compose file (good for local testing):
+## Table of contents
+
+- [Requirements](#requirements)
+- [Quick start (local)](#quick-start-local)
+- [Deploying to production](#deploying-to-production)
+- [Configuration](#configuration)
+- [Importing the data](#importing-the-data)
+- [Database migrations](#database-migrations)
+- [API reference](#api-reference)
+- [Project structure](#project-structure)
+- [License](#license)
+
+---
+
+## Requirements
+
+- Docker + Docker Compose v2
+- A Postgres database — either the one bundled in `docker-compose.yml` or your own
+
+## Quick start (local)
+
+Uses the Postgres bundled in the compose file.
 
 ```bash
+git clone <this-repo> && cd dados-gov-br
 cp .env.example .env
 docker compose --profile local-db up -d
 ```
 
-Pointing to your own Postgres (production): edit `.env` and set `CNPJ_DATABASE_URL=postgresql+psycopg2://user:password@your-server:5432/cnpj`, then bring up just the app and scheduler (without `--profile local-db`, the bundled `db` service won't even start):
+The API is now at `http://localhost:8000` — `/docs` for Swagger, `/health` for a liveness check. It's empty until you [import some data](#importing-the-data).
+
+## Deploying to production
+
+The same `docker-compose.yml` runs in production, just with different environment variables.
+
+1. **Provision a server** with Docker and Docker Compose installed.
+2. **Point at a real Postgres** — in `.env`, set:
+   ```bash
+   APP_DATABASE_URL=postgresql+psycopg2://user:password@your-db-host:5432/cnpj
+   ```
+3. **Bring up only the app and scheduler** — skip `--profile local-db` so the bundled `db` container never starts:
+   ```bash
+   cp .env.example .env
+   $EDITOR .env   # set APP_DATABASE_URL (step 2) and anything else you need
+   docker compose up -d app scheduler
+   ```
+   Both containers apply pending database migrations on boot — see [Database migrations](#database-migrations).
+4. **Put a reverse proxy in front of it** for TLS and a domain, e.g. with [Caddy](https://caddyserver.com):
+   ```
+   api.yourdomain.com {
+       reverse_proxy localhost:8000
+   }
+   ```
+5. **Run the first import** — see [Importing the data](#importing-the-data).
+6. **Lock down `POST /import/trigger`** at the reverse proxy if the API is public — it has no authentication.
+
+To update to a new version of the code later:
 
 ```bash
-cp .env.example .env
-$EDITOR .env   # uncomment and set CNPJ_DATABASE_URL
+git pull
+docker compose build app scheduler
 docker compose up -d app scheduler
 ```
 
-## Running the CNPJ import
+## Configuration
+
+Set via `.env` (copy `.env.example` to start).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `APP_PORT` | `8000` | Host port the API is exposed on. |
+| `APP_DATABASE_URL` | points at the bundled `db` service | Postgres connection string. |
+| `APP_OPEN_DATA_URL` | a mirror of the Federal Revenue's CNPJ dataset | Where `import-cnpj` downloads from. |
+| `APP_DOWNLOAD_DIR` | `/data/cnpj-import` | Scratch directory for files during import. |
+
+## Importing the data
+
+One command imports everything:
 
 ```bash
-# manual, one-off run:
-docker compose run --rm app python -m app.cli import-cnpj
-
-# a single group (reference, simples, empresas, estabelecimentos, build):
-docker compose run --rm app python -m app.cli import-cnpj --only estabelecimentos
-
-# runs automatically on the 20th of every month at 03:00, via the `scheduler` service (started by compose already)
+docker compose run --rm app python -m app.cli import-all
 ```
 
-## Monitoring progress
+Or import each source independently:
+
+```bash
+# CNPJ (Federal Revenue)
+docker compose run --rm app python -m app.cli import-cnpj
+
+# CNPJ — just one stage (reference, simples, empresas, estabelecimentos, build)
+docker compose run --rm app python -m app.cli import-cnpj --only estabelecimentos
+
+# CEPs (Post Office e-DNE Básico)
+docker compose run --rm app python -m app.cli import-ceps
+```
+
+Both also run automatically on the 20th of every month at 03:00, via the `scheduler` service. Progress:
 
 ```bash
 curl http://localhost:8000/import/status
 ```
 
-## Main endpoints
+## Database migrations
 
-**CNPJ**
+Schema is managed with [Alembic](https://alembic.sqlalchemy.org/). Both `app` and `scheduler` apply pending migrations automatically on boot (see `docker-entrypoint.sh` / `app/migrate.py`).
+
+To run migrations by hand:
+
+```bash
+docker compose run --rm app python -m app.cli migrate
+```
+
+To generate a new migration after changing `app/models.py`:
+
+```bash
+docker compose run --rm -v "$PWD/alembic:/srv/alembic" app alembic revision --autogenerate -m "describe the change"
+```
+
+Note: `correios_cep` (the e-DNE table) is **not** managed by Alembic — it's owned by `edne-correios-loader`, which rebuilds it on every `import-ceps` run.
+
+## API reference
+
+Full interactive docs (Swagger) at `/docs`.
+
+### CNPJ
+
 | Method | Path | Description |
 |---|---|---|
-| GET | `/establishments?cnae_codes=...&uf=...&only_with_cellphone=true&page=1&per_page=25` | Search establishments |
-| GET | `/establishments/by-cnpj?cnpjs=...` | Look up establishments by CNPJ |
-| GET | `/cnaes/search-by-description?words=...` | Search CNAE codes by description |
-| GET | `/cnaes/codes` | List CNAE codes |
-| GET | `/municipios/search?name=...` | Search municipalities |
-| GET | `/import/status` | Check import status |
-| POST | `/import/trigger` | Trigger an import in the background (prefer the CLI via scheduler/cron in production) |
+| `GET` | `/establishments` | Search companies. Filters: `cnae_codes` (+ `cnae_match=any\|all`), `uf`, `regiao`, `municipio_codes`, `company_size`, `is_mei`, `is_simples`, `is_headquarters`, `name`, `has_phone`, `only_with_cellphone`, `only_with_email`, `opened_after`/`opened_before`; sortable via `sort_by`/`sort_dir`, paginated via `page`/`per_page`. Results include CNAE descriptions and a human-readable company-size label. |
+| `GET` | `/establishments/by-cnpj` | Look up specific companies by CNPJ (`cnpjs=...`, repeatable). |
+| `GET` | `/establishments/stats` | Aggregates over the same filters as above: totals, breakdown by state/region/company size, and top CNAE codes — useful for sizing a segment before paginating individual results. |
+| `GET` | `/cnaes/search-by-description` | Search CNAE codes by description (`words=...`, repeatable). |
+| `GET` | `/cnaes/codes` | List all CNAE codes. |
+| `GET` | `/municipios/search` | Search municipalities by `name`, `uf`, and/or `regiao`. |
+| `GET` | `/municipios/by-code/{receita_code}` | Look up a municipality by its Revenue/IBGE code. |
+| `GET` | `/import/status` | Check import progress. |
+| `POST` | `/import/trigger` | Trigger an import in the background. Unauthenticated. |
 
-**Address**
+### Address
+
 | Method | Path | Description |
 |---|---|---|
-| GET | `/enderecos/cep/{cep}` | Look up an address by ZIP code |
-| GET | `/enderecos/estados` | List states |
+| `GET` | `/enderecos/cep/{cep}` | Look up an address by ZIP code. |
+| `GET` | `/enderecos/buscar` | Free-text address search — `logradouro` (street), `bairro` (neighborhood), `municipio`, `uf` (repeatable), `regiao`, `municipio_cod_ibge`; paginated via `page`/`per_page`. |
+| `GET` | `/enderecos/estados` | List all states. |
 
-Interactive documentation (Swagger) available at `/docs` while the server is running.
+### Taxes (Simples Nacional)
+
+Pure calculation, no database involved — reference tables, not tax advice.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/impostos/simples/anexos` | List the 5 Simples Nacional annexes (I–V) and what each covers. |
+| `GET` | `/impostos/simples/anexos/{anexo}` | Full bracket table (RBT12 ranges, nominal rate, deduction) for one annex. |
+| `GET` | `/impostos/simples/calcular` | Calculate the effective rate and DAS amount — `anexo`, `rbt12` (revenue over the last 12 months), optional `receita_mes` (defaults to `rbt12/12`). |
+| `GET` | `/impostos/fator-r` | Calculate the Fator R (`folha_pagamento_12m / receita_bruta_12m`) and whether it qualifies for Anexo III instead of V (≥ 28%, per §5º-D of LC 123/2006 — applies to intellectual/regulated service activities). |
+
+### Misc
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | Liveness check. |
+
+## Project structure
+
+```
+app/
+├── main.py           # FastAPI app, router registration
+├── config.py         # Settings (env vars)
+├── models.py         # SQLAlchemy models
+├── schemas.py        # Pydantic response models
+├── db.py             # Session/engine setup
+├── migrate.py        # Alembic runner used on container boot
+├── scheduler.py      # Monthly import job (APScheduler)
+├── cli.py            # `python -m app.cli ...` commands
+├── regions.py        # UF ↔ region mapping
+├── tax_tables.py      # Simples Nacional Anexos I–V (static tables)
+├── importer/         # CNPJ download/extract/load pipeline
+└── routers/           # API endpoints, one module per resource
+alembic/               # Schema migrations
+```
 
 ## License
 
