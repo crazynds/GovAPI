@@ -45,6 +45,31 @@ CEP_WIDTH = 8
 _FIXED_WIDTH_MAX = 8
 
 
+def reset_source_tables(db: Session, metadata) -> None:
+    """Dropa todas as tabelas que o edne-correios-loader vai (re)criar,
+    inclusive a que sobrou de um run anterior que falhou no meio.
+
+    `create_tables` (chamado dentro de `.load()`) faz
+    `metadata.create_all(self.engine, ...)` -- numa conexao da ENGINE, nao na
+    `self.connection` usada pros INSERTs -- e commita na hora. Se um run
+    anterior criou `log_bairro` e morreu numa StringDataRightTruncation antes
+    do cleanup no fim, a tabela fica pra tras com o schema de ENTAO
+    (committed, independente da transacao das inserts que fez rollback). Como
+    `create_all` so cria tabela que nao existe, o proximo run reusa essa
+    tabela estreita e quebra de novo -- mesmo depois de
+    `widen_free_text_columns` alargar o metadata em memoria, porque a tabela
+    real no banco nunca foi recriada com o tipo novo.
+
+    Drop explicito antes de cada run resolve isso de vez: `create_all` sempre
+    cria do zero, com o metadata (ja alargado) que valer naquele momento.
+    Seguro porque nenhuma tabela aqui e `correios_cep` -- a real fica de fora
+    do metadata da lib, so a de scratch (renomeada via `table_names`) entra.
+    """
+    for table in reversed(metadata.sorted_tables):
+        db.execute(text(f'DROP TABLE IF EXISTS "{table.name}" CASCADE'))
+    db.commit()
+
+
 def widen_free_text_columns(metadata) -> None:
     """Troca por Text() toda coluna de texto livre do esquema do e-DNE.
 

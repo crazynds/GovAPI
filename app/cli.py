@@ -238,19 +238,20 @@ def _import_ceps(source: str | None) -> None:
 
     db = SessionLocal()
     try:
-        db.execute(text(f"DROP TABLE IF EXISTS {ceps.SCRATCH_TABLE}"))
-        db.commit()
-
         loader = DneLoader(
             settings.database_url,
             dne_source=source,
             table_names={"cep_unificado": ceps.SCRATCH_TABLE},
         )
-        # O e-DNE real não respeita as larguras que a própria lib declara pro
-        # schema dela -- visto na prática: nome de bairro/logradouro passando
-        # de VARCHAR(36)/(100) e o INSERT da lib morrendo com
-        # StringDataRightTruncation. Alarga antes de `.load()` criar as
-        # tabelas -- ver ceps.widen_free_text_columns.
+        # Nessa ordem: dropa tudo que sobrou de um run anterior (inclusive de
+        # um que tenha falhado no meio, com tabela criada num schema velho --
+        # ver ceps.reset_source_tables) e só then alarga o metadata em
+        # memória, pra `create_all` dentro de `.load()` criar tudo do zero já
+        # com o tipo largo. O e-DNE real não respeita as larguras que a
+        # própria lib declara pro schema dela -- visto na prática: nome de
+        # bairro/logradouro passando de VARCHAR(36)/(100) e o INSERT da lib
+        # morrendo com StringDataRightTruncation.
+        ceps.reset_source_tables(db, loader.metadata)
         ceps.widen_free_text_columns(loader.metadata)
         with edne_progress.progress(loader):
             loader.load(table_set=TableSetEnum.UNIFIED_CEP_ONLY)

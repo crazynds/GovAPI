@@ -274,6 +274,16 @@ tables, and `correios_cep`'s matching columns are `TEXT` for the same reason,
 so a long value survives both the library's own tables and our upsert into it.
 Fixed-width codes (CEP, UF/country sigla, single-char flags) are left alone.
 
+That widening only helps a table `create_all` actually creates, and `create_all`
+skips any table that already exists — so a run that dies mid-way (this one did,
+on the same batch, deterministically, since the e-DNE file doesn't change
+within a release) leaves its tables committed with whatever schema was current
+at the time, on a connection separate from the one the failed INSERT rolled
+back. The next run would silently reuse that narrow table forever. So
+`import-ceps` now drops everything the library is about to (re)create before
+each run, `correios_cep` itself excluded — it's a scratch table under a
+different name, never part of the library's own schema.
+
 ## API reference
 
 Full interactive docs (Swagger) at `/docs`.
