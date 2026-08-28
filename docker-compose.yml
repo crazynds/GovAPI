@@ -1,20 +1,20 @@
 services:
   # Postgres embutido, só pra quem não tem um servidor próprio -- fica atrás
-  # de um profile de propósito: apontando APP_DATABASE_URL pro seu próprio
-  # Postgres (produção, RDS, o que for), esse serviço nem precisa subir.
-  # Rodar com ele: `docker compose --profile local-db up -d`
+  # de um profile de propósito: apontando APP_DB_HOST/USER/PASSWORD/etc pro
+  # seu próprio Postgres (produção, RDS, o que for), esse serviço nem
+  # precisa subir. Rodar com ele: `docker compose --profile local-db up -d`
   db:
     image: postgres:16-alpine
     restart: unless-stopped
     profiles: ["local-db"]
     environment:
-      POSTGRES_USER: cnpj
-      POSTGRES_PASSWORD: cnpj
-      POSTGRES_DB: cnpj
+      POSTGRES_USER: ${APP_DB_USER:-cnpj}
+      POSTGRES_PASSWORD: ${APP_DB_PASSWORD:-cnpj}
+      POSTGRES_DB: ${APP_DB_NAME:-cnpj}
     volumes:
       - cnpj_db_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U cnpj"]
+      test: ["CMD-SHELL", "pg_isready -U ${APP_DB_USER:-cnpj}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -23,10 +23,13 @@ services:
     build: .
     restart: unless-stopped
     environment:
-      # Default aponta pro serviço `db` acima (profile local-db). Pra usar
-      # um Postgres seu, defina APP_DATABASE_URL no .env -- ver .env.example.
-      APP_DATABASE_URL: ${APP_DATABASE_URL:-postgresql+psycopg2://cnpj:cnpj@db:5432/cnpj}
-      APP_OPEN_DATA_URL: ${APP_OPEN_DATA_URL:-https://dados-abertos-rf-cnpj.casadosdados.com.br/arquivos}
+      # Defaults apontam pro serviço `db` acima (profile local-db). Pra usar
+      # um Postgres seu, sobrescreva no .env -- ver .env.example.
+      APP_DB_HOST: ${APP_DB_HOST:-db}
+      APP_DB_PORT: ${APP_DB_PORT:-5432}
+      APP_DB_USER: ${APP_DB_USER:-cnpj}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-cnpj}
+      APP_DB_NAME: ${APP_DB_NAME:-cnpj}
       APP_DOWNLOAD_DIR: /data/cnpj-import
     ports:
       - "${APP_PORT:-8000}:8000"
@@ -39,8 +42,11 @@ services:
     build: .
     restart: unless-stopped
     environment:
-      APP_DATABASE_URL: ${APP_DATABASE_URL:-postgresql+psycopg2://cnpj:cnpj@db:5432/cnpj}
-      APP_OPEN_DATA_URL: ${APP_OPEN_DATA_URL:-https://dados-abertos-rf-cnpj.casadosdados.com.br/arquivos}
+      APP_DB_HOST: ${APP_DB_HOST:-db}
+      APP_DB_PORT: ${APP_DB_PORT:-5432}
+      APP_DB_USER: ${APP_DB_USER:-cnpj}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-cnpj}
+      APP_DB_NAME: ${APP_DB_NAME:-cnpj}
       APP_DOWNLOAD_DIR: /data/cnpj-import
     volumes:
       - cnpj_download_data:/data/cnpj-import

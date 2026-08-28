@@ -58,12 +58,16 @@ The same `docker-compose.yml` runs in production, just with different environmen
 1. **Provision a server** with Docker and Docker Compose installed.
 2. **Point at a real Postgres** — in `.env`, set:
    ```bash
-   APP_DATABASE_URL=postgresql+psycopg2://user:password@your-db-host:5432/cnpj
+   APP_DB_HOST=your-db-host
+   APP_DB_PORT=5432
+   APP_DB_USER=user
+   APP_DB_PASSWORD=password
+   APP_DB_NAME=cnpj
    ```
 3. **Bring up only the app and scheduler** — skip `--profile local-db` so the bundled `db` container never starts:
    ```bash
    cp .env.example .env
-   $EDITOR .env   # set APP_DATABASE_URL (step 2) and anything else you need
+   $EDITOR .env   # set APP_DB_* (step 2) and anything else you need
    docker compose up -d app scheduler
    ```
    Both containers apply pending database migrations on boot — see [Database migrations](#database-migrations).
@@ -91,8 +95,11 @@ Set via `.env` (copy `.env.example` to start).
 | Variable | Default | Purpose |
 |---|---|---|
 | `APP_PORT` | `8000` | Host port the API is exposed on. |
-| `APP_DATABASE_URL` | points at the bundled `db` service | Postgres connection string. |
-| `APP_OPEN_DATA_URL` | a mirror of the Federal Revenue's CNPJ dataset | Where `import-cnpj` downloads from. |
+| `APP_DB_HOST` | `db` | Postgres host. |
+| `APP_DB_PORT` | `5432` | Postgres port. |
+| `APP_DB_USER` | `cnpj` | Postgres user. |
+| `APP_DB_PASSWORD` | `cnpj` | Postgres password. |
+| `APP_DB_NAME` | `cnpj` | Postgres database name. |
 | `APP_DOWNLOAD_DIR` | `/data/cnpj-import` | Scratch directory for files during import. |
 
 ## Importing the data

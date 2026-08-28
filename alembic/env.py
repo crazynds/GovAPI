@@ -15,7 +15,10 @@ config = context.config
 
 # Sobrescreve o valor do alembic.ini -- uma fonte só de configuração
 # (APP_DATABASE_URL), sem duplicar a URL em dois lugares.
-config.set_main_option("sqlalchemy.url", settings.database_url)
+# `%` dobrado -- o ConfigParser usado por Alembic trata `%` como
+# interpolação; sem isso, uma URL com caracteres especiais escapados
+# (senha com # ou % gera %23/%25) quebra com "invalid interpolation syntax".
+config.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
