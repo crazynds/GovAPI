@@ -116,11 +116,33 @@ def _ceps_from_correios(db: Session, ceps: set[int]) -> dict[int, dict]:
 
 
 def _address(e: Establishment, correios: dict[int, dict]) -> AddressOut:
+    """Monta o endereço a partir de um dos dois caminhos possíveis.
+
+    Ou o estabelecimento está vinculado a um CEP -- e aí o endereço vem das
+    colunas mais o join com os Correios -- ou não está, e aí o registro bruto da
+    Receita está inteiro em `address`. Ver _build_final_table.
+    """
+    if e.address:
+        # Sem vínculo de CEP: CEP ausente, digitado errado ou fora da base dos
+        # Correios. Município/UF ainda saem do código da Receita, que é
+        # independente do CEP.
+        raw = e.address
+        return AddressOut(
+            cep=raw.get("cep"),
+            street=raw.get("logradouro"),
+            number=raw.get("numero"),
+            complement=raw.get("complemento"),
+            district=raw.get("bairro"),
+            municipio=e.municipio.name if e.municipio else None,
+            uf=uf_name(e.uf),
+            source="receita",
+        )
+
     cep_row = correios.get(e.cep) if e.cep else None
     return AddressOut(
         cep=f"{e.cep:0{CEP_WIDTH}d}" if e.cep else None,
-        # street/district só estão gravados quando o CEP não os resolve; nos
-        # outros casos vêm do join, sem duplicar nada em ~63M linhas.
+        # street/district só estão gravados quando o CEP não os resolve (CEP de
+        # localidade); nos outros casos vêm do join, sem duplicar em ~63M linhas.
         street=e.street or (cep_row or {}).get("logradouro"),
         number=e.address_number,
         complement=e.address_complement,

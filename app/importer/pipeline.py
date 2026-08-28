@@ -756,45 +756,77 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
 
     t0 = time.monotonic()
     display.set(slot, "  build: INSERT establishments_new ...")
-    # `correios_cep` so existe depois de `import-ceps` (e pertence ao
-    # edne-correios-loader, nao ao nosso metadata) -- sem ela, logradouro e
-    # bairro da Receita ficam como estao. Com ela, viram NULL quando o CEP ja
-    # resolve o endereco, e a leitura pega do join.
+    # `correios_cep` so existe depois de `import-ceps` (e o esquema dela vem do
+    # edne-correios-loader, nao do nosso metadata).
     has_cep_table = db.execute(text("SELECT to_regclass('correios_cep')")).scalar() is not None
     if has_cep_table:
         logger.info("Vinculando endereços a correios_cep")
         # Cast do lado da tabela de CEP (~1,2M linhas) e nao do staging (~63M),
-        # e filtrado a 8 dígitos pro cast nunca estourar numa linha estranha.
+        # e filtrado a 8 digitos pro cast nunca estourar numa linha estranha.
         cep_join = """
         LEFT JOIN (
             SELECT cep::integer AS cep, logradouro, bairro
             FROM correios_cep WHERE cep ~ '^[0-9]{8}$'
         ) c ON c.cep = e.cep
         """
-        street_sql = "CASE WHEN c.logradouro IS NULL THEN e.logradouro END"
-        district_sql = "CASE WHEN c.bairro IS NULL THEN e.bairro END"
+        # Ou o estabelecimento esta vinculado a um CEP -- e ai o endereco vive
+        # nas colunas, com logradouro/bairro vindo do join -- ou nao esta, e ai
+        # o registro bruto da Receita vai inteiro pro JSON. Nunca os dois.
+        #
+        # "Nao vinculado" cobre os dois casos: CEP ausente no arquivo da
+        # Receita, e CEP que nao existe na base dos Correios (digitado errado,
+        # extinto, endereco no exterior). Guardar o CEP orfao na coluna nao
+        # serviria pra nada -- nao resolve endereco nenhum -- e impediria uma
+        # FOREIGN KEY pra correios_cep.
+        linked = "c.cep IS NOT NULL"
+        cep_sql = f"CASE WHEN {linked} THEN e.cep END"
+        street_sql = f"CASE WHEN {linked} AND c.logradouro IS NULL THEN e.logradouro END"
+        district_sql = f"CASE WHEN {linked} AND c.bairro IS NULL THEN e.bairro END"
+        number_sql = f"CASE WHEN {linked} THEN e.numero END"
+        complement_sql = f"CASE WHEN {linked} THEN e.complemento END"
+        # `strip_nulls` pra nao gravar chave com null: sao poucas linhas, mas
+        # um objeto so com o que existe e menor e mais facil de ler.
+        address_sql = f"""
+            CASE WHEN NOT ({linked}) AND (
+                e.cep IS NOT NULL OR e.logradouro IS NOT NULL OR e.numero IS NOT NULL
+                OR e.complemento IS NOT NULL OR e.bairro IS NOT NULL
+            ) THEN jsonb_strip_nulls(jsonb_build_object(
+                'cep', lpad(e.cep::text, 8, '0'),
+                'logradouro', e.logradouro,
+                'numero', e.numero,
+                'complemento', e.complemento,
+                'bairro', e.bairro
+            )) END
+        """
     else:
         logger.warning(
             "Tabela correios_cep ausente -- rode `import-ceps` antes pra não duplicar "
             "logradouro/bairro que já viriam do CEP."
         )
+        # Sem a tabela de CEP nao da pra saber quem casa: mantem tudo nas
+        # colunas, como veio da Receita. Jogar as ~63M linhas no JSON seria o
+        # oposto do que essa coluna existe pra fazer.
         cep_join = ""
+        cep_sql = "e.cep"
         street_sql = "e.logradouro"
         district_sql = "e.bairro"
+        number_sql = "e.numero"
+        complement_sql = "e.complemento"
+        address_sql = "NULL::jsonb"
 
     imported = db.execute(text(f"""
         INSERT INTO establishments_new
             (cnpj, phone, cellphone, main_cnae, municipio_id, cep, opened_at, uf, company_size,
              situacao_cadastral, natureza_juridica, motivo_situacao_cadastral, cellphone_confidence,
              is_headquarters, is_mei, is_simples, secondary_cnaes, company_name, trade_name, email,
-             address_number, address_complement, street, district)
+             address_number, address_complement, street, district, address)
         SELECT
             e.cnpj,
             e.phone,
             e.cellphone,
             e.cnae_fiscal_principal,
             m.id,
-            e.cep,
+            {cep_sql},
             e.data_inicio_atividade,
             e.uf,
             emp.porte_empresa,
@@ -809,10 +841,11 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
             coalesce(emp.razao_social, e.nome_fantasia, ''),
             e.nome_fantasia,
             e.correio_eletronico,
-            e.numero,
-            e.complemento,
+            {number_sql},
+            {complement_sql},
             {street_sql},
-            {district_sql}
+            {district_sql},
+            {address_sql}
         FROM estabelecimentos_staging e
         LEFT JOIN empresas_staging emp ON emp.cnpj_basico = e.cnpj_basico
         LEFT JOIN simples_staging s ON s.cnpj_basico = e.cnpj_basico
@@ -828,23 +861,17 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
         # KEY de establishments.cep -> correios_cep.cep e possivel: ela so pode
         # existir se este "orfaos" for zero, porque a Receita tambem publica CEP
         # com digitacao errada, extinto, ou de endereco no exterior.
-        # `e.` obrigatorio no NOT EXISTS: sem qualificar, o `cep` de dentro
-        # resolve pra coluna da PROPRIA correios_cep (escopo mais interno
-        # primeiro), a condicao vira `c.cep = c.cep` e o contador da sempre 0.
+        # Agora que o CEP orfao vira NULL, a contagem sai direto das colunas:
+        # `address IS NOT NULL` e exatamente "nao casou com a base dos Correios".
         cov = db.execute(text("""
-            SELECT count(*) FILTER (WHERE e.cep IS NOT NULL) AS com_cep,
-                   count(*) FILTER (WHERE e.cep IS NOT NULL AND e.street IS NULL) AS resolvidos,
-                   count(*) FILTER (
-                       WHERE e.cep IS NOT NULL
-                       AND NOT EXISTS (
-                           SELECT 1 FROM correios_cep c WHERE c.cep = lpad(e.cep::text, 8, '0')
-                       )
-                   ) AS orfaos
-            FROM establishments_new e
+            SELECT count(*) FILTER (WHERE cep IS NOT NULL) AS vinculados,
+                   count(*) FILTER (WHERE cep IS NOT NULL AND street IS NULL) AS resolvidos,
+                   count(*) FILTER (WHERE address IS NOT NULL) AS sem_vinculo
+            FROM establishments_new
         """)).mappings().one()
         logger.info(
-            "CEP: %d com CEP, %d resolvidos pelos Correios, %d órfãos (CEP fora do e-DNE)",
-            cov["com_cep"], cov["resolvidos"], cov["orfaos"],
+            "CEP: %d vinculados (%d com logradouro dos Correios), %d sem vínculo (endereço em address)",
+            cov["vinculados"], cov["resolvidos"], cov["sem_vinculo"],
         )
 
     # `Municipios.zip` da Receita so tem codigo+nome, sem UF -- pega o UF de

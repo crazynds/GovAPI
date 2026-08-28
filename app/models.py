@@ -15,7 +15,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -140,11 +140,9 @@ class Establishment(Base):
     # saem logradouro/bairro/municipio/UF na leitura -- por isso essas colunas
     # nao sao duplicadas aqui. INTEGER (4 bytes) e nao os 8 digitos como texto.
     #
-    # Sem FOREIGN KEY de proposito: `correios_cep` pertence ao
-    # edne-correios-loader, que a cada `import-ceps` faz DELETE de todas as
-    # linhas e repovoa. Uma FK travaria esse DELETE (NO ACTION), e CASCADE/SET
-    # NULL apagariam o endereco de dezenas de milhoes de empresas. Alem disso
-    # a Receita traz CEP inexistente/malformado, que nenhuma FK aceitaria.
+    # NULL quando o CEP da Receita nao existe na base dos Correios (digitacao
+    # errada, extinto, endereco no exterior). Nesses casos o endereco bruto vai
+    # inteiro pra coluna `address` -- ver _build_final_table.
     cep: Mapped[int | None] = mapped_column(Integer, nullable=True)
     opened_at: Mapped[date | None] = mapped_column(Date, nullable=True)
     uf: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)  # ver app/regions.py
@@ -167,12 +165,18 @@ class Establishment(Base):
     # Especificos do estabelecimento, nao existem em `correios_cep`.
     address_number: Mapped[str | None] = mapped_column(Text, nullable=True)
     address_complement: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # Preenchidos SO quando o CEP nao resolve o logradouro: CEP de localidade
-    # (cidade pequena com um CEP so) nao tem rua em `correios_cep`, e ai o dado
-    # da Receita e a unica fonte. Quando o CEP resolve, ficam NULL e a leitura
-    # pega do join -- ver _build_final_table.
+    # Preenchidos SO quando o CEP existe mas nao resolve o logradouro: CEP de
+    # localidade (cidade pequena com um CEP so) nao tem rua em `correios_cep`,
+    # e ai o dado da Receita e a unica fonte. Quando o CEP resolve, ficam NULL
+    # e a leitura pega do join -- ver _build_final_table.
     street: Mapped[str | None] = mapped_column(Text, nullable=True)
     district: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Endereco bruto da Receita, so pras linhas SEM vinculo de CEP (CEP ausente
+    # ou fora da base dos Correios). NULL em todo o resto, que e a grande
+    # maioria -- por isso um JSON aqui nao pesa: nao ha um blob por linha, ha um
+    # por excecao. Guarda o registro inteiro (logradouro, numero, complemento,
+    # bairro, cep como veio) pra nao perder o endereco de quem nao casou.
+    address: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     municipio: Mapped[Municipio | None] = relationship()
 

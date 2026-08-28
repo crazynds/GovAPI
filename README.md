@@ -223,12 +223,17 @@ library never touches the real table. CEPs the Post Office retired are kept
 rather than deleted — that is what makes the table safe to reference — and the
 import reports how many it is holding on to.
 
-There is still no foreign key on `establishments.cep`, for one remaining
-reason: the Revenue publishes CEPs that are mistyped, defunct, or foreign, and
-a foreign key cannot be added while any row violates it. Adding one would mean
-discarding those CEPs. Each CNPJ build logs the number, so the decision can be
-made against the real figure — look for the `CEP: ... órfãos` line in the build
-log, which counts establishments whose CEP is absent from `correios_cep`.
+An establishment is in exactly one of two states, never both. Either it is
+linked to a CEP — `cep` is set, and street/district/municipality/state come from
+`correios_cep` on read — or it is not, and the Revenue's whole address record
+sits in an `address` JSONB column. Unlinked covers a missing CEP as well as one
+the Post Office has never heard of (mistyped, retired, foreign): keeping such a
+CEP in the column would resolve no address and would block a foreign key.
+
+JSONB rather than more columns because these are the exception, not the rule:
+the vast majority of rows match a CEP and leave `address` NULL, which costs
+nothing beyond its bit in the null bitmap. Each build logs the split — look for
+the `CEP: N vinculados ... N sem vínculo` line.
 
 Note: `correios_cep` (the e-DNE table) is **not** managed by Alembic — it's owned by `edne-correios-loader`, which rebuilds it on every `import-ceps` run.
 
