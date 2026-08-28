@@ -10,13 +10,16 @@ from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, func, or_
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Query as ORMQuery, Session
+
+from sqlalchemy import text
 
 from app import cnpj as cnpj_codec
 from app.db import get_db
 from app.models import Cnae, Establishment, Motivo, Municipio, NaturezaJuridica
 from app.regions import UF_TO_REGIAO, uf_code, uf_name, ufs_for_regiao
-from app.schemas import EstablishmentOut, EstablishmentPage, EstablishmentStatsOut
+from app.schemas import AddressOut, EstablishmentOut, EstablishmentPage, EstablishmentStatsOut
 
 router = APIRouter(prefix="/establishments", tags=["establishments"])
 
@@ -79,6 +82,55 @@ def _cnae_codes_to_int(values: list[str]) -> list[int]:
 CODE_WIDTHS = {"cnae": 7, "natureza": 4, "motivo": 2}
 
 
+CEP_WIDTH = 8
+
+
+def _ceps_from_correios(db: Session, ceps: set[int]) -> dict[int, dict]:
+    """Endereço dos Correios (e-DNE) pelos CEPs da página atual.
+
+    Uma query só, e a comparação é feita na forma de texto zero-padded porque é
+    assim que `correios_cep.cep` é indexado (a tabela é do
+    edne-correios-loader, não nossa) -- castar a coluna descartaria o índice.
+    A tabela pode nem existir, se `import-ceps` ainda não rodou.
+    """
+    wanted = {c for c in ceps if c}
+    if not wanted:
+        return {}
+
+    as_text = {f"{c:0{CEP_WIDTH}d}": c for c in wanted}
+    try:
+        rows = db.execute(
+            text(
+                "SELECT cep, logradouro, bairro, municipio, uf "
+                "FROM correios_cep WHERE cep = ANY(:ceps)"
+            ),
+            {"ceps": list(as_text)},
+        ).mappings().all()
+    except ProgrammingError:
+        # Sem `import-ceps` a tabela não existe -- o endereço então sai só com
+        # o que está guardado no próprio estabelecimento.
+        db.rollback()
+        return {}
+
+    return {as_text[row["cep"]]: dict(row) for row in rows if row["cep"] in as_text}
+
+
+def _address(e: Establishment, correios: dict[int, dict]) -> AddressOut:
+    cep_row = correios.get(e.cep) if e.cep else None
+    return AddressOut(
+        cep=f"{e.cep:0{CEP_WIDTH}d}" if e.cep else None,
+        # street/district só estão gravados quando o CEP não os resolve; nos
+        # outros casos vêm do join, sem duplicar nada em ~63M linhas.
+        street=e.street or (cep_row or {}).get("logradouro"),
+        number=e.address_number,
+        complement=e.address_complement,
+        district=e.district or (cep_row or {}).get("bairro"),
+        municipio=(cep_row or {}).get("municipio") or (e.municipio.name if e.municipio else None),
+        uf=(cep_row or {}).get("uf") or uf_name(e.uf),
+        source="correios" if cep_row and not e.street else ("receita" if e.street or e.district else None),
+    )
+
+
 def _code_descriptions(db: Session, model, codes: set[int], width: int) -> dict[int, str]:
     """{codigo numerico: descricao} pras tabelas de referencia."""
     wanted = {c for c in codes if c is not None}
@@ -94,6 +146,7 @@ def _serialize(
     cnae_map: dict[int, str] | None = None,
     natureza_map: dict[int, str] | None = None,
     motivo_map: dict[int, str] | None = None,
+    correios: dict[int, dict] | None = None,
 ) -> EstablishmentOut:
     cnae_map = cnae_map or {}
     natureza_map = natureza_map or {}
@@ -129,6 +182,7 @@ def _serialize(
         situacao_cadastral_label=SITUACAO_LABELS.get(e.situacao_cadastral),
         motivo_situacao_cadastral_code=_code(e.motivo_situacao_cadastral, CODE_WIDTHS["motivo"]),
         motivo_situacao_cadastral_description=motivo_map.get(e.motivo_situacao_cadastral),
+        address=_address(e, correios or {}),
     )
 
 
@@ -153,7 +207,8 @@ def _serialize_many(db: Session, items: list[Establishment]) -> list[Establishme
     cnae_map = _code_descriptions(db, Cnae, cnae_codes, CODE_WIDTHS["cnae"])
     natureza_map = _code_descriptions(db, NaturezaJuridica, natureza_codes, CODE_WIDTHS["natureza"])
     motivo_map = _code_descriptions(db, Motivo, motivo_codes, CODE_WIDTHS["motivo"])
-    return [_serialize(e, cnae_map, natureza_map, motivo_map) for e in items]
+    correios = _ceps_from_correios(db, {e.cep for e in items if e.cep})
+    return [_serialize(e, cnae_map, natureza_map, motivo_map, correios) for e in items]
 
 
 def _apply_filters(

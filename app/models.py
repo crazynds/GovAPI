@@ -122,6 +122,7 @@ class Establishment(Base):
             postgresql_where=text("secondary_cnaes IS NOT NULL"),
         ),
         Index("ix_establishments_situacao_cadastral", "situacao_cadastral"),
+        Index("ix_establishments_cep", "cep", postgresql_where=text("cep IS NOT NULL")),
     )
     # fillfactor = 100 (sem UPDATE depois do bulk load, nao faz sentido
     # reservar espaco livre por pagina pra HOT update) e aplicado por SQL na
@@ -135,6 +136,16 @@ class Establishment(Base):
     cellphone: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     main_cnae: Mapped[int | None] = mapped_column(Integer, nullable=True)
     municipio_id: Mapped[int | None] = mapped_column(ForeignKey("municipios.id"), nullable=True)
+    # Liga o estabelecimento a `correios_cep` (base e-DNE dos Correios), de onde
+    # saem logradouro/bairro/municipio/UF na leitura -- por isso essas colunas
+    # nao sao duplicadas aqui. INTEGER (4 bytes) e nao os 8 digitos como texto.
+    #
+    # Sem FOREIGN KEY de proposito: `correios_cep` pertence ao
+    # edne-correios-loader, que a cada `import-ceps` faz DELETE de todas as
+    # linhas e repovoa. Uma FK travaria esse DELETE (NO ACTION), e CASCADE/SET
+    # NULL apagariam o endereco de dezenas de milhoes de empresas. Alem disso
+    # a Receita traz CEP inexistente/malformado, que nenhuma FK aceitaria.
+    cep: Mapped[int | None] = mapped_column(Integer, nullable=True)
     opened_at: Mapped[date | None] = mapped_column(Date, nullable=True)
     uf: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)  # ver app/regions.py
     company_size: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
@@ -153,6 +164,15 @@ class Establishment(Base):
     company_name: Mapped[str] = mapped_column(Text)
     trade_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     email: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Especificos do estabelecimento, nao existem em `correios_cep`.
+    address_number: Mapped[str | None] = mapped_column(Text, nullable=True)
+    address_complement: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Preenchidos SO quando o CEP nao resolve o logradouro: CEP de localidade
+    # (cidade pequena com um CEP so) nao tem rua em `correios_cep`, e ai o dado
+    # da Receita e a unica fonte. Quando o CEP resolve, ficam NULL e a leitura
+    # pega do join -- ver _build_final_table.
+    street: Mapped[str | None] = mapped_column(Text, nullable=True)
+    district: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     municipio: Mapped[Municipio | None] = relationship()
 
@@ -209,6 +229,7 @@ class EstabelecimentoStaging(Base):
     cellphone: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     cnae_fiscal_principal: Mapped[int | None] = mapped_column(Integer, nullable=True)
     municipio_codigo: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cep: Mapped[int | None] = mapped_column(Integer, nullable=True)
     data_inicio_atividade: Mapped[date | None] = mapped_column(Date, nullable=True)
     uf: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     situacao_cadastral: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
@@ -218,6 +239,12 @@ class EstabelecimentoStaging(Base):
     cnae_fiscal_secundaria: Mapped[list[int] | None] = mapped_column(ARRAY(Integer), nullable=True)
     nome_fantasia: Mapped[str | None] = mapped_column(Text, nullable=True)
     correio_eletronico: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Logradouro/bairro entram aqui crus e podem virar NULL no build, se o CEP
+    # ja resolver o endereco em `correios_cep`.
+    logradouro: Mapped[str | None] = mapped_column(Text, nullable=True)
+    numero: Mapped[str | None] = mapped_column(Text, nullable=True)
+    complemento: Mapped[str | None] = mapped_column(Text, nullable=True)
+    bairro: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class Socio(Base):

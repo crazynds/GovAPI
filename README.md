@@ -199,6 +199,27 @@ Base-36 also preserves ordering, so "every establishment under root X" is a
 contiguous integer range that the primary key can serve — see
 `app.cnpj.basico_range`.
 
+### Addresses
+
+An establishment stores only its CEP (as a 4-byte integer), street number, and
+complement. Street, district, municipality, and state come from the Post
+Office's `correios_cep` by CEP, which is that table's primary key — so they are
+not duplicated across ~63M rows.
+
+Street and district *are* stored when the CEP cannot resolve them: a small town
+is often a single locality-wide CEP with no street in the e-DNE base, and there
+the Revenue's data is the only source. The build decides this per row, which is
+why `import-ceps` has to run before `import-cnpj` — that is the order
+`import-all` uses. Run the CNPJ import without the CEP table in place and the
+address still works, it is just stored unresolved (the import warns). Each
+address in the API carries a `source` field saying which way it went.
+
+There is deliberately no foreign key. `correios_cep` belongs to
+`edne-correios-loader`, which deletes every row and repopulates on each
+`import-ceps`: a foreign key would block that delete, and `CASCADE`/`SET NULL`
+would wipe the address off tens of millions of companies. The Revenue also ships
+CEPs that do not exist, which no foreign key would accept.
+
 Note: `correios_cep` (the e-DNE table) is **not** managed by Alembic — it's owned by `edne-correios-loader`, which rebuilds it on every `import-ceps` run.
 
 ## API reference
@@ -210,7 +231,7 @@ Full interactive docs (Swagger) at `/docs`.
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/establishments` | Search companies. Filters: `cnae_codes` (+ `cnae_match=any\|all`), `uf`, `regiao`, `municipio_codes`, `company_size`, `is_mei`, `is_simples`, `is_headquarters`, `name`, `situacao` (registration status, code or label — includes all statuses unless filtered), `has_phone`, `only_with_cellphone`, `only_with_email`, `opened_after`/`opened_before`; sortable via `sort_by`/`sort_dir`, paginated via `page`/`per_page`. Results include CNAE, legal-nature, and deregistration-reason descriptions, plus human-readable labels for company size and registration status. |
-| `GET` | `/establishments/by-cnpj` | Look up specific companies by CNPJ (`cnpjs=...`, repeatable). |
+| `GET` | `/establishments/by-cnpj` | Look up specific companies by CNPJ (`cnpjs=...`, repeatable). Accepts punctuation, a full CNPJ, or just the 8-position root. |
 | `GET` | `/establishments/stats` | Aggregates over the same filters as above: totals, breakdown by state/region/company size, and top CNAE codes — useful for sizing a segment before paginating individual results. |
 | `GET` | `/cnaes/search-by-description` | Search CNAE codes by description (`words=...`, repeatable). |
 | `GET` | `/cnaes/codes` | List all CNAE codes. |

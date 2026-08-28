@@ -735,6 +735,7 @@ DEFERRED_INDEXES = [
     ("ix_establishments_main_cnae", "(main_cnae)", "situacao_cadastral = 2", None),
     ("ix_establishments_secondary_cnaes", "(secondary_cnaes)", "secondary_cnaes IS NOT NULL", "gin"),
     ("ix_establishments_situacao_cadastral", "(situacao_cadastral)", None, None),
+    ("ix_establishments_cep", "(cep)", "cep IS NOT NULL", None),
 ]
 
 
@@ -755,17 +756,45 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
 
     t0 = time.monotonic()
     display.set(slot, "  build: INSERT establishments_new ...")
-    imported = db.execute(text("""
+    # `correios_cep` so existe depois de `import-ceps` (e pertence ao
+    # edne-correios-loader, nao ao nosso metadata) -- sem ela, logradouro e
+    # bairro da Receita ficam como estao. Com ela, viram NULL quando o CEP ja
+    # resolve o endereco, e a leitura pega do join.
+    has_cep_table = db.execute(text("SELECT to_regclass('correios_cep')")).scalar() is not None
+    if has_cep_table:
+        logger.info("Vinculando endereços a correios_cep")
+        # Cast do lado da tabela de CEP (~1,2M linhas) e nao do staging (~63M),
+        # e filtrado a 8 dígitos pro cast nunca estourar numa linha estranha.
+        cep_join = """
+        LEFT JOIN (
+            SELECT cep::integer AS cep, logradouro, bairro
+            FROM correios_cep WHERE cep ~ '^[0-9]{8}$'
+        ) c ON c.cep = e.cep
+        """
+        street_sql = "CASE WHEN c.logradouro IS NULL THEN e.logradouro END"
+        district_sql = "CASE WHEN c.bairro IS NULL THEN e.bairro END"
+    else:
+        logger.warning(
+            "Tabela correios_cep ausente -- rode `import-ceps` antes pra não duplicar "
+            "logradouro/bairro que já viriam do CEP."
+        )
+        cep_join = ""
+        street_sql = "e.logradouro"
+        district_sql = "e.bairro"
+
+    imported = db.execute(text(f"""
         INSERT INTO establishments_new
-            (cnpj, phone, cellphone, main_cnae, municipio_id, opened_at, uf, company_size,
+            (cnpj, phone, cellphone, main_cnae, municipio_id, cep, opened_at, uf, company_size,
              situacao_cadastral, natureza_juridica, motivo_situacao_cadastral, cellphone_confidence,
-             is_headquarters, is_mei, is_simples, secondary_cnaes, company_name, trade_name, email)
+             is_headquarters, is_mei, is_simples, secondary_cnaes, company_name, trade_name, email,
+             address_number, address_complement, street, district)
         SELECT
             e.cnpj,
             e.phone,
             e.cellphone,
             e.cnae_fiscal_principal,
             m.id,
+            e.cep,
             e.data_inicio_atividade,
             e.uf,
             emp.porte_empresa,
@@ -779,11 +808,16 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
             e.cnae_fiscal_secundaria,
             coalesce(emp.razao_social, e.nome_fantasia, ''),
             e.nome_fantasia,
-            e.correio_eletronico
+            e.correio_eletronico,
+            e.numero,
+            e.complemento,
+            {street_sql},
+            {district_sql}
         FROM estabelecimentos_staging e
         LEFT JOIN empresas_staging emp ON emp.cnpj_basico = e.cnpj_basico
         LEFT JOIN simples_staging s ON s.cnpj_basico = e.cnpj_basico
         LEFT JOIN municipios m ON m.receita_code = e.municipio_codigo
+        {cep_join}
         ON CONFLICT (cnpj) DO NOTHING
     """))
     db.commit()

@@ -134,6 +134,27 @@ def _documento(identificador: str | None, raw: str | None) -> int | None:
     return int(cleaned) if cleaned.isdigit() else None
 
 
+def _cep(value: str | None) -> int | None:
+    """CEP -> int (8 digitos cabem folgado num INTEGER).
+
+    A Receita traz CEP com e sem pontuacao, e as vezes lixo ("00000000",
+    zeros, tamanho errado) -- nesses casos NULL, senao o vinculo com
+    `correios_cep` aponta pra um CEP que nao existe.
+    """
+    if not value:
+        return None
+    digits = "".join(c for c in value if c.isdigit())
+    if len(digits) != 8:
+        return None
+    return int(digits) or None
+
+
+def _logradouro(tipo: str | None, nome: str | None) -> str | None:
+    """"RUA" + "DAS FLORES" -> "RUA DAS FLORES" (a Receita separa os dois)."""
+    parts = [p for p in (_text(tipo), _text(nome)) if p]
+    return " ".join(parts) or None
+
+
 def _cpf(raw: str | None) -> int | None:
     """CPF mascarado (representante legal) -> os digitos que sobraram."""
     if not raw:
@@ -185,6 +206,7 @@ def _transform_estabelecimentos(row: dict, counters: Counters) -> list | None:
         cellphone,
         _int(row.get("cnae_fiscal_principal")),
         _int(row.get("municipio_codigo")),
+        _cep(row.get("cep")),
         _date(row.get("data_inicio_atividade")),
         uf,
         _int(row.get("situacao_cadastral")),
@@ -194,6 +216,10 @@ def _transform_estabelecimentos(row: dict, counters: Counters) -> list | None:
         _int_array(row.get("cnae_fiscal_secundaria")),
         _text(row.get("nome_fantasia")),
         _text(row.get("correio_eletronico")),
+        _logradouro(row.get("tipo_logradouro"), row.get("logradouro")),
+        _text(row.get("numero")),
+        _text(row.get("complemento")),
+        _text(row.get("bairro")),
     ]
 
 
@@ -254,9 +280,9 @@ GROUP_SPECS: dict[str, GroupSpec] = {
         table="estabelecimentos_staging",
         columns=[
             "cnpj", "cnpj_basico", "phone", "cellphone", "cnae_fiscal_principal", "municipio_codigo",
-            "data_inicio_atividade", "uf", "situacao_cadastral", "motivo_situacao_cadastral",
+            "cep", "data_inicio_atividade", "uf", "situacao_cadastral", "motivo_situacao_cadastral",
             "cellphone_confidence", "is_headquarters", "cnae_fiscal_secundaria", "nome_fantasia",
-            "correio_eletronico",
+            "correio_eletronico", "logradouro", "numero", "complemento", "bairro",
         ],
         key=["cnpj"],
         transform=_transform_estabelecimentos,

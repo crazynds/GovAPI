@@ -3,6 +3,27 @@ from datetime import date
 from pydantic import BaseModel
 
 
+class AddressOut(BaseModel):
+    """Endereço do estabelecimento.
+
+    Só CEP, número e complemento ficam guardados por estabelecimento;
+    logradouro/bairro/município/UF vêm da base dos Correios pelo CEP, e só
+    são gravados quando o CEP não os resolve (CEP de localidade). Ver
+    Establishment em app/models.py.
+    """
+
+    cep: str | None
+    street: str | None
+    number: str | None
+    complement: str | None
+    district: str | None
+    municipio: str | None
+    uf: str | None
+    # De onde vieram logradouro/bairro: "correios" (pelo CEP) ou "receita"
+    # (o CEP não resolve, então valeu o dado da Receita).
+    source: str | None
+
+
 class EstablishmentOut(BaseModel):
     cnpj: str
     company_name: str
@@ -29,6 +50,7 @@ class EstablishmentOut(BaseModel):
     situacao_cadastral_label: str | None
     motivo_situacao_cadastral_code: str | None
     motivo_situacao_cadastral_description: str | None
+    address: AddressOut
 
     model_config = {"from_attributes": True}
 
