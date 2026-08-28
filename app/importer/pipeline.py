@@ -32,20 +32,26 @@ from app.models import (
     EstabelecimentoStaging,
     ImportLog,
     ImportProgress,
+    Motivo,
     Municipio,
+    NaturezaJuridica,
+    Pais,
+    Qualificacao,
     SimplesStaging,
+    Socio,
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("importer")
 
-GROUPS = ["reference", "simples", "empresas", "estabelecimentos"]
+GROUPS = ["reference", "simples", "empresas", "estabelecimentos", "socios"]
 
 STEP_PREFIXES = {
-    "reference": ["Cnaes", "Municipios"],
+    "reference": ["Cnaes", "Municipios", "Motivos", "Naturezas", "Paises", "Qualificacoes"],
     "simples": ["Simples"],
     "empresas": ["Empresas"],
     "estabelecimentos": ["Estabelecimentos"],
+    "socios": ["Socios"],
 }
 
 MAX_LENGTHS = {
@@ -54,6 +60,7 @@ MAX_LENGTHS = {
     "cnpj_dv": 2,
     "identificador_matriz_filial": 1,
     "situacao_cadastral": 2,
+    "motivo_situacao_cadastral": 2,
     "uf": 2,
     "ddd_1": 4,
     "opcao_simples": 1,
@@ -90,6 +97,19 @@ def run_import(period: str | None = None, only: list[str] | None = None) -> None
         for group in groups:
             group_files = files_for_group(all_files, group)
             logger.info("Grupo %s: %d arquivo(s)", group, len(group_files))
+            if group == "socios" and group_files and not any(
+                _already_imported(db, resolved_period, f) for f in group_files
+            ):
+                # socios não tem staging+swap (cada Socios<N>.zip cobre uma
+                # faixa disjunta de cnpj_basico, não tem o que dar merge
+                # entre arquivos) -- zera uma vez no início de um run NOVO
+                # (nenhum arquivo do grupo ainda marcado em ImportLog),
+                # senão um reimport mensal ficaria empilhando linha
+                # repetida. Só não zera se for uma RETOMADA (algum arquivo
+                # já importado nesse período) -- senão perderia os dados
+                # dos arquivos já concluídos antes da falha.
+                db.execute(text("TRUNCATE socios"))
+                db.commit()
             for i, file in enumerate(group_files, start=1):
                 logger.info("[%s] arquivo %d/%d: %s", group, i, len(group_files), file)
                 _process_file(db, resolved_period, group, file)
@@ -244,7 +264,7 @@ def _import_file(db: Session, period: str, group: str, file: str, csv_path: str)
                 "capital_social", "porte_empresa", "ente_federativo",
             ],
             "model": EmpresaStaging,
-            "keep": ["cnpj_basico", "razao_social", "porte_empresa"],
+            "keep": ["cnpj_basico", "razao_social", "porte_empresa", "natureza_juridica"],
             "unique": ["cnpj_basico"],
         },
         "estabelecimentos": {
@@ -259,11 +279,30 @@ def _import_file(db: Session, period: str, group: str, file: str, csv_path: str)
             "model": EstabelecimentoStaging,
             "keep": [
                 "cnpj_basico", "cnpj_ordem", "cnpj_dv", "identificador_matriz_filial", "nome_fantasia",
-                "situacao_cadastral", "data_inicio_atividade", "cnae_fiscal_principal",
+                "situacao_cadastral", "motivo_situacao_cadastral", "data_inicio_atividade", "cnae_fiscal_principal",
                 "cnae_fiscal_secundaria", "uf", "municipio_codigo", "ddd_1", "telefone_1", "correio_eletronico",
             ],
             "unique": ["cnpj_basico", "cnpj_ordem", "cnpj_dv"],
             "date_fields": ["data_inicio_atividade"],
+        },
+        "socios": {
+            "columns": [
+                "cnpj_basico", "identificador_socio", "nome_socio", "cpf_cnpj_socio",
+                "qualificacao_socio", "data_entrada_sociedade", "pais", "representante_legal",
+                "nome_representante", "qualificacao_representante_legal", "faixa_etaria",
+            ],
+            "model": Socio,
+            "keep": [
+                "cnpj_basico", "identificador_socio", "nome_socio", "cpf_cnpj_socio",
+                "qualificacao_socio", "data_entrada_sociedade", "pais", "representante_legal",
+                "nome_representante", "qualificacao_representante_legal", "faixa_etaria",
+            ],
+            # Sem unique -- cada Socios<N>.zip cobre uma faixa disjunta de
+            # cnpj_basico (mesmo particionamento de Empresas/Estabelecimentos),
+            # não tem chave natural nem necessidade de merge entre arquivos,
+            # só um INSERT simples (ver truncate no início do grupo em run_import).
+            "unique": None,
+            "date_fields": ["data_entrada_sociedade"],
         },
     }[group]
 
@@ -332,27 +371,38 @@ def _import_file(db: Session, period: str, group: str, file: str, csv_path: str)
     select_cols = [
         (f'NULLIF("{c}", \'\')::date' if c in date_fields else f'"{c}"') for c in keep
     ] + ['"source_file"']
-    update_cols = [c for c in copy_columns if c not in unique]
-    set_clause = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in update_cols)
-    unique_cols_quoted = ", ".join(f'"{c}"' for c in unique)
+
+    if unique:
+        # O CSV oficial às vezes repete a mesma chave dentro do mesmo
+        # arquivo (visto na prática: Empresas2.zip) -- um único INSERT ...
+        # ON CONFLICT DO UPDATE não aceita conflitar duas vezes com a mesma
+        # linha, então dedup primeiro (fica com a ocorrência mais recente
+        # pela ordem física de carga, igual o UPSERT linha a linha antigo
+        # já fazia implicitamente).
+        update_cols = [c for c in copy_columns if c not in unique]
+        set_clause = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in update_cols)
+        unique_cols_quoted = ", ".join(f'"{c}"' for c in unique)
+        merge_sql = f"""
+            INSERT INTO {table_name} ({quoted_cols})
+            SELECT {", ".join(select_cols)}
+            FROM (
+                SELECT DISTINCT ON ({unique_cols_quoted}) *
+                FROM {tmp_table}
+                ORDER BY {unique_cols_quoted}, ctid DESC
+            ) AS deduped
+            ON CONFLICT ({unique_cols_quoted}) DO UPDATE SET {set_clause}
+        """
+    else:
+        # Sem chave única -- não tem o que mesclar/deduplicar (cada arquivo
+        # é independente, ver spec["socios"]), só um append direto.
+        merge_sql = f"""
+            INSERT INTO {table_name} ({quoted_cols})
+            SELECT {", ".join(select_cols)}
+            FROM {tmp_table}
+        """
 
     t0 = time.monotonic()
-    db.execute(text(f"""
-        INSERT INTO {table_name} ({quoted_cols})
-        SELECT {", ".join(select_cols)}
-        FROM (
-            -- O CSV oficial às vezes repete a mesma chave dentro do mesmo
-            -- arquivo (visto na prática: Empresas2.zip) -- um único INSERT
-            -- ... ON CONFLICT DO UPDATE não aceita conflitar duas vezes com
-            -- a mesma linha, então dedup primeiro (fica com a ocorrência
-            -- mais recente pela ordem física de carga, igual o UPSERT
-            -- linha a linha antigo já fazia implicitamente).
-            SELECT DISTINCT ON ({unique_cols_quoted}) *
-            FROM {tmp_table}
-            ORDER BY {unique_cols_quoted}, ctid DESC
-        ) AS deduped
-        ON CONFLICT ({unique_cols_quoted}) DO UPDATE SET {set_clause}
-    """))
+    db.execute(text(merge_sql))
     db.execute(text(f"DROP TABLE {tmp_table}"))
     db.commit()
     logger.info("Mesclado %s no staging final em %.1fs", file, time.monotonic() - t0)
@@ -369,6 +419,10 @@ def _import_reference(db: Session, period: str, group: str, file: str, csv_path:
     spec = {
         "Cnaes.zip": (["code", "description"], Cnae, "code"),
         "Municipios.zip": (["receita_code", "name"], Municipio, "receita_code"),
+        "Motivos.zip": (["code", "description"], Motivo, "code"),
+        "Naturezas.zip": (["code", "description"], NaturezaJuridica, "code"),
+        "Paises.zip": (["code", "description"], Pais, "code"),
+        "Qualificacoes.zip": (["code", "description"], Qualificacao, "code"),
     }[file]
     columns, model, key = spec
     table = model.__table__
@@ -412,7 +466,7 @@ def _build_final_table(db: Session, period: str) -> None:
     # do bulk load, onde um CREATE INDEX é ordens de magnitude mais rápido.
     # Índice único de cnpj (usado pelo ON CONFLICT) e PK ficam intactos.
     deferred_indexes = []
-    for col in ("main_cnae_code", "uf", "cellphone"):
+    for col in ("main_cnae_code", "uf", "cellphone", "situacao_cadastral"):
         idx_name = db.execute(
             text(
                 "SELECT indexname FROM pg_indexes "
@@ -428,8 +482,9 @@ def _build_final_table(db: Session, period: str) -> None:
     imported = db.execute(text("""
         INSERT INTO establishments_new
             (cnpj, company_name, trade_name, is_headquarters, is_mei, is_simples,
-             company_size, main_cnae_code, secondary_cnae_codes, municipio_id,
-             uf, email, phone, cellphone, cellphone_confidence, opened_at)
+             company_size, natureza_juridica_code, main_cnae_code, secondary_cnae_codes,
+             municipio_id, uf, email, phone, cellphone, cellphone_confidence, opened_at,
+             situacao_cadastral, motivo_situacao_cadastral_code)
         SELECT
             lpad(e.cnpj_basico, 8, '0') || lpad(e.cnpj_ordem, 4, '0') || lpad(e.cnpj_dv, 2, '0'),
             coalesce(nullif(emp.razao_social, ''), nullif(e.nome_fantasia, ''), ''),
@@ -438,6 +493,7 @@ def _build_final_table(db: Session, period: str) -> None:
             coalesce(s.opcao_mei = 'S', false),
             coalesce(s.opcao_simples = 'S', false),
             emp.porte_empresa,
+            emp.natureza_juridica,
             e.cnae_fiscal_principal,
             '[]',
             m.id,
@@ -446,17 +502,31 @@ def _build_final_table(db: Session, period: str) -> None:
             NULL,
             NULL,
             0,
-            e.data_inicio_atividade
+            e.data_inicio_atividade,
+            e.situacao_cadastral,
+            e.motivo_situacao_cadastral
         FROM estabelecimentos_staging e
         LEFT JOIN empresas_staging emp ON emp.cnpj_basico = e.cnpj_basico
         LEFT JOIN simples_staging s ON s.cnpj_basico = e.cnpj_basico
         LEFT JOIN municipios m ON m.receita_code = e.municipio_codigo
-        WHERE e.situacao_cadastral = '02'
         ON CONFLICT (cnpj) DO NOTHING
     """))
     db.commit()
 
     _fill_phones_and_secondary_cnaes(db, period)
+
+    # `Municipios.zip` da Receita só tem código+nome, sem UF -- pega o UF
+    # de qualquer estabelecimento daquele município (são 1:1 -- um código
+    # de município pertence sempre à mesma UF) enquanto o staging ainda
+    # existe. Sem isso, Municipio.uf fica sempre NULL e nomes duplicados
+    # entre estados (ex. várias "Buritis") ficam impossíveis de desambiguar.
+    _set_progress(db, period=period, group="build", step="build", message="preenchendo UF dos municípios")
+    db.execute(text("""
+        UPDATE municipios m SET uf = e.uf
+        FROM (SELECT DISTINCT ON (municipio_codigo) municipio_codigo, uf FROM estabelecimentos_staging) e
+        WHERE e.municipio_codigo = m.receita_code AND m.uf IS DISTINCT FROM e.uf
+    """))
+    db.commit()
 
     for col in deferred_indexes:
         _set_progress(db, period=period, group="build", step="build", message=f"recriando índice de {col}")
@@ -482,7 +552,6 @@ def _fill_phones_and_secondary_cnaes(db: Session, period: str) -> None:
     result = db.execute(text("""
         SELECT cnpj_basico, cnpj_ordem, cnpj_dv, ddd_1, telefone_1, cnae_fiscal_secundaria
         FROM estabelecimentos_staging
-        WHERE situacao_cadastral = '02'
     """))
 
     batch = []

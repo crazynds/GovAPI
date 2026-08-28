@@ -8,9 +8,11 @@
 
 | Dataset | Source | What you get |
 |---|---|---|
-| **CNPJ / CNAE** | Federal Revenue's public CNPJ database | Company search by CNAE (business activity), state, region, size, MEI/Simples status, etc. |
-| **Municipalities** | Official IBGE/Revenue list | Municipality lookup by name, state, region, or code. |
-| **CEP / Address** | [e-DNE Básico](https://github.com/cauethenorio/edne-correios-loader) | Address lookup by ZIP code or free text. Falls back to [ViaCEP](https://viacep.com.br) for anything not yet covered, and saves the result for next time. |
+| **CNPJ / CNAE** | Federal Revenue's public CNPJ database | Company search by CNAE (business activity), state, region, size, MEI/Simples status, legal nature, registration status (active/suspended/closed/etc — all companies, not just active ones), etc. |
+| **Partners (Sócios)** | Federal Revenue's public CNPJ database | Company shareholders/partners — search by company or by partner name/document. |
+| **Reference tables** | Federal Revenue's public CNPJ database | Legal nature, partner/officer qualification, country, and deregistration-reason codes — small lookup tables. |
+| **Municipalities** | Official IBGE/Revenue list, enriched with [IBGE/SIDRA](https://servicodados.ibge.gov.br) | Municipality lookup by name, state, region, or code, with estimated population and territorial area. |
+| **CEP / Address** | [e-DNE Básico](https://github.com/cauethenorio/edne-correios-loader) | Address lookup by ZIP code or free text. Falls back to [ViaCEP](https://viacep.com.br) for anything not yet covered, and saves the result for next time. Coordinates (lat/long) via [BrasilAPI](https://brasilapi.com.br), cached once looked up — radius search and distance sort work over that cache, not the whole CEP base. |
 | **States** | Static list | Brazilian states (UF + name + region). |
 | **Taxes (Simples Nacional)** | LC 123/2006 Anexos I–V | Effective tax rate and DAS amount calculation, Fator R calculation. Pure math, no import needed. |
 
@@ -127,6 +129,9 @@ docker compose run --rm app python -m app.cli import-cnpj --only estabelecimento
 
 # CEPs (Post Office e-DNE Básico)
 docker compose run --rm app python -m app.cli import-ceps
+
+# Municipality population/area (IBGE/SIDRA) -- run after import-cnpj at least once
+docker compose run --rm app python -m app.cli import-ibge
 ```
 
 Neither runs automatically — schedule `import-all` yourself (e.g. cron, an external scheduler) if you want periodic refreshes. Progress:
@@ -161,22 +166,41 @@ Full interactive docs (Swagger) at `/docs`.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/establishments` | Search companies. Filters: `cnae_codes` (+ `cnae_match=any\|all`), `uf`, `regiao`, `municipio_codes`, `company_size`, `is_mei`, `is_simples`, `is_headquarters`, `name`, `has_phone`, `only_with_cellphone`, `only_with_email`, `opened_after`/`opened_before`; sortable via `sort_by`/`sort_dir`, paginated via `page`/`per_page`. Results include CNAE descriptions and a human-readable company-size label. |
+| `GET` | `/establishments` | Search companies. Filters: `cnae_codes` (+ `cnae_match=any\|all`), `uf`, `regiao`, `municipio_codes`, `company_size`, `is_mei`, `is_simples`, `is_headquarters`, `name`, `situacao` (registration status, code or label — includes all statuses unless filtered), `has_phone`, `only_with_cellphone`, `only_with_email`, `opened_after`/`opened_before`; sortable via `sort_by`/`sort_dir`, paginated via `page`/`per_page`. Results include CNAE, legal-nature, and deregistration-reason descriptions, plus human-readable labels for company size and registration status. |
 | `GET` | `/establishments/by-cnpj` | Look up specific companies by CNPJ (`cnpjs=...`, repeatable). |
 | `GET` | `/establishments/stats` | Aggregates over the same filters as above: totals, breakdown by state/region/company size, and top CNAE codes — useful for sizing a segment before paginating individual results. |
 | `GET` | `/cnaes/search-by-description` | Search CNAE codes by description (`words=...`, repeatable). |
 | `GET` | `/cnaes/codes` | List all CNAE codes. |
-| `GET` | `/municipios/search` | Search municipalities by `name`, `uf`, and/or `regiao`. |
+| `GET` | `/municipios/search` | Search municipalities by `name`, `uf`, and/or `regiao`. Includes `population` and `area_km2` once `import-ibge` has run. |
 | `GET` | `/municipios/by-code/{receita_code}` | Look up a municipality by its Revenue/IBGE code. |
 | `GET` | `/import/status` | Check import progress. |
 | `POST` | `/import/trigger` | Trigger an import in the background. Unauthenticated. |
+
+### Partners (Sócios)
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/socios/por-empresa/{cnpj}` | List a company's partners/shareholders — accepts a full CNPJ or just the 8-digit root. |
+| `GET` | `/socios/buscar` | Search partners by `nome` and/or `documento` (CPF comes masked by the Revenue itself, e.g. `***123456**`) — find every company a person/entity is a partner in. Paginated. |
+
+### Reference tables
+
+Small code/description lookups — same shape as `/cnaes`. Each has `/search?name=...`, a plain list, and `/{code}`.
+
+| Prefix | Covers |
+|---|---|
+| `/naturezas-juridicas` | Legal nature (e.g. "Sociedade Empresária Limitada"). |
+| `/qualificacoes-societarias` | Partner/officer role (e.g. "Administrador"). |
+| `/paises` | Country codes, for foreign partners/companies. |
+| `/motivos-situacao-cadastral` | Why a company was deregistered/suspended. |
 
 ### Address
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/enderecos/cep/{cep}` | Look up an address by ZIP code. |
-| `GET` | `/enderecos/buscar` | Free-text address search — `logradouro` (street), `bairro` (neighborhood), `municipio`, `uf` (repeatable), `regiao`, `municipio_cod_ibge`; paginated via `page`/`per_page`. |
+| `GET` | `/enderecos/cep/{cep}` | Look up an address by ZIP code, including `latitude`/`longitude` when available (fetched from BrasilAPI on first lookup, cached after). |
+| `GET` | `/enderecos/buscar` | Free-text address search — `logradouro` (street), `bairro` (neighborhood), `municipio`, `uf` (repeatable), `regiao`, `municipio_cod_ibge`; paginated via `page`/`per_page`. Pass `lat`+`lon` to sort by distance instead (only over CEPs with a cached coordinate). |
+| `GET` | `/enderecos/proximos` | ZIP codes within `raio_km` of `lat`+`lon`, nearest first. Same cached-coordinates caveat as above. |
 | `GET` | `/enderecos/estados` | List all states. |
 
 ### Taxes (Simples Nacional)
@@ -209,7 +233,7 @@ app/
 ├── cli.py            # `python -m app.cli ...` commands
 ├── regions.py        # UF ↔ region mapping
 ├── tax_tables.py      # Simples Nacional Anexos I–V (static tables)
-├── importer/         # CNPJ download/extract/load pipeline
+├── importer/         # CNPJ download/extract/load pipeline, IBGE enrichment
 └── routers/           # API endpoints, one module per resource
 alembic/               # Schema migrations
 ```

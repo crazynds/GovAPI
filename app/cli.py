@@ -1,6 +1,7 @@
 import typer
 
 from app.config import settings
+from app.db import SessionLocal
 from app.importer.pipeline import run_import
 from app.migrate import run_migrations
 
@@ -41,6 +42,24 @@ def import_ceps(
     """
     _import_ceps(source=source)
     typer.echo(f"Importação de CEPs concluída — tabela `{CORREIOS_CEP_TABLE}`.")
+
+
+@cli.command("import-ibge")
+def import_ibge_command():
+    """
+    Busca população estimada e área territorial de todos os municípios de
+    uma vez via API pública do IBGE (SIDRA/Agregados, sem chave) e casa por
+    nome+UF com os municípios já importados. Precisa que `import-cnpj`
+    já tenha rodado ao menos uma vez (usa o UF preenchido no build).
+    """
+    from app.importer.ibge import import_ibge
+
+    db = SessionLocal()
+    try:
+        pop, area = import_ibge(db)
+        typer.echo(f"IBGE: {pop} municípios com população, {area} com área.")
+    finally:
+        db.close()
 
 
 @cli.command("import-all")

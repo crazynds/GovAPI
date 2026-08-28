@@ -14,6 +14,9 @@ def _serialize(m: Municipio) -> dict:
         "name": m.name,
         "uf": m.uf,
         "regiao": UF_TO_REGIAO.get(m.uf) if m.uf else None,
+        "ibge_code": m.ibge_code,
+        "population": m.population,
+        "area_km2": float(m.area_km2) if m.area_km2 is not None else None,
     }
 
 

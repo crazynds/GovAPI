@@ -6,7 +6,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Query as ORMQuery, Session
 
 from app.db import get_db
-from app.models import Cnae, Establishment, Municipio
+from app.models import Cnae, Establishment, Motivo, Municipio, NaturezaJuridica
 from app.regions import UF_TO_REGIAO, ufs_for_regiao
 from app.schemas import EstablishmentOut, EstablishmentPage, EstablishmentStatsOut
 
@@ -20,17 +20,39 @@ COMPANY_SIZE_LABELS = {
     "05": "Demais (médio/grande porte)",
 }
 
+# Codigos oficiais de situacao cadastral (Receita) -- ver layout do arquivo
+# Estabelecimentos. Aceito tanto o codigo quanto o label como filtro.
+SITUACAO_LABELS = {
+    "01": "nula",
+    "02": "ativa",
+    "03": "suspensa",
+    "04": "inapta",
+    "08": "baixada",
+}
+SITUACAO_CODES_BY_LABEL = {label: code for code, label in SITUACAO_LABELS.items()}
 
-def _cnae_descriptions(db: Session, codes: set[str]) -> dict[str, str]:
+
+def _resolve_situacao_codes(values: list[str]) -> list[str]:
+    return [SITUACAO_CODES_BY_LABEL.get(v.lower(), v) for v in values]
+
+
+def _code_descriptions(db: Session, model, codes: set[str]) -> dict[str, str]:
     codes = {c for c in codes if c}
     if not codes:
         return {}
-    rows = db.query(Cnae.code, Cnae.description).filter(Cnae.code.in_(codes)).all()
+    rows = db.query(model.code, model.description).filter(model.code.in_(codes)).all()
     return dict(rows)
 
 
-def _serialize(e: Establishment, cnae_map: dict[str, str] | None = None) -> EstablishmentOut:
+def _serialize(
+    e: Establishment,
+    cnae_map: dict[str, str] | None = None,
+    natureza_map: dict[str, str] | None = None,
+    motivo_map: dict[str, str] | None = None,
+) -> EstablishmentOut:
     cnae_map = cnae_map or {}
+    natureza_map = natureza_map or {}
+    motivo_map = motivo_map or {}
     secondary_codes = e.secondary_cnae_codes or []
     return EstablishmentOut(
         cnpj=e.cnpj,
@@ -41,6 +63,8 @@ def _serialize(e: Establishment, cnae_map: dict[str, str] | None = None) -> Esta
         is_simples=e.is_simples,
         company_size=e.company_size,
         company_size_label=COMPANY_SIZE_LABELS.get(e.company_size or ""),
+        natureza_juridica_code=e.natureza_juridica_code,
+        natureza_juridica_description=natureza_map.get(e.natureza_juridica_code or ""),
         main_cnae_code=e.main_cnae_code,
         main_cnae_description=cnae_map.get(e.main_cnae_code or ""),
         secondary_cnae_codes=secondary_codes,
@@ -52,16 +76,26 @@ def _serialize(e: Establishment, cnae_map: dict[str, str] | None = None) -> Esta
         cellphone=e.cellphone,
         cellphone_confidence=e.cellphone_confidence,
         opened_at=e.opened_at,
+        situacao_cadastral=e.situacao_cadastral,
+        situacao_cadastral_label=SITUACAO_LABELS.get(e.situacao_cadastral or ""),
+        motivo_situacao_cadastral_code=e.motivo_situacao_cadastral_code,
+        motivo_situacao_cadastral_description=motivo_map.get(e.motivo_situacao_cadastral_code or ""),
     )
 
 
 def _serialize_many(db: Session, items: list[Establishment]) -> list[EstablishmentOut]:
-    all_codes: set[str] = set()
+    all_cnae_codes: set[str] = set()
+    natureza_codes: set[str] = set()
+    motivo_codes: set[str] = set()
     for e in items:
-        all_codes.add(e.main_cnae_code or "")
-        all_codes.update(e.secondary_cnae_codes or [])
-    cnae_map = _cnae_descriptions(db, all_codes)
-    return [_serialize(e, cnae_map) for e in items]
+        all_cnae_codes.add(e.main_cnae_code or "")
+        all_cnae_codes.update(e.secondary_cnae_codes or [])
+        natureza_codes.add(e.natureza_juridica_code or "")
+        motivo_codes.add(e.motivo_situacao_cadastral_code or "")
+    cnae_map = _code_descriptions(db, Cnae, all_cnae_codes)
+    natureza_map = _code_descriptions(db, NaturezaJuridica, natureza_codes)
+    motivo_map = _code_descriptions(db, Motivo, motivo_codes)
+    return [_serialize(e, cnae_map, natureza_map, motivo_map) for e in items]
 
 
 def _apply_filters(
@@ -77,6 +111,7 @@ def _apply_filters(
     is_simples: bool | None,
     is_headquarters: bool | None,
     name: str | None,
+    situacao: list[str] | None,
     only_with_cellphone: bool,
     only_with_email: bool,
     has_phone: bool | None,
@@ -120,6 +155,9 @@ def _apply_filters(
             or_(Establishment.company_name.ilike(pattern), Establishment.trade_name.ilike(pattern))
         )
 
+    if situacao:
+        query = query.filter(Establishment.situacao_cadastral.in_(_resolve_situacao_codes(situacao)))
+
     if only_with_cellphone:
         query = query.filter(Establishment.cellphone.isnot(None))
 
@@ -150,6 +188,9 @@ def search(
     is_simples: bool | None = Query(None),
     is_headquarters: bool | None = Query(None),
     name: str | None = Query(None, description="Busca por razão social ou nome fantasia"),
+    situacao: list[str] | None = Query(
+        None, description="Código (01/02/03/04/08) ou label (nula/ativa/suspensa/inapta/baixada); sem filtro, mostra todas"
+    ),
     only_with_cellphone: bool = Query(True),
     only_with_email: bool = Query(False),
     has_phone: bool | None = Query(None, description="Filtra por ter (true) ou não ter (false) telefone fixo"),
@@ -173,6 +214,7 @@ def search(
         is_simples=is_simples,
         is_headquarters=is_headquarters,
         name=name,
+        situacao=situacao,
         only_with_cellphone=only_with_cellphone,
         only_with_email=only_with_email,
         has_phone=has_phone,
@@ -219,6 +261,7 @@ def stats(
     is_simples: bool | None = Query(None),
     is_headquarters: bool | None = Query(None),
     name: str | None = Query(None),
+    situacao: list[str] | None = Query(None),
     only_with_cellphone: bool = Query(False),
     only_with_email: bool = Query(False),
     has_phone: bool | None = Query(None),
@@ -243,6 +286,7 @@ def stats(
         is_simples=is_simples,
         is_headquarters=is_headquarters,
         name=name,
+        situacao=situacao,
         only_with_cellphone=only_with_cellphone,
         only_with_email=only_with_email,
         has_phone=has_phone,

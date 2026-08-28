@@ -12,6 +12,8 @@ class EstablishmentOut(BaseModel):
     is_simples: bool
     company_size: str | None
     company_size_label: str | None
+    natureza_juridica_code: str | None
+    natureza_juridica_description: str | None
     main_cnae_code: str | None
     main_cnae_description: str | None
     secondary_cnae_codes: list[str]
@@ -23,8 +25,46 @@ class EstablishmentOut(BaseModel):
     cellphone: str | None
     cellphone_confidence: int
     opened_at: date | None
+    situacao_cadastral: str | None
+    situacao_cadastral_label: str | None
+    motivo_situacao_cadastral_code: str | None
+    motivo_situacao_cadastral_description: str | None
 
     model_config = {"from_attributes": True}
+
+
+class CodeDescriptionOut(BaseModel):
+    code: str
+    description: str
+
+    model_config = {"from_attributes": True}
+
+
+class SocioOut(BaseModel):
+    cnpj_basico: str
+    identificador_socio: str | None
+    identificador_socio_label: str | None
+    nome_socio: str
+    cpf_cnpj_socio: str | None
+    qualificacao_socio_code: str | None
+    qualificacao_socio_description: str | None
+    data_entrada_sociedade: date | None
+    pais_code: str | None
+    pais_description: str | None
+    representante_legal: str | None
+    nome_representante: str | None
+    qualificacao_representante_code: str | None
+    qualificacao_representante_description: str | None
+    faixa_etaria_label: str | None
+    company_name: str | None
+
+
+class SocioPageOut(BaseModel):
+    data: list[SocioOut]
+    total: int
+    per_page: int
+    current_page: int
+    last_page: int
 
 
 class EstablishmentPage(BaseModel):

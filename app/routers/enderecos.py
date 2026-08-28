@@ -1,12 +1,15 @@
 import re
+from datetime import datetime, timezone
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 
 from app.db import get_db
+from app.models import CepCoordenada
 from app.regions import ufs_for_regiao
 
 router = APIRouter(prefix="/enderecos", tags=["enderecos"])
@@ -19,6 +22,7 @@ router = APIRouter(prefix="/enderecos", tags=["enderecos"])
 # primeiro `import-ceps` já ter rodado (ver _ensure_correios_cep_table).
 CORREIOS_CEP_TABLE = "correios_cep"
 CORREIOS_CEP_COLUMNS = "cep, logradouro, complemento, bairro, municipio, municipio_cod_ibge, uf, nome"
+_CORREIOS_CEP_COLUMNS_PREFIXED_E = ", ".join(f"e.{c.strip()}" for c in CORREIOS_CEP_COLUMNS.split(","))
 
 # UF -> nome, IBGE não muda isso com frequência (dado estático).
 ESTADOS = [
@@ -61,6 +65,9 @@ def buscar_cep(cep: str, db: Session = Depends(get_db)):
 
     from_correios = _query_correios_cep(db, digits)
     if from_correios:
+        coords = _get_or_fetch_coordinates(db, digits)
+        from_correios["latitude"] = coords[0] if coords else None
+        from_correios["longitude"] = coords[1] if coords else None
         return from_correios
 
     try:
@@ -102,7 +109,22 @@ def buscar_cep(cep: str, db: Session = Depends(get_db)):
         )
         db.commit()
 
+    coords = _get_or_fetch_coordinates(db, digits)
+    row["latitude"] = coords[0] if coords else None
+    row["longitude"] = coords[1] if coords else None
     return row
+
+
+# Haversine em SQL puro (sem PostGIS) -- distância em km entre um ponto
+# fixo (:lat/:lon) e cep_coordenadas.latitude/longitude.
+_DISTANCE_KM_SQL = """
+    6371 * acos(
+        greatest(-1, least(1,
+            cos(radians(:lat)) * cos(radians(c.latitude)) * cos(radians(c.longitude) - radians(:lon))
+            + sin(radians(:lat)) * sin(radians(c.latitude))
+        ))
+    )
+"""
 
 
 @router.get("/buscar")
@@ -113,12 +135,20 @@ def buscar_endereco(
     uf: list[str] | None = Query(None, description="Uma ou mais UFs, ex: ?uf=SP&uf=RJ"),
     regiao: str | None = Query(None, description="norte/nordeste/centro-oeste/sudeste/sul, combina com uf"),
     municipio_cod_ibge: int | None = Query(None),
+    lat: float | None = Query(None, description="Ordena por distância a partir daqui (combine com lon)"),
+    lon: float | None = Query(None, description="Ordena por distância a partir daqui (combine com lat)"),
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
     """Busca por texto/filtros na base oficial dos Correios (e-DNE) -- precisa
-    do `import-ceps` já ter rodado, senão retorna lista vazia."""
+    do `import-ceps` já ter rodado, senão retorna lista vazia.
+
+    Passando `lat`+`lon`, ordena por distância em vez de município/logradouro
+    -- mas só considera CEPs que já têm coordenada cacheada (ver
+    `/enderecos/cep/{cep}`), então filtros de texto amplos combinados com
+    `lat`/`lon` tendem a retornar poucos resultados até mais CEPs da região
+    terem sido consultados alguma vez."""
     conditions = []
     params: dict = {"limit": per_page, "offset": (page - 1) * per_page}
 
@@ -145,15 +175,56 @@ def buscar_endereco(
         conditions.append("uf = ANY(:ufs)")
         params["ufs"] = list(ufs)
 
-    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    order_by_distance = lat is not None and lon is not None
+    if order_by_distance:
+        params["lat"], params["lon"] = lat, lon
+        query_sql = f"""
+            SELECT {_CORREIOS_CEP_COLUMNS_PREFIXED_E}, {_DISTANCE_KM_SQL} AS distancia_km
+            FROM {CORREIOS_CEP_TABLE} e
+            JOIN cep_coordenadas c ON c.cep = e.cep
+            {f"WHERE {' AND '.join(conditions)}" if conditions else ""}
+            ORDER BY distancia_km ASC
+            LIMIT :limit OFFSET :offset
+        """
+    else:
+        query_sql = f"""
+            SELECT {CORREIOS_CEP_COLUMNS} FROM {CORREIOS_CEP_TABLE}
+            {f"WHERE {' AND '.join(conditions)}" if conditions else ""}
+            ORDER BY municipio, logradouro
+            LIMIT :limit OFFSET :offset
+        """
 
     try:
+        result = db.execute(text(query_sql), params)
+        return [dict(row._mapping) for row in result]
+    except ProgrammingError:
+        db.rollback()
+        return []
+
+
+@router.get("/proximos")
+def enderecos_proximos(
+    lat: float = Query(..., description="Latitude do ponto de referência"),
+    lon: float = Query(..., description="Longitude do ponto de referência"),
+    raio_km: float = Query(5, gt=0, le=200, description="Raio de busca em km"),
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """Lista CEPs dentro de um raio, ordenados por distância (mais próximo
+    primeiro). Só considera CEPs que já têm coordenada cacheada (ver
+    `/enderecos/cep/{cep}`) -- não é uma busca geográfica sobre toda a base
+    de CEPs do Brasil, só sobre os que já foram consultados alguma vez."""
+    try:
         result = db.execute(
-            text(
-                f"SELECT {CORREIOS_CEP_COLUMNS} FROM {CORREIOS_CEP_TABLE} {where} "
-                "ORDER BY municipio, logradouro LIMIT :limit OFFSET :offset"
-            ),
-            params,
+            text(f"""
+                SELECT {_CORREIOS_CEP_COLUMNS_PREFIXED_E}, {_DISTANCE_KM_SQL} AS distancia_km
+                FROM {CORREIOS_CEP_TABLE} e
+                JOIN cep_coordenadas c ON c.cep = e.cep
+                WHERE {_DISTANCE_KM_SQL} <= :raio_km
+                ORDER BY distancia_km ASC
+                LIMIT :limit
+            """),
+            {"lat": lat, "lon": lon, "raio_km": raio_km, "limit": limit},
         )
         return [dict(row._mapping) for row in result]
     except ProgrammingError:
@@ -176,6 +247,45 @@ def _ensure_correios_cep_table(db: Session) -> None:
             nome VARCHAR(100)
         )
     """))
+
+
+def _get_or_fetch_coordinates(db: Session, cep: str) -> tuple[float, float] | None:
+    """Lat/long por CEP, cacheadas em `cep_coordenadas` (tabela nossa,
+    imune ao rebuild do e-DNE). Se ainda não tem, busca na BrasilAPI
+    (gratuita, sem chave) -- best-effort: nunca falha a consulta de
+    endereço por causa disso, e cacheia mesmo quando não acha coordenada
+    pra não bater na BrasilAPI de novo pro mesmo CEP sem coordenada."""
+    cached = db.get(CepCoordenada, cep)
+    if cached:
+        if cached.latitude is None or cached.longitude is None:
+            return None
+        return float(cached.latitude), float(cached.longitude)
+
+    latitude = longitude = None
+    source = "brasilapi_sem_coordenada"
+    try:
+        response = httpx.get(f"https://brasilapi.com.br/api/cep/v2/{cep}", timeout=8)
+        if response.status_code == 200:
+            coords = response.json().get("location", {}).get("coordinates", {})
+            if coords.get("latitude") and coords.get("longitude"):
+                latitude, longitude = float(coords["latitude"]), float(coords["longitude"])
+                source = "brasilapi"
+    except (httpx.HTTPError, ValueError, TypeError):
+        return None  # falha na consulta -- não cacheia, tenta de novo na próxima
+
+    stmt = pg_insert(CepCoordenada.__table__).values(
+        cep=cep, latitude=latitude, longitude=longitude, source=source,
+        updated_at=datetime.now(timezone.utc),
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["cep"],
+        set_={"latitude": stmt.excluded.latitude, "longitude": stmt.excluded.longitude,
+              "source": stmt.excluded.source, "updated_at": stmt.excluded.updated_at},
+    )
+    db.execute(stmt)
+    db.commit()
+
+    return (latitude, longitude) if latitude and longitude else None
 
 
 def _query_correios_cep(db: Session, cep: str) -> dict | None:
