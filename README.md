@@ -265,6 +265,15 @@ terse line per table for the rest, so `app/importer/edne_progress.py` drives a
 progress bar off the one hook it exposes (`download_report_hook`) and off a
 thin wrapper around `populate_table` that counts rows as they stream through.
 
+Real e-DNE data doesn't respect the column widths the library's own schema
+declares for it — a neighborhood name longer than the `VARCHAR(36)` it assigns
+its abbreviation, for one, hit in production. `app.ceps.widen_free_text_columns`
+switches every free-text column (name, address, abbreviation — anything wider
+than 8 chars in the library's own schema) to `TEXT` before `.load()` creates the
+tables, and `correios_cep`'s matching columns are `TEXT` for the same reason,
+so a long value survives both the library's own tables and our upsert into it.
+Fixed-width codes (CEP, UF/country sigla, single-char flags) are left alone.
+
 ## API reference
 
 Full interactive docs (Swagger) at `/docs`.

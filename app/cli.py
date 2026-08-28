@@ -246,6 +246,12 @@ def _import_ceps(source: str | None) -> None:
             dne_source=source,
             table_names={"cep_unificado": ceps.SCRATCH_TABLE},
         )
+        # O e-DNE real não respeita as larguras que a própria lib declara pro
+        # schema dela -- visto na prática: nome de bairro/logradouro passando
+        # de VARCHAR(36)/(100) e o INSERT da lib morrendo com
+        # StringDataRightTruncation. Alarga antes de `.load()` criar as
+        # tabelas -- ver ceps.widen_free_text_columns.
+        ceps.widen_free_text_columns(loader.metadata)
         with edne_progress.progress(loader):
             loader.load(table_set=TableSetEnum.UNIFIED_CEP_ONLY)
 

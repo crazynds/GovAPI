@@ -10,7 +10,7 @@ O `cep` e INTEGER (4 bytes em vez dos 8 digitos como texto), e a formatacao com
 zero a esquerda acontece na leitura -- ver `SELECT_COLUMNS`.
 """
 
-from sqlalchemy import text
+from sqlalchemy import String, Text, text
 from sqlalchemy.orm import Session
 
 TABLE = "correios_cep"
@@ -36,6 +36,36 @@ COLUMNS = (
 )
 
 CEP_WIDTH = 8
+
+
+# Colunas cujo tamanho e um codigo de largura fixa (sigla de UF/pais, flag de
+# 1 caractere, o proprio CEP) -- essas ficam do jeito que a lib declarou.
+# Tudo com largura declarada acima disso e texto livre (nome de logradouro,
+# bairro, abreviacao) e vai pra `widen_free_text_columns`.
+_FIXED_WIDTH_MAX = 8
+
+
+def widen_free_text_columns(metadata) -> None:
+    """Troca por Text() toda coluna de texto livre do esquema do e-DNE.
+
+    O e-DNE (dados reais dos Correios) nao respeita as larguras que o proprio
+    edne-correios-loader declara pro schema dele -- visto na pratica:
+    `log_bairro.bai_no_abrev` e VARCHAR(36) e um bairro real tem abreviacao
+    maior, `StringDataRightTruncation` no INSERT. E nao e so essa coluna: a
+    `logradouro` da tabela unificada e montada concatenando `tlo_tx` (36) +
+    `log_no` (100) numa coluna que so tem 100 de largura -- o mesmo estouro
+    pode acontecer ali tambem, so que mais raro (por isso nao apareceu antes).
+
+    Chamado sobre `DneLoader.metadata` ANTES de `.load()`: como as tabelas
+    (inclusive a de scratch que vira `cep_unificado`) sao criadas dentro do
+    `.load()`, mudar o tipo aqui muda a DDL que sai. As colunas afetadas
+    pertencem a tabelas temporarias, dropadas no fim do import -- widen sem
+    limite nao custa nada alem do import em si.
+    """
+    for table in metadata.tables.values():
+        for column in table.columns:
+            if isinstance(column.type, String) and (column.type.length or 0) > _FIXED_WIDTH_MAX:
+                column.type = Text()
 
 
 def to_int(raw: str | int | None) -> int | None:

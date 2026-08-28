@@ -321,11 +321,17 @@ class Cep(Base):
     longitude: Mapped[float | None] = mapped_column(Numeric(10, 7), nullable=True)
     coord_updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     uf: Mapped[str | None] = mapped_column(String(2), nullable=True)
-    logradouro: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    complemento: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    bairro: Mapped[str | None] = mapped_column(String(72), nullable=True)
-    municipio: Mapped[str | None] = mapped_column(String(72), nullable=True)
-    nome: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Text (nao VARCHAR(n)) de proposito: o e-DNE real nao respeita as
+    # larguras que o proprio schema do e-DNE declara (visto na pratica --
+    # nome de logradouro/bairro estourando VARCHAR(36)/(100) e derrubando o
+    # import com StringDataRightTruncation). Sem custo em Postgres: TEXT e
+    # VARCHAR(n) tem a mesma representacao em disco, e e o mesmo padrao ja
+    # usado em Establishment.company_name/trade_name/email.
+    logradouro: Mapped[str | None] = mapped_column(Text, nullable=True)
+    complemento: Mapped[str | None] = mapped_column(Text, nullable=True)
+    bairro: Mapped[str | None] = mapped_column(Text, nullable=True)
+    municipio: Mapped[str | None] = mapped_column(Text, nullable=True)
+    nome: Mapped[str | None] = mapped_column(Text, nullable=True)
     # De onde veio a coordenada: 'osm_extract', 'brasilapi', ou
     # 'brasilapi_sem_coordenada' pra marcar "ja perguntei e nao tem" e nao
     # bater na API de novo pelo mesmo CEP. NULL = nunca foi buscada.
