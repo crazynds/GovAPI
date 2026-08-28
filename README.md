@@ -106,7 +106,7 @@ Set via `.env` (copy `.env.example` to start).
 | `APP_DB_USER` | `cnpj` | Postgres user. |
 | `APP_DB_PASSWORD` | `cnpj` | Postgres password. |
 | `APP_DB_NAME` | `cnpj` | Postgres database name. |
-| `APP_DOWNLOAD_DIR` | `/data/cnpj-import` | Scratch directory for files during import. |
+| `APP_DOWNLOAD_DIR` | `/tmp/cnpj-import` | Scratch directory for files during import (no need to persist it across restarts). |
 
 ## Importing the data
 

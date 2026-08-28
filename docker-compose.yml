@@ -30,18 +30,17 @@ services:
       APP_DB_USER: ${APP_DB_USER:-cnpj}
       APP_DB_PASSWORD: ${APP_DB_PASSWORD:-cnpj}
       APP_DB_NAME: ${APP_DB_NAME:-cnpj}
-      APP_DOWNLOAD_DIR: /data/cnpj-import
     ports:
       - "${APP_PORT:-8000}:8000"
     volumes:
-      - cnpj_download_data:/data/cnpj-import
       # Código montado direto do host -- editar aqui já reflete no
       # container, sem rebuild. Só precisa rebuildar (`docker compose build
       # app`) quando requirements.txt mudar (dependências ficam na imagem).
       - ./app:/srv/app
       - ./alembic:/srv/alembic
       - ./alembic.ini:/srv/alembic.ini
+      # Scratch de zips/CSVs do import -- some com o container, não precisa
+      # de volume nomeado (ver APP_DOWNLOAD_DIR em app/config.py).
 
 volumes:
   cnpj_db_data:
-  cnpj_download_data:

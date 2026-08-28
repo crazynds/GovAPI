@@ -19,8 +19,9 @@ class Settings(BaseSettings):
     open_data_url: str = "https://dados-abertos-rf-cnpj.casadosdados.com.br/arquivos"
 
     # Diretorio de trabalho para zips/CSVs baixados -- limpo arquivo a
-    # arquivo durante o pipeline (ver app/importer/pipeline.py).
-    download_dir: str = "/data/cnpj-import"
+    # arquivo durante o pipeline (ver app/importer/pipeline.py), não
+    # precisa persistir entre execuções, por isso vive em /tmp sem volume.
+    download_dir: str = "/tmp/cnpj-import"
 
     class Config:
         env_prefix = "APP_"
