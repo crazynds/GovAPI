@@ -60,7 +60,7 @@ MAX_LENGTHS = {
 }
 
 MAX_ATTEMPTS_PER_FILE = 3
-BATCH_SIZE = 2000
+BATCH_SIZE = 10_000
 
 
 def files_for_group(files: list[str], group: str) -> list[str]:
@@ -71,6 +71,13 @@ def files_for_group(files: list[str], group: str) -> list[str]:
 def run_import(period: str | None = None, only: list[str] | None = None) -> None:
     db = SessionLocal()
     try:
+        # Staging é inteiramente reconstruível (UPSERT idempotente, refeito
+        # do zero em caso de falha -- ver ImportLog), então esperar o WAL
+        # sincronizar a cada commit não compra nada aqui além de lentidão.
+        # Efeito: só a última fração de segundo de trabalho pode se perder
+        # num crash do Postgres em si (não da aplicação) -- aceitável.
+        db.execute(text("SET synchronous_commit = OFF"))
+
         resolved_period = period or client.discover_latest_period()
         all_files = client.list_files(resolved_period)
         groups = [g for g in GROUPS if not only or g in only]
@@ -242,6 +249,12 @@ def _import_file(db: Session, period: str, group: str, file: str, csv_path: str)
     last_db_write = 0.0
 
     def flush():
+        # Sem commit aqui de propósito -- comitar a cada lote de milhões de
+        # linhas é o maior gargalo (fsync do WAL por commit). O commit
+        # acontece no ritmo do on_progress abaixo (~1x/s) e no final do
+        # arquivo; se cair no meio, o arquivo é refeito do zero de qualquer
+        # forma (UPSERT idempotente, ver ImportLog), então perder alguns
+        # lotes não-comitados de um crash não muda o resultado final.
         nonlocal count
         if not batch:
             return
@@ -249,7 +262,6 @@ def _import_file(db: Session, period: str, group: str, file: str, csv_path: str)
         update_cols = {c: stmt.excluded[c] for c in batch[0] if c not in spec["unique"]}
         stmt = stmt.on_conflict_do_update(index_elements=spec["unique"], set_=update_cols)
         db.execute(stmt)
-        db.commit()
         count_local = len(batch)
         batch.clear()
         return count_local
@@ -329,6 +341,24 @@ def _build_final_table(db: Session, period: str) -> None:
     # Sequence própria antes de qualquer INSERT usar o default.
     db.execute(text("CREATE SEQUENCE IF NOT EXISTS establishments_new_id_seq OWNED BY establishments_new.id"))
     db.execute(text("ALTER TABLE establishments_new ALTER COLUMN id SET DEFAULT nextval('establishments_new_id_seq')"))
+
+    # Índices secundários (não essenciais pro ON CONFLICT abaixo, só pras
+    # queries da API depois) custam caro de manter linha a linha num INSERT
+    # de milhões de linhas -- dropa os que o LIKE copiou e recria só depois
+    # do bulk load, onde um CREATE INDEX é ordens de magnitude mais rápido.
+    # Índice único de cnpj (usado pelo ON CONFLICT) e PK ficam intactos.
+    deferred_indexes = []
+    for col in ("main_cnae_code", "uf", "cellphone"):
+        idx_name = db.execute(
+            text(
+                "SELECT indexname FROM pg_indexes "
+                "WHERE tablename = 'establishments_new' AND indexdef ILIKE :pattern"
+            ),
+            {"pattern": f"%({col})%"},
+        ).scalar()
+        if idx_name:
+            db.execute(text(f'DROP INDEX "{idx_name}"'))
+            deferred_indexes.append(col)
     db.commit()
 
     imported = db.execute(text("""
@@ -364,9 +394,18 @@ def _build_final_table(db: Session, period: str) -> None:
 
     _fill_phones_and_secondary_cnaes(db, period)
 
+    for col in deferred_indexes:
+        _set_progress(db, period=period, group="build", step="build", message=f"recriando índice de {col}")
+        db.execute(text(f'CREATE INDEX "ix_establishments_new_{col}" ON establishments_new ({col})'))
+        db.commit()
+
     db.execute(text("ALTER TABLE establishments RENAME TO establishments_old"))
     db.execute(text("ALTER TABLE establishments_new RENAME TO establishments"))
+    # Só depois de dropar a tabela antiga (e os índices dela junto) pra
+    # liberar os nomes canônicos (ix_establishments_<col>) sem colisão.
     db.execute(text("DROP TABLE establishments_old"))
+    for col in deferred_indexes:
+        db.execute(text(f'ALTER INDEX "ix_establishments_new_{col}" RENAME TO "ix_establishments_{col}"'))
     db.execute(text("ALTER SEQUENCE establishments_new_id_seq RENAME TO establishments_id_seq"))
     db.execute(text("TRUNCATE TABLE empresas_staging, simples_staging, estabelecimentos_staging"))
     db.execute(text("DELETE FROM import_log WHERE period = :period"), {"period": period})

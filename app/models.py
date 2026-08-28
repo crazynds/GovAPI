@@ -97,7 +97,11 @@ class EstabelecimentoStaging(Base):
     cnpj_dv: Mapped[str] = mapped_column(String(2))
     identificador_matriz_filial: Mapped[str | None] = mapped_column(String(1), nullable=True)
     nome_fantasia: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    situacao_cadastral: Mapped[str | None] = mapped_column(String(2), nullable=True, index=True)
+    # Sem index=True aqui de propósito: só é filtrado 2x no fim do import
+    # (build da tabela final), um full scan nessas 2 vezes é mais barato do
+    # que manter um índice btree atualizado a cada um dos milhões de UPSERTs
+    # que populam essa tabela durante o import.
+    situacao_cadastral: Mapped[str | None] = mapped_column(String(2), nullable=True)
     data_inicio_atividade: Mapped[date | None] = mapped_column(Date, nullable=True)
     cnae_fiscal_principal: Mapped[str | None] = mapped_column(String(16), nullable=True)
     cnae_fiscal_secundaria: Mapped[str | None] = mapped_column(String(2048), nullable=True)
