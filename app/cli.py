@@ -1,11 +1,15 @@
+from datetime import datetime, timezone
+
 import typer
 from sqlalchemy import text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app import ceps
 from app.config import settings
 from app.db import SessionLocal
 from app.importer.pipeline import run_import
 from app.migrate import run_migrations
+from app.models import ImportAllRun
 
 cli = typer.Typer()
 
@@ -144,6 +148,11 @@ def import_ceps_osm_command():
         db.close()
 
 
+# Ordem das 5 fases de `import_all` -- a mesma ordem em que elas rodam, e a
+# mesma dos nomes das colunas de ImportAllRun.
+IMPORT_ALL_PHASES = ["ceps", "ceps_osm", "cnpj", "ibge", "municipios_geo"]
+
+
 @cli.command("import-all")
 def import_all(
     skip_municipios_geo: bool = typer.Option(
@@ -172,13 +181,69 @@ def import_all(
          município que já tem coordenada, então rodar de novo só continua de
          onde parou. Use --skip-municipios-geo pra deixar pra depois.
 
+    Se for cancelado no meio (Ctrl-C ou qualquer falha), a PRÓXIMA chamada
+    retoma da fase em que parou -- pula toda fase já concluída na tentativa
+    anterior, em vez de recomeçar da 1/5. Isso só vale enquanto a tentativa
+    anterior não tiver terminado com sucesso: depois de um `import-all`
+    completo, a próxima chamada é tratada como um refresh de verdade (mês que
+    vem, novo período de CNPJ, e-DNE atualizado) e roda as 5 fases de novo.
+
     Use os comandos individuais se só precisar atualizar uma das bases -- mas
     respeite a ordem acima ao encadeá-los.
     """
-    typer.echo("== 1/5 CEPs (Correios / e-DNE) ==")
-    _import_ceps(source=None)
+    db = SessionLocal()
+    try:
+        run = db.get(ImportAllRun, 1)
+        resuming = run is not None and run.status != "success"
 
-    typer.echo("== 2/5 Coordenadas de CEP (extrato do OpenStreetMap) ==")
+        if not resuming:
+            # Ou é a primeira vez, ou a tentativa anterior terminou com
+            # sucesso -- as duas contam como "começar do zero", a segunda
+            # porque um refresh periódico deve reprocessar tudo, não pular
+            # fase nenhuma pra sempre.
+            phases = dict.fromkeys(IMPORT_ALL_PHASES, "pending")
+        else:
+            phases = {name: getattr(run, name) for name in IMPORT_ALL_PHASES}
+            already_done = [name for name, status in phases.items() if status == "success"]
+            if already_done:
+                typer.echo(f"Retomando: pulando {', '.join(already_done)} (já concluído(s) antes).")
+
+        _set_import_all(db, status="running", **phases)
+
+        steps = [
+            ("ceps", "1/5 CEPs (Correios / e-DNE)", lambda: _import_ceps(source=None)),
+            ("ceps_osm", "2/5 Coordenadas de CEP (extrato do OpenStreetMap)", _run_ceps_osm),
+            ("cnpj", "3/5 CNPJ (Receita Federal)", lambda: _import_cnpj(period=None, only=None)),
+            ("ibge", "4/5 População e área dos municípios (IBGE)", _run_ibge),
+            ("municipios_geo", "5/5 Centroide dos municípios (Nominatim, ~1h40)", _run_municipios_geo),
+        ]
+
+        for key, label, action in steps:
+            if phases.get(key) == "success":
+                typer.echo(f"== {label} -- já concluído ==")
+                continue
+
+            if key == "municipios_geo" and skip_municipios_geo:
+                typer.echo(f"== {label} -- pulado (--skip-municipios-geo) ==")
+                _set_import_all(db, municipios_geo="skipped")
+                continue
+
+            typer.echo(f"== {label} ==")
+            _set_import_all(db, **{key: "running"})
+            try:
+                action()
+            except BaseException as exc:  # noqa: BLE001 -- inclui KeyboardInterrupt: Ctrl-C também marca a fase como não concluída
+                _set_import_all(db, status="failed", message=f"{key}: {exc}"[:255], **{key: "failed"})
+                raise
+            _set_import_all(db, **{key: "success"})
+
+        _set_import_all(db, status="success", message="import-all concluído")
+        typer.echo("Todas as importações concluídas.")
+    finally:
+        db.close()
+
+
+def _run_ceps_osm() -> None:
     from app.importer.osm_ceps import import_ceps_from_osm
 
     db = SessionLocal()
@@ -187,10 +252,8 @@ def import_all(
     finally:
         db.close()
 
-    typer.echo("== 3/5 CNPJ (Receita Federal) ==")
-    _import_cnpj(period=None, only=None)
 
-    typer.echo("== 4/5 População e área dos municípios (IBGE) ==")
+def _run_ibge() -> None:
     from app.importer.ibge import import_ibge
 
     db = SessionLocal()
@@ -200,20 +263,30 @@ def import_all(
     finally:
         db.close()
 
-    if skip_municipios_geo:
-        typer.echo("== 5/5 Centroide dos municípios -- pulado (--skip-municipios-geo) ==")
-    else:
-        typer.echo("== 5/5 Centroide dos municípios (Nominatim, ~1h40) ==")
-        from app.importer.geocoding import geocode_municipios
 
-        db = SessionLocal()
-        try:
-            geocoded, total = geocode_municipios(db)
-            typer.echo(f"Geocodificação: {geocoded}/{total} municípios pendentes resolvidos.")
-        finally:
-            db.close()
+def _run_municipios_geo() -> None:
+    from app.importer.geocoding import geocode_municipios
 
-    typer.echo("Todas as importações concluídas.")
+    db = SessionLocal()
+    try:
+        geocoded, total = geocode_municipios(db)
+        typer.echo(f"Geocodificação: {geocoded}/{total} municípios pendentes resolvidos.")
+    finally:
+        db.close()
+
+
+def _set_import_all(db, **fields) -> None:
+    now = datetime.now(timezone.utc)
+    fields["updated_at"] = now
+    if fields.get("status") == "running":
+        existing = db.get(ImportAllRun, 1)
+        if not existing or existing.status != "running":
+            fields["started_at"] = now
+
+    stmt = pg_insert(ImportAllRun.__table__).values(id=1, **fields)
+    stmt = stmt.on_conflict_do_update(index_elements=["id"], set_={c: stmt.excluded[c] for c in fields})
+    db.execute(stmt)
+    db.commit()
 
 
 def _import_cnpj(period: str | None, only: list[str] | None) -> None:

@@ -146,6 +146,14 @@ IBGE/geocoding steps need. Chaining the individual commands means respecting
 that order yourself. `--skip-municipios-geo` leaves out the slow step (~5570
 Nominatim calls at 1 req/s, about 1h40 the first time).
 
+If interrupted — Ctrl-C or a genuine failure — the next `import-all` resumes
+from the phase that didn't finish rather than starting over at CEPs. Each
+phase writes its own status to `import_all_run` before and after running, and
+a phase already `success` is skipped. That only holds while the previous
+attempt didn't fully succeed, though: once all five phases complete, the
+following call treats itself as a real periodic refresh (a new CNPJ period, an
+updated e-DNE) and redoes everything rather than skipping forever.
+
 Neither runs automatically — schedule `import-all` yourself (e.g. cron, an external scheduler) if you want periodic refreshes. Progress:
 
 ```bash

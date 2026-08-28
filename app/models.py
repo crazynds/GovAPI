@@ -393,3 +393,34 @@ class ImportRun(Base):
     message: Mapped[str | None] = mapped_column(String(255), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class ImportAllRun(Base):
+    """Estado do comando `import-all` em si -- as 5 fases que ele encadeia
+    (CEPs, coordenadas OSM, CNPJ, IBGE, centroide de municipio), nao o
+    pipeline do CNPJ (que ja tem o proprio ImportRun/ImportProgress). Uma
+    linha so (id=1).
+
+    Existe pra `import-all` retomar de onde parou se for cancelado no meio:
+    cada fase tem seu proprio status, e uma nova chamada pula toda fase ja
+    'success' -- MAS so enquanto a tentativa anterior nao tiver terminado com
+    sucesso. Se `status` (o geral) for 'success', a proxima chamada e um
+    refresh periodico de verdade (mes que vem, novo periodo de CNPJ, e-DNE
+    atualizado) e reprocessa as 5 fases do zero -- ver app.cli.import_all,
+    que decide isso comparando o status geral antes de começar.
+    """
+
+    __tablename__ = "import_all_run"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    status: Mapped[str] = mapped_column(String(20), default="idle")  # idle|running|success|failed
+    # pending|running|success|failed|skipped, uma coluna por fase (na ordem
+    # em que import_all as executa).
+    ceps: Mapped[str] = mapped_column(String(20), default="pending")
+    ceps_osm: Mapped[str] = mapped_column(String(20), default="pending")
+    cnpj: Mapped[str] = mapped_column(String(20), default="pending")
+    ibge: Mapped[str] = mapped_column(String(20), default="pending")
+    municipios_geo: Mapped[str] = mapped_column(String(20), default="pending")
+    message: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime)
