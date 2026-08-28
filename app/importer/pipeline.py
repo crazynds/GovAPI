@@ -44,7 +44,7 @@ from app.config import settings
 from app.db import SessionLocal
 from app.importer import client
 from app.importer.csv_reader import read_csv
-from app.importer.progress import ProgressDisplay, human_bytes
+from app.importer.progress import ProgressDisplay, human_bytes, log_through
 from app.importer.rows import GROUP_SPECS, Counters
 from app.regions import CODE_TO_UF
 from app.models import (
@@ -216,6 +216,12 @@ class ImportPipeline:
     # -- execucao ---------------------------------------------------------
 
     def run(self) -> None:
+        # Todo o logging sai pelo display enquanto o import roda -- ver
+        # ProgressDisplay.log.
+        with log_through(self.display):
+            self._run()
+
+    def _run(self) -> None:
         main_db = self.session()
         logger.info("Orçamento de disco: %s", human_bytes(self.budget.total))
 
