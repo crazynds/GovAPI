@@ -32,11 +32,16 @@ def encode(basico: str, ordem: str) -> int:
 def to_int(body: str) -> int:
     """Converte as 12 posicoes alfanumericas num inteiro.
 
-    Levanta ValueError se vier algo fora do formato -- de proposito: durante o
-    import isso derruba o arquivo pro retry em vez de gravar uma raiz truncada
-    em silencio.
+    Filtra fora qualquer caractere que nao seja alfanumerico antes de validar
+    o tamanho -- um CNPJ nunca tem nada alem disso, entao aspas/espaco que
+    vazaram de um parsing de CSV mal comportado (visto na pratica: duas
+    colunas coladas com as aspas originais ainda dentro, tipo
+    '"20206097""0003"') sao descartados em vez de derrubar a linha. Ainda
+    levanta ValueError se, depois de limpo, nao sobrarem exatamente 12
+    posicoes -- aí o dado em si esta errado, nao so um caractere estranho a
+    mais, e isso ainda derruba o arquivo pro retry de proposito.
     """
-    body = body.strip().upper()
+    body = "".join(c for c in body.upper() if c.isalnum())
     if len(body) != BODY_LEN:
         raise ValueError(f"CNPJ deve ter {BODY_LEN} posições alfanuméricas, veio {len(body)}: {body!r}")
     return int(body, _BASE)
@@ -110,8 +115,12 @@ def parse(text: str) -> int:
 
 def basico_to_int(basico: str) -> int:
     """So a raiz (8 posicoes) como inteiro -- e assim que as tabelas de staging
-    guardam `cnpj_basico`, e o que o JOIN do build compara."""
-    basico = f"{basico.strip():0>{BASICO_LEN}}".upper()
+    guardam `cnpj_basico`, e o que o JOIN do build compara.
+
+    Mesmo filtro de `to_int`: descarta qualquer caractere nao-alfanumerico
+    antes de completar com zero a esquerda e validar o tamanho.
+    """
+    basico = "".join(c for c in basico.upper() if c.isalnum()).rjust(BASICO_LEN, "0")
     if len(basico) != BASICO_LEN:
         raise ValueError(f"Raiz de CNPJ deve ter {BASICO_LEN} posições: {basico!r}")
     return int(basico, _BASE)
