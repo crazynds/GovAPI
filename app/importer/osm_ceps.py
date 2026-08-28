@@ -103,8 +103,8 @@ def _rows(geojsonseq_path: str):
 
 def import_ceps_from_osm(db: Session) -> int:
     """Baixa o extrato, extrai pontos com CEP e carrega em
-    `cep_coordenadas` (só preenche o que ainda não existe). Retorna quantos
-    CEPs novos foram inseridos."""
+    `correios_cep` (só preenche coordenada que ainda não existe). Retorna
+    quantos CEPs ganharam coordenada."""
     work_dir = settings.download_dir
     os.makedirs(work_dir, exist_ok=True)
     pbf_path = os.path.join(work_dir, "brazil.osm.pbf")
@@ -147,19 +147,29 @@ def import_ceps_from_osm(db: Session) -> int:
             _IteratorFile(csv_lines()),
         )
 
+        # DO UPDATE ... WHERE, e não DO NOTHING: depois da fusão das tabelas, a
+        # maioria dos CEPs JÁ tem linha (veio do e-DNE) só que sem coordenada --
+        # com DO NOTHING o import não preencheria nada. O `WHERE latitude IS
+        # NULL` mantém a intenção original: nunca sobrescrever uma coordenada
+        # que já existe (a da BrasilAPI é precisa; a do OSM só compartilha o
+        # CEP).
         result = db.execute(text("""
-            INSERT INTO cep_coordenadas (cep, latitude, longitude, source, updated_at)
-            -- cep é INTEGER na tabela (casa com correios_cep.cep); a temp
-            -- recebe texto direto do COPY e o cast sai aqui.
+            INSERT INTO correios_cep (cep, latitude, longitude, coord_source, coord_updated_at)
+            -- cep é INTEGER na tabela; a temp recebe texto direto do COPY.
             SELECT cep::integer, latitude::numeric, longitude::numeric, 'osm_extract', :now
             FROM tmp_osm_ceps
-            ON CONFLICT (cep) DO NOTHING
+            ON CONFLICT (cep) DO UPDATE SET
+                latitude = EXCLUDED.latitude,
+                longitude = EXCLUDED.longitude,
+                coord_source = EXCLUDED.coord_source,
+                coord_updated_at = EXCLUDED.coord_updated_at
+            WHERE correios_cep.latitude IS NULL
         """), {"now": datetime.now(timezone.utc)})
         inserted = result.rowcount
         db.execute(text("DROP TABLE tmp_osm_ceps"))
         db.commit()
 
-        logger.info("OSM: %d CEPs novos carregados em cep_coordenadas.", inserted)
+        logger.info("OSM: %d CEPs com coordenada nova.", inserted)
         return inserted
     finally:
         for path in (pbf_path, filtered_path, geojsonseq_path):

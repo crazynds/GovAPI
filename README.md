@@ -239,9 +239,17 @@ Because an unmatched CEP becomes NULL, and because the CEP import upserts
 instead of deleting, `establishments.cep` carries a real foreign key to
 `correios_cep`. The build adds it after the bulk load rather than before, so
 the check is one pass at the end instead of a per-row cost across the whole
-insert. `correios_cep` is an ordinary model now (`models.CorreiosCep`) — the
-loader only ever populates the scratch table — so Alembic manages it like any
-other.
+insert. `correios_cep` is an ordinary model now (`models.Cep`) — the loader only ever
+populates the scratch table — so Alembic manages it like any other.
+
+That table also absorbed `cep_coordenadas`. The two were keyed identically and
+only lived apart because a coordinate column glued onto `correios_cep` would
+not have survived the loader rebuilding it; that rebuild is gone. Address and
+coordinate are independent halves and either may be missing — there are CEPs
+with an address and no coordinate, and CEPs only the OSM extract knows — so the
+address columns are nullable. The CEP import's upsert lists only the address
+columns in its `DO UPDATE`, which is what keeps coordinates intact across an
+`import-ceps`.
 
 Note: `correios_cep` (the e-DNE table) is **not** managed by Alembic — it's owned by `edne-correios-loader`, which rebuilds it on every `import-ceps` run.
 

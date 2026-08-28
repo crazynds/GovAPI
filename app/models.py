@@ -293,46 +293,43 @@ class Socio(Base):
     nome_representante: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
-class CorreiosCep(Base):
-    """Base unificada de CEP dos Correios (e-DNE Básico).
+class Cep(Base):
+    """Tudo que sabemos sobre um CEP: o endereco (base e-DNE dos Correios) e a
+    coordenada (extrato do OSM em massa, ou BrasilAPI sob demanda).
 
-    O esquema veio do edne-correios-loader, mas a tabela é nossa: o
-    `import-ceps` manda a lib montar a base nova numa tabela de scratch e faz
-    UPSERT daqui (ver app/ceps.py). Como nada aqui é apagado, dá pra referenciar
-    -- `establishments.cep` tem FOREIGN KEY pra cá.
+    Eram duas tabelas, `correios_cep` e `cep_coordenadas`, com a mesma chave.
+    Ficaram separadas enquanto o edne-correios-loader era dono do esquema e
+    reconstruia a tabela a cada import, o que teria destruido uma coluna de
+    coordenada colada nela. Hoje a lib so popula uma tabela de scratch e o
+    merge e um upsert nosso que toca so as colunas de endereco -- entao a
+    coordenada sobrevive ao import e as duas metades cabem numa tabela so.
 
-    `cep` é INTEGER (4 bytes) e não os 8 dígitos como texto: além do espaço, é
-    o que permite a FK, já que establishments.cep também é INTEGER e o Postgres
-    exige tipos comparáveis. A formatação com zero à esquerda sai na leitura.
+    As duas metades sao independentes e ambas opcionais: ha CEP com endereco e
+    sem coordenada (a maioria, ate o `import-ceps-osm` rodar) e CEP que so o
+    OSM conhece, sem endereco nenhum. Por isso as colunas de endereco sao
+    nullable -- antes eram NOT NULL porque a tabela so tinha uma metade.
+
+    `establishments.cep` tem FOREIGN KEY pra ca. Funciona porque nada aqui e
+    apagado: o import de CEP e upsert, nao substituicao.
     """
 
     __tablename__ = "correios_cep"
 
     cep: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    municipio_cod_ibge: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    latitude: Mapped[float | None] = mapped_column(Numeric(10, 7), nullable=True)
+    longitude: Mapped[float | None] = mapped_column(Numeric(10, 7), nullable=True)
+    coord_updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    uf: Mapped[str | None] = mapped_column(String(2), nullable=True)
     logradouro: Mapped[str | None] = mapped_column(String(100), nullable=True)
     complemento: Mapped[str | None] = mapped_column(String(100), nullable=True)
     bairro: Mapped[str | None] = mapped_column(String(72), nullable=True)
-    municipio: Mapped[str] = mapped_column(String(72))
-    municipio_cod_ibge: Mapped[int] = mapped_column(Integer)
-    uf: Mapped[str] = mapped_column(String(2))
+    municipio: Mapped[str | None] = mapped_column(String(72), nullable=True)
     nome: Mapped[str | None] = mapped_column(String(100), nullable=True)
-
-
-class CepCoordenada(Base):
-    """Latitude/longitude por CEP -- tabela separada de `correios_cep` porque é
-    cache nosso (BrasilAPI sob demanda, ou o extrato do OSM em massa), não dado
-    dos Correios. Preenchida sob demanda quando alguém consulta
-    GET /enderecos/cep/{cep} e o CEP ainda não tem coordenada salva."""
-
-    __tablename__ = "cep_coordenadas"
-
-    # INTEGER pra casar com correios_cep.cep, com quem é joinada na busca por
-    # proximidade (ver _COORD_JOIN_SQL em app/routers/enderecos.py).
-    cep: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
-    latitude: Mapped[float | None] = mapped_column(Numeric(10, 7), nullable=True)
-    longitude: Mapped[float | None] = mapped_column(Numeric(10, 7), nullable=True)
-    source: Mapped[str | None] = mapped_column(String(30), nullable=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime)
+    # De onde veio a coordenada: 'osm_extract', 'brasilapi', ou
+    # 'brasilapi_sem_coordenada' pra marcar "ja perguntei e nao tem" e nao
+    # bater na API de novo pelo mesmo CEP. NULL = nunca foi buscada.
+    coord_source: Mapped[str | None] = mapped_column(String(30), nullable=True)
 
 
 class ImportLog(Base):

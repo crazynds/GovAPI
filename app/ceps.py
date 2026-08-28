@@ -19,6 +19,11 @@ TABLE = "correios_cep"
 # esquema dele (cep como VARCHAR(8)), e o cast pra INTEGER acontece no upsert.
 SCRATCH_TABLE = "correios_cep_import"
 
+# So as colunas de endereco (e-DNE). As de coordenada (latitude/longitude/
+# coord_source/coord_updated_at) vivem na mesma tabela desde a fusao com
+# `cep_coordenadas`, e ficam DE FORA daqui de proposito: o upsert do import
+# lista essas colunas no ON CONFLICT DO UPDATE, entao deixa-las de fora e o que
+# faz a coordenada sobreviver a um `import-ceps`.
 COLUMNS = (
     "cep",
     "logradouro",
@@ -67,7 +72,8 @@ def upsert_from(db: Session, source_table: str) -> tuple[int, int, int]:
 
     UPSERT e nao DELETE + INSERT: nada some debaixo de quem referencia a tabela
     (a FK de establishments.cep depende disso), e a base nunca fica vazia no
-    meio de um import.
+    meio de um import. As colunas de coordenada nao entram no SET, entao
+    sobrevivem intactas.
     """
     cols = ", ".join(COLUMNS)
     updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in COLUMNS if c != "cep")
@@ -88,13 +94,18 @@ def upsert_from(db: Session, source_table: str) -> tuple[int, int, int]:
 
     after = db.execute(text(f"SELECT count(*) FROM {TABLE}")).scalar() or 0
 
-    # CEPs que ja estavam aqui e nao vieram na base nova (extintos ou
+    # CEPs que ja tinham endereco aqui e nao vieram na base nova (extintos ou
     # remanejados pelos Correios). O upsert nao os remove -- e justamente isso
     # que permite referenciar a tabela sem levar a linha embaixo do pe -- mas
     # conta-los evita acumular CEP morto sem ninguem perceber.
+    #
+    # `municipio IS NOT NULL` filtra as linhas que so tem coordenada (vindas do
+    # `import-ceps-osm`): elas nunca estiveram no e-DNE, entao nao "sumiram"
+    # dele -- conta-las como stale seria alarme falso.
     stale = db.execute(text(f"""
         SELECT count(*) FROM {TABLE} c
-        WHERE NOT EXISTS (SELECT 1 FROM ({incoming}) s WHERE s.cep = c.cep)
+        WHERE c.municipio IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM ({incoming}) s WHERE s.cep = c.cep)
     """)).scalar() or 0
 
     inserted = after - before

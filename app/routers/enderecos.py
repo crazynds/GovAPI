@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app import ceps
 from app.db import get_db
-from app.models import CepCoordenada
+from app.models import Cep
 from app.regions import ufs_for_regiao
 
 router = APIRouter(prefix="/enderecos", tags=["enderecos"])
@@ -87,9 +87,10 @@ def buscar_cep(cep: str, db: Session = Depends(get_db)):
         "nome": None,
     }
 
-    # municipio/uf/municipio_cod_ibge são NOT NULL na tabela do e-DNE -- só
-    # persiste se o ViaCEP realmente trouxe esses três; senão só devolve a
-    # resposta sem gravar (ainda é melhor que dar erro pro cliente).
+    # Só persiste se o ViaCEP trouxe município/UF/código IBGE; senão devolve a
+    # resposta sem gravar. Não é mais uma restrição de schema (essas colunas são
+    # nullable desde a fusão com as coordenadas), é critério: gravar um CEP sem
+    # município nenhum não ajudaria nenhuma busca.
     if row["municipio"] and row["uf"] and row["municipio_cod_ibge"]:
         db.execute(
             text(f"""
@@ -124,20 +125,20 @@ _DISTANCE_KM_SQL = """
     )
 """
 
-# Coordenada exata do CEP (cep_coordenadas, cacheada sob demanda em
-# GET /enderecos/cep/{cep}) quando existir; senão o centroide do município
+# Coordenada exata do CEP (na própria linha, vinda do `import-ceps-osm` em
+# massa ou cacheada sob demanda em GET /enderecos/cep/{cep}) quando
+# existir; senão o centroide do município
 # (municipios.latitude/longitude, ver `import-municipios-geo`) como
 # fallback de baixa precisão -- sem isso, a busca por proximidade só
 # funcionaria pra CEPs já consultados individualmente, o que na prática é
 # quase nenhum. `exata` diz qual das duas foi usada.
 _COORD_JOIN_SQL = """
-    LEFT JOIN cep_coordenadas cc ON cc.cep = e.cep
     LEFT JOIN municipios mu ON mu.ibge_code = e.municipio_cod_ibge::text
     CROSS JOIN LATERAL (
         SELECT
-            coalesce(cc.latitude, mu.latitude) AS lat_final,
-            coalesce(cc.longitude, mu.longitude) AS lon_final,
-            (cc.latitude IS NOT NULL) AS exata
+            coalesce(e.latitude, mu.latitude) AS lat_final,
+            coalesce(e.longitude, mu.longitude) AS lon_final,
+            (e.latitude IS NOT NULL) AS exata
     ) coord
 """
 
@@ -245,13 +246,12 @@ def enderecos_proximos(
 
 
 def _get_or_fetch_coordinates(db: Session, cep: int) -> tuple[float, float] | None:
-    """Lat/long por CEP, cacheadas em `cep_coordenadas` (tabela nossa,
-    imune ao rebuild do e-DNE). Se ainda não tem, busca na BrasilAPI
-    (gratuita, sem chave) -- best-effort: nunca falha a consulta de
-    endereço por causa disso, e cacheia mesmo quando não acha coordenada
-    pra não bater na BrasilAPI de novo pro mesmo CEP sem coordenada."""
-    cached = db.get(CepCoordenada, cep)
-    if cached:
+    """Lat/long do CEP. Se ainda não foi buscada, tenta a BrasilAPI (gratuita,
+    sem chave) -- best-effort: nunca falha a consulta de endereço por causa
+    disso, e grava mesmo quando não acha coordenada (`coord_source` marca a
+    tentativa) pra não bater na API de novo pelo mesmo CEP."""
+    cached = db.get(Cep, cep)
+    if cached and cached.coord_source:
         if cached.latitude is None or cached.longitude is None:
             return None
         return float(cached.latitude), float(cached.longitude)
@@ -268,14 +268,18 @@ def _get_or_fetch_coordinates(db: Session, cep: int) -> tuple[float, float] | No
     except (httpx.HTTPError, ValueError, TypeError):
         return None  # falha na consulta -- não cacheia, tenta de novo na próxima
 
-    stmt = pg_insert(CepCoordenada.__table__).values(
-        cep=cep, latitude=latitude, longitude=longitude, source=source,
-        updated_at=datetime.now(timezone.utc),
+    # A linha pode já existir (veio do e-DNE, sem coordenada) ou não existir
+    # (CEP que só a BrasilAPI conhece) -- upsert cobre os dois, e mexe só nas
+    # colunas de coordenada, deixando o endereço intacto.
+    stmt = pg_insert(Cep.__table__).values(
+        cep=cep, latitude=latitude, longitude=longitude, coord_source=source,
+        coord_updated_at=datetime.now(timezone.utc),
     )
     stmt = stmt.on_conflict_do_update(
         index_elements=["cep"],
         set_={"latitude": stmt.excluded.latitude, "longitude": stmt.excluded.longitude,
-              "source": stmt.excluded.source, "updated_at": stmt.excluded.updated_at},
+              "coord_source": stmt.excluded.coord_source,
+              "coord_updated_at": stmt.excluded.coord_updated_at},
     )
     db.execute(stmt)
     db.commit()
