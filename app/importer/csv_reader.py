@@ -1,8 +1,18 @@
 """Le o CSV oficial da Receita: `;`-delimitado, sempre entre aspas duplas,
-ISO-8859-1, sem cabecalho. `explode` manual em vez de csv.reader porque o
-layout e sempre bem formado (mesma decisao tomada e validada no lado
-Laravel contra 5000 linhas reais do mirror)."""
+ISO-8859-1, sem cabecalho.
 
+Usa o `csv` da stdlib (nao um split manual) de proposito: ja foi tentado um
+`split('";"')` a mao, e a Receita realmente tem linha com aspas mal
+escapadas/desalinhadas no meio de dezenas de milhoes de linhas (visto na
+pratica -- Estabelecimentos0.zip, mesma linha gerando corrupcao diferente
+duas vezes, sinal de desalinhamento de campo de verdade, nao so pontuacao
+solta). O `csv.reader` entende aspas duplicadas (`""` -> `"` literal) e campo
+com newline embutido dentro de aspas (contabiliza como parte do mesmo
+registro, nao como fim de linha) -- as duas coisas que o split manual nao
+sabia fazer.
+"""
+
+import csv
 import os
 from collections.abc import Callable, Iterator
 
@@ -13,27 +23,33 @@ ProgressCallback = Callable[[int, int, int], None]
 
 def read_csv(path: str, columns: list[str], on_progress: ProgressCallback | None = None) -> Iterator[dict]:
     total_bytes = os.path.getsize(path)
-    bytes_read = 0
-    rows_read = 0
+    # Uma lista em vez de closure com `nonlocal` -- o gerador que conta bytes
+    # e passado pro `csv.reader` como sua fonte de linhas, entao o `yield` do
+    # csv acontece de dentro da chamada do reader, nao do nosso loop direto.
+    counters = [0, 0]  # [bytes_lidos, linhas_fisicas_lidas]
+
+    def counted_lines(f):
+        for raw_line in f:
+            # ISO-8859-1 e 1 byte por caractere, então len() do texto já e o
+            # total de bytes consumidos nessa linha.
+            counters[0] += len(raw_line)
+            counters[1] += 1
+            yield raw_line
 
     with open(path, encoding="iso-8859-1", newline="") as f:
-        for raw_line in f:
-            # ISO-8859-1 e 1 byte por caractere, então len() do texto já e
-            # o total de bytes consumidos nessa linha -- sem precisar de
-            # f.tell(), que não é confiável durante iteração em modo texto.
-            bytes_read += len(raw_line)
-            rows_read += 1
-            if on_progress:
-                on_progress(bytes_read, total_bytes, rows_read)
-
-            line = raw_line.rstrip("\r\n")
-            if not line:
+        reader = csv.reader(counted_lines(f), delimiter=";", quotechar='"')
+        rows_read = 0
+        for fields in reader:
+            if not fields or fields == [""]:
                 continue
 
-            if line.startswith('"') and line.endswith('"'):
-                fields = line[1:-1].split('";"')
-            else:
-                fields = line.split(";")
+            rows_read += 1
+            if on_progress:
+                # Bytes/linhas fisicas ate aqui (pode ser mais de 1 por
+                # registro, se um campo tiver newline dentro de aspas) --
+                # `rows_read` conta REGISTROS, que e o que importa pro
+                # chamador (linhas do CSV, nao linhas fisicas do arquivo).
+                on_progress(counters[0], total_bytes, rows_read)
 
             row = {}
             for name, value in zip(columns, fields):

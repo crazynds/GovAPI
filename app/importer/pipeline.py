@@ -628,8 +628,22 @@ def _import_group(db: Session, progress: Session, job: Job, display: ProgressDis
     def csv_lines():
         buf = io.StringIO()
         writer = csv.writer(buf)
+        malformed_logged = 0
         for row in read_csv(job.csv_path, spec.csv_columns, on_progress=on_progress):
-            values = spec.transform(row, job.counters)
+            try:
+                values = spec.transform(row, job.counters)
+            except ValueError as exc:
+                # Uma linha que nao da pra montar (CNPJ com tamanho errado
+                # mesmo depois de limpo, por exemplo) nao pode derrubar o
+                # arquivo inteiro -- um COPY de dezenas de milhoes de linhas
+                # cancela e reinicia do zero (3x) por causa de UMA linha ruim
+                # da fonte (visto na pratica). Conta, loga só as primeiras
+                # (evita flood se o problema for sistemico) e segue o arquivo.
+                job.counters.malformed += 1
+                malformed_logged += 1
+                if malformed_logged <= 5:
+                    logger.warning("%s: linha descartada (%s): %r", job.file, exc, row)
+                continue
             if values is None:
                 continue
             writer.writerow(["" if v is None else v for v in values])

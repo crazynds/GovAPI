@@ -39,6 +39,7 @@ class Counters:
         self.dv_mismatch = 0
         self.bad_uf = 0
         self.skipped = 0
+        self.malformed = 0
 
     def summary(self) -> str:
         parts = []
@@ -48,6 +49,8 @@ class Counters:
             parts.append(f"{self.bad_uf} UF(s) desconhecida(s)")
         if self.skipped:
             parts.append(f"{self.skipped} linha(s) descartada(s)")
+        if self.malformed:
+            parts.append(f"{self.malformed} linha(s) malformada(s) (não deu pra montar um CNPJ válido)")
         return "; ".join(parts)
 
 
