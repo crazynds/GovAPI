@@ -265,6 +265,16 @@ terse line per table for the rest, so `app/importer/edne_progress.py` drives a
 progress bar off the one hook it exposes (`download_report_hook`) and off a
 thin wrapper around `populate_table` that counts rows as they stream through.
 
+`import-ceps-osm`'s own ~2GB download resumes rather than restarts. Any
+failure after it — filtering, exporting, the database load — used to discard
+the whole file along with everything else, so a retry paid for the network
+transfer again to redo work that was entirely local. The download now sends
+a `Range` header when a partial (or complete) file is already on disk, and
+the cleanup on failure only removes the two derived, cheap-to-regenerate
+files (the OSM filter output and the GeoJSONSeq export) — the multi-gigabyte
+download survives to be resumed, or skipped outright via a 416 if it was
+already complete.
+
 Real e-DNE data doesn't respect the column widths the library's own schema
 declares for it — a neighborhood name longer than the `VARCHAR(36)` it assigns
 its abbreviation, for one, hit in production. `app.ceps.widen_free_text_columns`
