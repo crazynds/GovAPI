@@ -36,6 +36,11 @@ class Municipio(Base):
     ibge_code: Mapped[str | None] = mapped_column(String(7), nullable=True, index=True)
     population: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     area_km2: Mapped[float | None] = mapped_column(Numeric(12, 3), nullable=True)
+    # Centroide do municipio (Nominatim/OSM) -- ver `import-municipios-geo`.
+    # Usado como fallback de baixa precisao (nivel cidade) quando um CEP
+    # ainda nao tem coordenada exata cacheada em cep_coordenadas.
+    latitude: Mapped[float | None] = mapped_column(Numeric(10, 7), nullable=True)
+    longitude: Mapped[float | None] = mapped_column(Numeric(10, 7), nullable=True)
 
 
 class Cnae(Base):

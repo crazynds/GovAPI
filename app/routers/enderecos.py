@@ -116,14 +116,32 @@ def buscar_cep(cep: str, db: Session = Depends(get_db)):
 
 
 # Haversine em SQL puro (sem PostGIS) -- distância em km entre um ponto
-# fixo (:lat/:lon) e cep_coordenadas.latitude/longitude.
+# fixo (:lat/:lon) e uma coordenada `lat_final`/`lon_final` (ver
+# _COORD_JOIN_SQL abaixo).
 _DISTANCE_KM_SQL = """
     6371 * acos(
         greatest(-1, least(1,
-            cos(radians(:lat)) * cos(radians(c.latitude)) * cos(radians(c.longitude) - radians(:lon))
-            + sin(radians(:lat)) * sin(radians(c.latitude))
+            cos(radians(:lat)) * cos(radians(lat_final)) * cos(radians(lon_final) - radians(:lon))
+            + sin(radians(:lat)) * sin(radians(lat_final))
         ))
     )
+"""
+
+# Coordenada exata do CEP (cep_coordenadas, cacheada sob demanda em
+# GET /enderecos/cep/{cep}) quando existir; senão o centroide do município
+# (municipios.latitude/longitude, ver `import-municipios-geo`) como
+# fallback de baixa precisão -- sem isso, a busca por proximidade só
+# funcionaria pra CEPs já consultados individualmente, o que na prática é
+# quase nenhum. `exata` diz qual das duas foi usada.
+_COORD_JOIN_SQL = f"""
+    LEFT JOIN cep_coordenadas cc ON cc.cep = e.cep
+    LEFT JOIN municipios mu ON mu.ibge_code = e.municipio_cod_ibge::text
+    CROSS JOIN LATERAL (
+        SELECT
+            coalesce(cc.latitude, mu.latitude) AS lat_final,
+            coalesce(cc.longitude, mu.longitude) AS lon_final,
+            (cc.latitude IS NOT NULL) AS exata
+    ) coord
 """
 
 
@@ -145,10 +163,11 @@ def buscar_endereco(
     do `import-ceps` já ter rodado, senão retorna lista vazia.
 
     Passando `lat`+`lon`, ordena por distância em vez de município/logradouro
-    -- mas só considera CEPs que já têm coordenada cacheada (ver
-    `/enderecos/cep/{cep}`), então filtros de texto amplos combinados com
-    `lat`/`lon` tendem a retornar poucos resultados até mais CEPs da região
-    terem sido consultados alguma vez."""
+    -- usa a coordenada exata do CEP quando já foi consultado (ver
+    `/enderecos/cep/{cep}`), senão cai pro centroide do município (ver
+    `import-municipios-geo`); cada item vem com `exata: true/false` dizendo
+    qual das duas foi usada. CEPs sem nenhuma das duas (município ainda não
+    geocodificado) não entram no resultado."""
     conditions = []
     params: dict = {"limit": per_page, "offset": (page - 1) * per_page}
 
@@ -178,11 +197,12 @@ def buscar_endereco(
     order_by_distance = lat is not None and lon is not None
     if order_by_distance:
         params["lat"], params["lon"] = lat, lon
+        distance_conditions = conditions + ["coord.lat_final IS NOT NULL"]
         query_sql = f"""
-            SELECT {_CORREIOS_CEP_COLUMNS_PREFIXED_E}, {_DISTANCE_KM_SQL} AS distancia_km
+            SELECT {_CORREIOS_CEP_COLUMNS_PREFIXED_E}, coord.exata, {_DISTANCE_KM_SQL} AS distancia_km
             FROM {CORREIOS_CEP_TABLE} e
-            JOIN cep_coordenadas c ON c.cep = e.cep
-            {f"WHERE {' AND '.join(conditions)}" if conditions else ""}
+            {_COORD_JOIN_SQL}
+            WHERE {' AND '.join(distance_conditions)}
             ORDER BY distancia_km ASC
             LIMIT :limit OFFSET :offset
         """
@@ -211,16 +231,18 @@ def enderecos_proximos(
     db: Session = Depends(get_db),
 ):
     """Lista CEPs dentro de um raio, ordenados por distância (mais próximo
-    primeiro). Só considera CEPs que já têm coordenada cacheada (ver
-    `/enderecos/cep/{cep}`) -- não é uma busca geográfica sobre toda a base
-    de CEPs do Brasil, só sobre os que já foram consultados alguma vez."""
+    primeiro). Usa a coordenada exata do CEP quando já foi consultado (ver
+    `/enderecos/cep/{cep}`), senão cai pro centroide do município (ver
+    `import-municipios-geo`) -- cada item vem com `exata: true/false`
+    dizendo qual das duas foi usada. Município ainda não geocodificado
+    fica de fora até `import-municipios-geo` rodar."""
     try:
         result = db.execute(
             text(f"""
-                SELECT {_CORREIOS_CEP_COLUMNS_PREFIXED_E}, {_DISTANCE_KM_SQL} AS distancia_km
+                SELECT {_CORREIOS_CEP_COLUMNS_PREFIXED_E}, coord.exata, {_DISTANCE_KM_SQL} AS distancia_km
                 FROM {CORREIOS_CEP_TABLE} e
-                JOIN cep_coordenadas c ON c.cep = e.cep
-                WHERE {_DISTANCE_KM_SQL} <= :raio_km
+                {_COORD_JOIN_SQL}
+                WHERE coord.lat_final IS NOT NULL AND {_DISTANCE_KM_SQL} <= :raio_km
                 ORDER BY distancia_km ASC
                 LIMIT :limit
             """),

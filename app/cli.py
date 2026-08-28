@@ -94,6 +94,28 @@ def import_ibge_command():
         db.close()
 
 
+@cli.command("import-municipios-geo")
+def import_municipios_geo_command():
+    """
+    Geocodifica o centroide de cada município (latitude/longitude) via
+    Nominatim/OpenStreetMap, sem chave -- usado como fallback de baixa
+    precisão em /enderecos/proximos e /enderecos/buscar?lat=&lon= quando
+    um CEP específico ainda não tem coordenada exata cacheada.
+
+    Só ~5570 chamadas (uma por município), a 1 req/s (política de uso do
+    Nominatim) -- leva cerca de 1h40 na primeira vez. Pula município que já
+    tem coordenada, então rodar de novo depois de uma queda só continua.
+    """
+    from app.importer.geocoding import geocode_municipios
+
+    db = SessionLocal()
+    try:
+        geocoded, total = geocode_municipios(db)
+        typer.echo(f"Geocodificação: {geocoded}/{total} municípios pendentes resolvidos.")
+    finally:
+        db.close()
+
+
 @cli.command("import-all")
 def import_all():
     """

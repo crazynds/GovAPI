@@ -12,7 +12,7 @@
 | **Partners (Sócios)** | Federal Revenue's public CNPJ database | Company shareholders/partners — search by company or by partner name/document. |
 | **Reference tables** | Federal Revenue's public CNPJ database | Legal nature, partner/officer qualification, country, and deregistration-reason codes — small lookup tables. |
 | **Municipalities** | Official IBGE/Revenue list, enriched with [IBGE/SIDRA](https://servicodados.ibge.gov.br) | Municipality lookup by name, state, region, or code, with estimated population and territorial area. |
-| **CEP / Address** | [e-DNE Básico](https://github.com/cauethenorio/edne-correios-loader) | Address lookup by ZIP code or free text. Falls back to [ViaCEP](https://viacep.com.br) for anything not yet covered, and saves the result for next time. Coordinates (lat/long) via [BrasilAPI](https://brasilapi.com.br), cached once looked up — radius search and distance sort work over that cache, not the whole CEP base. |
+| **CEP / Address** | [e-DNE Básico](https://github.com/cauethenorio/edne-correios-loader) | Address lookup by ZIP code or free text. Falls back to [ViaCEP](https://viacep.com.br) for anything not yet covered, and saves the result for next time. Coordinates (lat/long) via [BrasilAPI](https://brasilapi.com.br), cached once looked up; radius search and distance sort fall back to the municipality's centroid ([Nominatim](https://nominatim.openstreetmap.org)) for everything else, so they work across the whole CEP base, just at city-level precision where no exact coordinate is cached yet. |
 | **States** | Static list | Brazilian states (UF + name + region). |
 | **Taxes (Simples Nacional)** | LC 123/2006 Anexos I–V | Effective tax rate and DAS amount calculation, Fator R calculation. Pure math, no import needed. |
 
@@ -132,6 +132,10 @@ docker compose run --rm app python -m app.cli import-ceps
 
 # Municipality population/area (IBGE/SIDRA) -- run after import-cnpj at least once
 docker compose run --rm app python -m app.cli import-ibge
+
+# Municipality centroid coordinates (Nominatim/OSM) -- one-time, ~1h40 (rate-limited
+# to 1 req/s), resumable. Backs the low-precision fallback in the address geo endpoints.
+docker compose run --rm app python -m app.cli import-municipios-geo
 ```
 
 Neither runs automatically — schedule `import-all` yourself (e.g. cron, an external scheduler) if you want periodic refreshes. Progress:
@@ -238,8 +242,8 @@ Small code/description lookups — same shape as `/cnaes`. Each has `/search?nam
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/enderecos/cep/{cep}` | Look up an address by ZIP code, including `latitude`/`longitude` when available (fetched from BrasilAPI on first lookup, cached after). |
-| `GET` | `/enderecos/buscar` | Free-text address search — `logradouro` (street), `bairro` (neighborhood), `municipio`, `uf` (repeatable), `regiao`, `municipio_cod_ibge`; paginated via `page`/`per_page`. Pass `lat`+`lon` to sort by distance instead (only over CEPs with a cached coordinate). |
-| `GET` | `/enderecos/proximos` | ZIP codes within `raio_km` of `lat`+`lon`, nearest first. Same cached-coordinates caveat as above. |
+| `GET` | `/enderecos/buscar` | Free-text address search — `logradouro` (street), `bairro` (neighborhood), `municipio`, `uf` (repeatable), `regiao`, `municipio_cod_ibge`; paginated via `page`/`per_page`. Pass `lat`+`lon` to sort by distance instead — uses the ZIP code's own cached coordinate when available, otherwise falls back to its municipality's centroid (`import-municipios-geo`); each result's `exata` field says which one was used. |
+| `GET` | `/enderecos/proximos` | ZIP codes within `raio_km` of `lat`+`lon`, nearest first. Same exact-vs-municipality-centroid fallback as above. |
 | `GET` | `/enderecos/estados` | List all states. |
 
 ### Taxes (Simples Nacional)
