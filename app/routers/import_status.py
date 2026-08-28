@@ -3,31 +3,60 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.importer.pipeline import run_import
-from app.models import ImportProgress
-from app.schemas import ImportStatusOut
+from app.models import ImportProgress, ImportRun
+from app.schemas import ImportStatusOut, ImportStepOut
 
 router = APIRouter(prefix="/import", tags=["import"])
+
+# Ordem de exibicao dos estagios -- a mesma do fluxo do pipeline.
+STAGE_ORDER = ("download", "extract", "import", "build")
 
 
 @router.get("/status", response_model=ImportStatusOut)
 def status(db: Session = Depends(get_db)):
-    progress = db.get(ImportProgress, 1)
-    if not progress:
-        return ImportStatusOut(
-            period=None, status="idle", group=None, current_file=None, step=None,
-            processed_rows=0, message=None, started_at=None, updated_at=None,
-        )
+    """Estado da importação: o global (`status`) mais uma entrada por estágio
+    do pipeline. Os estágios rodam em paralelo, então num run ativo há três
+    arquivos diferentes em `stages` ao mesmo tempo."""
+    run = db.get(ImportRun, 1)
+    steps = db.query(ImportProgress).all()
+    by_step = {step.step: step for step in steps}
 
     return ImportStatusOut(
-        period=progress.period,
-        status=progress.status,
-        group=progress.group,
-        current_file=progress.current_file,
-        step=progress.step,
-        processed_rows=progress.processed_rows,
-        message=progress.message,
-        started_at=progress.started_at.isoformat() if progress.started_at else None,
-        updated_at=progress.updated_at.isoformat() if progress.updated_at else None,
+        period=run.period if run else None,
+        status=run.status if run else "idle",
+        message=run.message if run else None,
+        started_at=_iso(run.started_at) if run else None,
+        updated_at=_iso(run.updated_at) if run else None,
+        stages=[_serialize_step(name, by_step.get(name)) for name in STAGE_ORDER],
+    )
+
+
+def _iso(value) -> str | None:
+    return value.isoformat() if value else None
+
+
+def _serialize_step(name: str, step: ImportProgress | None) -> ImportStepOut:
+    if step is None:
+        return ImportStepOut(
+            step=name, status="idle", group=None, current_file=None, processed_rows=0,
+            total_bytes=None, percent=None, message=None, started_at=None, updated_at=None,
+        )
+
+    percent = None
+    if step.total_bytes:
+        percent = round(min(100.0, step.processed_rows * 100 / step.total_bytes), 1)
+
+    return ImportStepOut(
+        step=step.step,
+        status=step.status,
+        group=step.group,
+        current_file=step.current_file,
+        processed_rows=step.processed_rows,
+        total_bytes=step.total_bytes,
+        percent=percent,
+        message=step.message,
+        started_at=_iso(step.started_at),
+        updated_at=_iso(step.updated_at),
     )
 
 

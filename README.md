@@ -140,6 +140,17 @@ Neither runs automatically — schedule `import-all` yourself (e.g. cron, an ext
 curl http://localhost:8000/import/status
 ```
 
+The CNPJ import runs its three stages — download, unzip, load — in parallel, one
+file per stage at a time (like `docker pull`): while a 20 GB CSV is loading, the
+next archive is already downloading. `/import/status` therefore reports one entry
+per stage under `stages`, each on a different file.
+
+Because more than one file is on disk at once, admission is capped by a byte
+budget rather than a file count. It defaults to 70% of the free space in
+`APP_DOWNLOAD_DIR`; set `APP_DISK_BUDGET` (in bytes) to pin it. Small files
+pipeline freely, and the multi-gigabyte `Estabelecimentos*.zip` degrade to
+near-serial instead of filling the disk.
+
 ## Database migrations
 
 Schema is managed with [Alembic](https://alembic.sqlalchemy.org/). `app` applies pending migrations automatically on boot (see `docker-entrypoint.sh` / `app/migrate.py`).
@@ -155,6 +166,34 @@ To generate a new migration after changing `app/models.py`:
 ```bash
 docker compose run --rm -v "$PWD/alembic:/srv/alembic" app alembic revision --autogenerate -m "describe the change"
 ```
+
+To wipe everything and start from an empty, up-to-date schema:
+
+```bash
+docker compose run --rm app python -m app.cli reset-db          # asks for confirmation
+docker compose run --rm app python -m app.cli reset-db --yes    # unattended
+```
+
+This drops the whole `public` schema and reapplies the migrations. It drops the
+schema rather than the mapped tables because `correios_cep` is created by
+`edne-correios-loader`, outside SQLAlchemy's metadata, and a table-by-table drop
+would leave it behind.
+
+## How data is stored
+
+Everything that is a number is stored as a number, and the CNPJ as a base-36
+integer — the alphanumeric root+order fit exactly in a `BIGINT` (36¹² < 2⁶³), so
+a CNPJ costs 8 bytes instead of 15 as text, and the check digits are recomputed
+on output rather than stored. Phone numbers drop the constant `+55`, CNAE/state/
+company-size/registration-status become integers, secondary CNAEs are an
+`INTEGER[]` (`NULL` when empty, with a GIN index), and the staging tables are
+`UNLOGGED`. All formatting — zero padding, `+55`, punctuation — happens at the
+edges: on import in `app/importer/rows.py`, on output in the routers. The API
+contract is unchanged.
+
+Base-36 also preserves ordering, so "every establishment under root X" is a
+contiguous integer range that the primary key can serve — see
+`app.cnpj.basico_range`.
 
 Note: `correios_cep` (the e-DNE table) is **not** managed by Alembic — it's owned by `edne-correios-loader`, which rebuilds it on every `import-ceps` run.
 
@@ -173,7 +212,7 @@ Full interactive docs (Swagger) at `/docs`.
 | `GET` | `/cnaes/codes` | List all CNAE codes. |
 | `GET` | `/municipios/search` | Search municipalities by `name`, `uf`, and/or `regiao`. Includes `population` and `area_km2` once `import-ibge` has run. |
 | `GET` | `/municipios/by-code/{receita_code}` | Look up a municipality by its Revenue/IBGE code. |
-| `GET` | `/import/status` | Check import progress. |
+| `GET` | `/import/status` | Check import progress — the overall run plus one entry per pipeline stage (`stages`), since download/unzip/load run in parallel on different files. |
 | `POST` | `/import/trigger` | Trigger an import in the background. Unauthenticated. |
 
 ### Partners (Sócios)
@@ -181,7 +220,7 @@ Full interactive docs (Swagger) at `/docs`.
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/socios/por-empresa/{cnpj}` | List a company's partners/shareholders — accepts a full CNPJ or just the 8-digit root. |
-| `GET` | `/socios/buscar` | Search partners by `nome` and/or `documento` (CPF comes masked by the Revenue itself, e.g. `***123456**`) — find every company a person/entity is a partner in. Paginated. |
+| `GET` | `/socios/buscar` | Search partners by `nome` and/or `documento` — find every company a person/entity is a partner in. Paginated. `documento` is an exact match: for a CPF pass only the visible digits (the Revenue masks it itself, `***123456**` → `123456`); a CNPJ is accepted with or without punctuation. |
 
 ### Reference tables
 

@@ -133,13 +133,26 @@ class FatorROut(BaseModel):
     anexo_sugerido: str
 
 
-class ImportStatusOut(BaseModel):
-    period: str | None
+class ImportStepOut(BaseModel):
+    """Um estágio do pipeline. Os três (download/extract/import) rodam em
+    paralelo, cada um num arquivo diferente -- ver app/importer/pipeline.py."""
+
+    step: str
     status: str
     group: str | None
     current_file: str | None
-    step: str | None
     processed_rows: int
+    total_bytes: int | None
+    percent: float | None
     message: str | None
     started_at: str | None
     updated_at: str | None
+
+
+class ImportStatusOut(BaseModel):
+    period: str | None
+    status: str
+    message: str | None
+    started_at: str | None
+    updated_at: str | None
+    stages: list[ImportStepOut]

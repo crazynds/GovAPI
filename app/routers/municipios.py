@@ -8,9 +8,15 @@ from app.regions import UF_TO_REGIAO, ufs_for_regiao
 router = APIRouter(prefix="/municipios", tags=["municipios"])
 
 
+# Largura do codigo de municipio da Receita (4 digitos) -- a coluna e Integer
+# no banco (pro JOIN do build casar tipo sem CAST), mas a API sempre falou
+# nessa forma de string.
+RECEITA_CODE_WIDTH = 4
+
+
 def _serialize(m: Municipio) -> dict:
     return {
-        "receita_code": m.receita_code,
+        "receita_code": f"{m.receita_code:0{RECEITA_CODE_WIDTH}d}",
         "name": m.name,
         "uf": m.uf,
         "regiao": UF_TO_REGIAO.get(m.uf) if m.uf else None,
@@ -48,7 +54,9 @@ def search(
 
 @router.get("/by-code/{receita_code}")
 def by_code(receita_code: str, db: Session = Depends(get_db)):
-    m = db.query(Municipio).filter(Municipio.receita_code == receita_code).first()
+    if not receita_code.strip().isdigit():
+        raise HTTPException(422, f"Código de município inválido: {receita_code!r}")
+    m = db.query(Municipio).filter(Municipio.receita_code == int(receita_code)).first()
     if not m:
         raise HTTPException(404, "Município não encontrado")
     return _serialize(m)

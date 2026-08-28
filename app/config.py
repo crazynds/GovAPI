@@ -23,6 +23,13 @@ class Settings(BaseSettings):
     # precisa persistir entre execuções, por isso vive em /tmp sem volume.
     download_dir: str = "/tmp/cnpj-import"
 
+    # Teto de bytes que o pipeline pode manter em `download_dir` de uma vez.
+    # Os estagios (download/extract/import) rodam em paralelo, entao ha mais de
+    # um zip/CSV vivo ao mesmo tempo; esse orcamento e o que impede um arquivo
+    # como Estabelecimentos (~5GB zip -> ~20GB CSV) de encher o disco quando o
+    # estagio seguinte esta lento. 0 = calcula 70% do espaco livre no boot.
+    disk_budget: int = 0
+
     class Config:
         env_prefix = "APP_"
 

@@ -20,6 +20,38 @@ def migrate():
     typer.echo("Migrations em dia.")
 
 
+@cli.command("reset-db")
+def reset_db(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Não pede confirmação."),
+):
+    """
+    APAGA TODOS OS DADOS: derruba o schema `public` inteiro e reaplica as
+    migrations, deixando um banco vazio e no schema mais recente.
+
+    DROP SCHEMA (e não um drop tabela a tabela) porque a tabela `correios_cep`
+    é criada pelo edne-correios-loader, fora do metadata do SQLAlchemy -- um
+    drop pelos models deixaria ela para trás.
+    """
+    target = f"{settings.db_user}@{settings.db_host}:{settings.db_port}/{settings.db_name}"
+    if not yes:
+        typer.confirm(
+            f"Isso APAGA TODOS OS DADOS de {target}. Continuar?",
+            abort=True,
+        )
+
+    from sqlalchemy import text
+
+    from app.db import engine
+
+    with engine.begin() as conn:
+        conn.execute(text("DROP SCHEMA public CASCADE"))
+        conn.execute(text("CREATE SCHEMA public"))
+    typer.echo(f"Schema `public` recriado em {target}.")
+
+    run_migrations()
+    typer.echo("Migrations aplicadas — banco vazio e em dia.")
+
+
 @cli.command("import-cnpj")
 def import_cnpj(
     period: str = typer.Option(None, help="Período específico (YYYY-MM-DD). Padrão: descobre o mais recente."),

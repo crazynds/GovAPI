@@ -1,100 +1,158 @@
+"""Busca de estabelecimentos.
+
+O banco guarda tudo em tipo numerico compacto (CNPJ em base 36, CNAE/UF/porte
+como inteiro, telefone sem o +55 -- ver app/models.py). A traducao pros
+formatos publicos acontece toda aqui: `_serialize` na saida, `_apply_filters`
+na entrada. O contrato da API e o mesmo de quando as colunas eram texto.
+"""
+
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, func, or_
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Query as ORMQuery, Session
 
+from app import cnpj as cnpj_codec
 from app.db import get_db
 from app.models import Cnae, Establishment, Motivo, Municipio, NaturezaJuridica
-from app.regions import UF_TO_REGIAO, ufs_for_regiao
+from app.regions import UF_TO_REGIAO, uf_code, uf_name, ufs_for_regiao
 from app.schemas import EstablishmentOut, EstablishmentPage, EstablishmentStatsOut
 
 router = APIRouter(prefix="/establishments", tags=["establishments"])
 
 # Codigos oficiais de porte (Receita) -- ver layout do arquivo Empresas.
+# Chaveadas pelo codigo numerico (como fica no banco); a API continua
+# devolvendo/aceitando a forma "00"/"01"/... de dois digitos.
 COMPANY_SIZE_LABELS = {
-    "00": "Não informado",
-    "01": "Micro empresa",
-    "03": "Empresa de pequeno porte",
-    "05": "Demais (médio/grande porte)",
+    0: "Não informado",
+    1: "Micro empresa",
+    3: "Empresa de pequeno porte",
+    5: "Demais (médio/grande porte)",
 }
 
 # Codigos oficiais de situacao cadastral (Receita) -- ver layout do arquivo
 # Estabelecimentos. Aceito tanto o codigo quanto o label como filtro.
 SITUACAO_LABELS = {
-    "01": "nula",
-    "02": "ativa",
-    "03": "suspensa",
-    "04": "inapta",
-    "08": "baixada",
+    1: "nula",
+    2: "ativa",
+    3: "suspensa",
+    4: "inapta",
+    8: "baixada",
 }
 SITUACAO_CODES_BY_LABEL = {label: code for code, label in SITUACAO_LABELS.items()}
 
 
-def _resolve_situacao_codes(values: list[str]) -> list[str]:
-    return [SITUACAO_CODES_BY_LABEL.get(v.lower(), v) for v in values]
+def _code(value: int | None, width: int = 2) -> str | None:
+    """Codigo numerico -> a string com zero a esquerda que a API sempre expos."""
+    return f"{value:0{width}d}" if value is not None else None
 
 
-def _code_descriptions(db: Session, model, codes: set[str]) -> dict[str, str]:
-    codes = {c for c in codes if c}
-    if not codes:
+def _resolve_situacao_codes(values: list[str]) -> list[int]:
+    """Aceita label ("ativa") ou codigo ("02"/"2"), devolve o inteiro do banco."""
+    codes = []
+    for raw in values:
+        value = raw.strip().lower()
+        if value in SITUACAO_CODES_BY_LABEL:
+            codes.append(SITUACAO_CODES_BY_LABEL[value])
+        elif value.isdigit():
+            codes.append(int(value))
+        else:
+            raise HTTPException(422, f"Situação cadastral desconhecida: {raw!r}")
+    return codes
+
+
+def _cnae_codes_to_int(values: list[str]) -> list[int]:
+    codes = []
+    for raw in values:
+        digits = "".join(c for c in raw if c.isdigit())
+        if not digits:
+            raise HTTPException(422, f"Código CNAE inválido: {raw!r}")
+        codes.append(int(digits))
+    return codes
+
+
+# Largura do `code` nas tabelas de referencia, que continuam em texto (sao de
+# alguns milhares de linhas -- compactar nao pagaria, e o `code` e a interface
+# publica). Precisamos dela pra reconstruir a string a partir do inteiro
+# guardado em establishments e casar no indice, em vez de castar a coluna (o
+# que descartaria o indice).
+CODE_WIDTHS = {"cnae": 7, "natureza": 4, "motivo": 2}
+
+
+def _code_descriptions(db: Session, model, codes: set[int], width: int) -> dict[int, str]:
+    """{codigo numerico: descricao} pras tabelas de referencia."""
+    wanted = {c for c in codes if c is not None}
+    if not wanted:
         return {}
-    rows = db.query(model.code, model.description).filter(model.code.in_(codes)).all()
-    return dict(rows)
+    as_text = {f"{c:0{width}d}": c for c in wanted}
+    rows = db.query(model.code, model.description).filter(model.code.in_(as_text)).all()
+    return {as_text[code]: description for code, description in rows if code in as_text}
 
 
 def _serialize(
     e: Establishment,
-    cnae_map: dict[str, str] | None = None,
-    natureza_map: dict[str, str] | None = None,
-    motivo_map: dict[str, str] | None = None,
+    cnae_map: dict[int, str] | None = None,
+    natureza_map: dict[int, str] | None = None,
+    motivo_map: dict[int, str] | None = None,
 ) -> EstablishmentOut:
     cnae_map = cnae_map or {}
     natureza_map = natureza_map or {}
     motivo_map = motivo_map or {}
-    secondary_codes = e.secondary_cnae_codes or []
+    secondary = e.secondary_cnaes or []
+    cnae_width = CODE_WIDTHS["cnae"]
+
     return EstablishmentOut(
-        cnpj=e.cnpj,
+        # 14 posicoes sem pontuacao -- o DV e recalculado do corpo (nao e
+        # guardado). Mesmo formato de quando a coluna era varchar(14).
+        cnpj=cnpj_codec.full(e.cnpj),
         company_name=e.company_name,
         trade_name=e.trade_name,
         is_headquarters=e.is_headquarters,
         is_mei=e.is_mei,
         is_simples=e.is_simples,
-        company_size=e.company_size,
-        company_size_label=COMPANY_SIZE_LABELS.get(e.company_size or ""),
-        natureza_juridica_code=e.natureza_juridica_code,
-        natureza_juridica_description=natureza_map.get(e.natureza_juridica_code or ""),
-        main_cnae_code=e.main_cnae_code,
-        main_cnae_description=cnae_map.get(e.main_cnae_code or ""),
-        secondary_cnae_codes=secondary_codes,
-        secondary_cnae_descriptions=[cnae_map[c] for c in secondary_codes if c in cnae_map],
+        company_size=_code(e.company_size),
+        company_size_label=COMPANY_SIZE_LABELS.get(e.company_size),
+        natureza_juridica_code=_code(e.natureza_juridica, CODE_WIDTHS["natureza"]),
+        natureza_juridica_description=natureza_map.get(e.natureza_juridica),
+        main_cnae_code=_code(e.main_cnae, cnae_width),
+        main_cnae_description=cnae_map.get(e.main_cnae),
+        secondary_cnae_codes=[f"{c:0{cnae_width}d}" for c in secondary],
+        secondary_cnae_descriptions=[cnae_map[c] for c in secondary if c in cnae_map],
         municipio_name=e.municipio.name if e.municipio else None,
-        uf=e.uf,
+        uf=uf_name(e.uf),
         email=e.email,
-        phone=e.phone,
-        cellphone=e.cellphone,
+        phone=_e164(e.phone),
+        cellphone=_e164(e.cellphone),
         cellphone_confidence=e.cellphone_confidence,
         opened_at=e.opened_at,
-        situacao_cadastral=e.situacao_cadastral,
-        situacao_cadastral_label=SITUACAO_LABELS.get(e.situacao_cadastral or ""),
-        motivo_situacao_cadastral_code=e.motivo_situacao_cadastral_code,
-        motivo_situacao_cadastral_description=motivo_map.get(e.motivo_situacao_cadastral_code or ""),
+        situacao_cadastral=_code(e.situacao_cadastral),
+        situacao_cadastral_label=SITUACAO_LABELS.get(e.situacao_cadastral),
+        motivo_situacao_cadastral_code=_code(e.motivo_situacao_cadastral, CODE_WIDTHS["motivo"]),
+        motivo_situacao_cadastral_description=motivo_map.get(e.motivo_situacao_cadastral),
     )
 
 
+def _e164(national: int | None) -> str | None:
+    """O banco guarda so DDD+numero; o +55 e constante (base so tem Brasil)."""
+    return f"+55{national}" if national else None
+
+
 def _serialize_many(db: Session, items: list[Establishment]) -> list[EstablishmentOut]:
-    all_cnae_codes: set[str] = set()
-    natureza_codes: set[str] = set()
-    motivo_codes: set[str] = set()
+    cnae_codes: set[int] = set()
+    natureza_codes: set[int] = set()
+    motivo_codes: set[int] = set()
     for e in items:
-        all_cnae_codes.add(e.main_cnae_code or "")
-        all_cnae_codes.update(e.secondary_cnae_codes or [])
-        natureza_codes.add(e.natureza_juridica_code or "")
-        motivo_codes.add(e.motivo_situacao_cadastral_code or "")
-    cnae_map = _code_descriptions(db, Cnae, all_cnae_codes)
-    natureza_map = _code_descriptions(db, NaturezaJuridica, natureza_codes)
-    motivo_map = _code_descriptions(db, Motivo, motivo_codes)
+        if e.main_cnae is not None:
+            cnae_codes.add(e.main_cnae)
+        cnae_codes.update(e.secondary_cnaes or [])
+        if e.natureza_juridica is not None:
+            natureza_codes.add(e.natureza_juridica)
+        if e.motivo_situacao_cadastral is not None:
+            motivo_codes.add(e.motivo_situacao_cadastral)
+
+    cnae_map = _code_descriptions(db, Cnae, cnae_codes, CODE_WIDTHS["cnae"])
+    natureza_map = _code_descriptions(db, NaturezaJuridica, natureza_codes, CODE_WIDTHS["natureza"])
+    motivo_map = _code_descriptions(db, Motivo, motivo_codes, CODE_WIDTHS["motivo"])
     return [_serialize(e, cnae_map, natureza_map, motivo_map) for e in items]
 
 
@@ -119,9 +177,13 @@ def _apply_filters(
     opened_before: date | None,
 ) -> ORMQuery:
     if cnae_codes:
-        secondary = Establishment.secondary_cnae_codes.cast(JSONB)
+        # `overlap` (o operador && do Postgres) sobre INTEGER[] usa o indice
+        # GIN de secondary_cnaes; a versao anterior castava um JSON pra JSONB
+        # linha a linha, o que nao usava indice nenhum e varria a tabela.
+        codes = _cnae_codes_to_int(cnae_codes)
         per_code = [
-            or_(Establishment.main_cnae_code == code, secondary.contains([code])) for code in cnae_codes
+            or_(Establishment.main_cnae == code, Establishment.secondary_cnaes.overlap([code]))
+            for code in codes
         ]
         query = query.filter(and_(*per_code) if cnae_match == "all" else or_(*per_code))
 
@@ -132,13 +194,23 @@ def _apply_filters(
             raise HTTPException(422, f"Região desconhecida: {regiao!r} (use norte/nordeste/centro-oeste/sudeste/sul)")
         ufs |= set(regiao_ufs)
     if ufs:
-        query = query.filter(Establishment.uf.in_(ufs))
+        codes = [uf_code(u) for u in ufs]
+        unknown = [u for u, c in zip(ufs, codes) if c is None]
+        if unknown:
+            raise HTTPException(422, f"UF desconhecida: {sorted(unknown)}")
+        query = query.filter(Establishment.uf.in_(codes))
 
     if municipio_codes:
-        query = query.filter(Establishment.municipio.has(Municipio.receita_code.in_(municipio_codes)))
+        codes = [int(c) for c in municipio_codes if str(c).strip().isdigit()]
+        if not codes:
+            raise HTTPException(422, f"Código de município inválido: {municipio_codes}")
+        query = query.filter(Establishment.municipio.has(Municipio.receita_code.in_(codes)))
 
     if company_size:
-        query = query.filter(Establishment.company_size.in_(company_size))
+        sizes = [int(c) for c in company_size if str(c).strip().isdigit()]
+        if not sizes:
+            raise HTTPException(422, f"Código de porte inválido: {company_size}")
+        query = query.filter(Establishment.company_size.in_(sizes))
 
     if is_mei is not None:
         query = query.filter(Establishment.is_mei == is_mei)
@@ -243,7 +315,15 @@ def by_cnpjs(
     only_with_cellphone: bool = Query(False),
     db: Session = Depends(get_db),
 ):
-    query = db.query(Establishment).filter(Establishment.cnpj.in_(cnpjs))
+    # Aceita com ou sem pontuação, completo (14) ou só a raiz (8). Antes a
+    # comparação era direta contra a coluna de texto, então só a forma crua de
+    # 14 posições casava -- e um CNPJ pontuado devolvia lista vazia sem erro.
+    try:
+        values = [cnpj_codec.parse(raw) for raw in cnpjs]
+    except ValueError as exc:
+        raise HTTPException(422, f"CNPJ inválido: {exc}") from exc
+
+    query = db.query(Establishment).filter(Establishment.cnpj.in_(values))
     if only_with_cellphone:
         query = query.filter(Establishment.cellphone.isnot(None))
     return _serialize_many(db, query.all())
@@ -309,25 +389,30 @@ def stats(
         .all()
     )
     by_main_cnae_rows = (
-        base.with_entities(Establishment.main_cnae_code, func.count().label("total"))
-        .filter(Establishment.main_cnae_code.isnot(None))
-        .group_by(Establishment.main_cnae_code)
+        base.with_entities(Establishment.main_cnae, func.count().label("total"))
+        .filter(Establishment.main_cnae.isnot(None))
+        .group_by(Establishment.main_cnae)
         .order_by(func.count().desc())
         .limit(top_cnaes)
         .all()
     )
 
+    # Os group_by devolvem os codigos numericos do banco -- decodifica aqui,
+    # nas poucas dezenas de linhas agregadas, nao nas 63M.
+    by_uf = {(uf_name(code) or "desconhecido"): count for code, count in by_uf_rows}
+
     by_regiao: dict[str, int] = {}
-    for uf_code, count in by_uf_rows:
-        regiao_key = UF_TO_REGIAO.get(uf_code, "desconhecida")
+    for code, count in by_uf_rows:
+        regiao_key = UF_TO_REGIAO.get(uf_name(code), "desconhecida")
         by_regiao[regiao_key] = by_regiao.get(regiao_key, 0) + count
 
+    cnae_width = CODE_WIDTHS["cnae"]
     return EstablishmentStatsOut(
         total=total,
         with_cellphone=base.filter(Establishment.cellphone.isnot(None)).count(),
         with_email=base.filter(Establishment.email.isnot(None)).count(),
-        by_uf={uf_code or "desconhecido": count for uf_code, count in by_uf_rows},
+        by_uf=by_uf,
         by_regiao=by_regiao,
-        by_company_size={size or "desconhecido": count for size, count in by_company_size_rows},
-        top_cnaes=[{"cnae_code": code, "total": count} for code, count in by_main_cnae_rows],
+        by_company_size={(_code(size) or "desconhecido"): count for size, count in by_company_size_rows},
+        top_cnaes=[{"cnae_code": f"{code:0{cnae_width}d}", "total": count} for code, count in by_main_cnae_rows],
     )
