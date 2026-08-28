@@ -122,8 +122,11 @@ def import_ceps_osm_command():
     """
     Baixa o extrato do Brasil do OpenStreetMap (Geofabrik, ~2GB, sem
     limite de taxa) e carrega em massa os CEPs com coordenada nele em
-    `cep_coordenadas` -- só preenche o que ainda não existe (nunca
+    `correios_cep` -- só preenche CEP que ainda não tem coordenada (nunca
     sobrescreve uma coordenada exata já cacheada via BrasilAPI).
+
+    Rode depois do `import-ceps`: assim preenche a coordenada dos CEPs que já
+    têm endereço, em vez de criar linha só-coordenada.
 
     Alternativa a geocodificar CEP a CEP contra o Nominatim: pra ~1.6
     milhão de CEPs isso violaria a política de uso da API pública deles
@@ -142,17 +145,73 @@ def import_ceps_osm_command():
 
 
 @cli.command("import-all")
-def import_all():
+def import_all(
+    skip_municipios_geo: bool = typer.Option(
+        False, "--skip-municipios-geo", help="Pula a geocodificação de municípios (a etapa lenta, ~1h40)."
+    ),
+):
     """
-    Roda todas as importações de uma vez só: CNPJ da Receita Federal e
-    CEPs dos Correios (e-DNE). Use os comandos `import-cnpj`/`import-ceps`
-    em separado se só precisar atualizar uma das bases.
+    Roda todas as importações, na ordem em que uma depende da outra.
+
+    A ordem não é preferência, é dependência:
+
+      1. CEPs dos Correios (e-DNE) -- tem que vir primeiro. O build do CNPJ
+         liga cada estabelecimento ao seu CEP e, quando o CEP já resolve o
+         endereço, deixa de guardar logradouro/bairro. Sem a base de CEP no
+         lugar, esse dado é duplicado em dezenas de milhões de linhas e a
+         FOREIGN KEY de `establishments.cep` não é criada.
+      2. Coordenadas em massa (extrato do OSM) -- preenche lat/long dos CEPs
+         que acabaram de entrar.
+      3. CNPJ da Receita Federal -- é aqui que o vínculo com o CEP acontece.
+         Também é o que preenche `municipios.uf`, que os dois passos
+         seguintes exigem.
+      4. População e área dos municípios (IBGE) -- casa por nome+UF.
+      5. Centroide dos municípios (Nominatim) -- fallback de baixa precisão
+         na busca por proximidade. É a etapa lenta: ~5570 chamadas a 1 req/s
+         (política de uso do Nominatim), cerca de 1h40 na primeira vez. Pula
+         município que já tem coordenada, então rodar de novo só continua de
+         onde parou. Use --skip-municipios-geo pra deixar pra depois.
+
+    Use os comandos individuais se só precisar atualizar uma das bases -- mas
+    respeite a ordem acima ao encadeá-los.
     """
-    typer.echo("== CNPJ (Receita Federal) ==")
+    typer.echo("== 1/5 CEPs (Correios / e-DNE) ==")
+    _import_ceps(source=None)
+
+    typer.echo("== 2/5 Coordenadas de CEP (extrato do OpenStreetMap) ==")
+    from app.importer.osm_ceps import import_ceps_from_osm
+
+    db = SessionLocal()
+    try:
+        typer.echo(f"OSM: {import_ceps_from_osm(db)} CEPs com coordenada nova.")
+    finally:
+        db.close()
+
+    typer.echo("== 3/5 CNPJ (Receita Federal) ==")
     _import_cnpj(period=None, only=None)
 
-    typer.echo("== CEPs (Correios / e-DNE) ==")
-    _import_ceps(source=None)
+    typer.echo("== 4/5 População e área dos municípios (IBGE) ==")
+    from app.importer.ibge import import_ibge
+
+    db = SessionLocal()
+    try:
+        pop, area = import_ibge(db)
+        typer.echo(f"IBGE: {pop} municípios com população, {area} com área.")
+    finally:
+        db.close()
+
+    if skip_municipios_geo:
+        typer.echo("== 5/5 Centroide dos municípios -- pulado (--skip-municipios-geo) ==")
+    else:
+        typer.echo("== 5/5 Centroide dos municípios (Nominatim, ~1h40) ==")
+        from app.importer.geocoding import geocode_municipios
+
+        db = SessionLocal()
+        try:
+            geocoded, total = geocode_municipios(db)
+            typer.echo(f"Geocodificação: {geocoded}/{total} municípios pendentes resolvidos.")
+        finally:
+            db.close()
 
     typer.echo("Todas as importações concluídas.")
 

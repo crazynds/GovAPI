@@ -138,6 +138,14 @@ docker compose run --rm app python -m app.cli import-ibge
 docker compose run --rm app python -m app.cli import-municipios-geo
 ```
 
+`import-all` chains all five in dependency order: Post Office CEPs, bulk
+coordinates from the OSM extract, the Revenue's CNPJ base, then IBGE population
+and municipality centroids. The order is not a preference — the CNPJ build links
+addresses to `correios_cep`, and it is what fills `municipios.uf`, which the two
+IBGE/geocoding steps need. Chaining the individual commands means respecting
+that order yourself. `--skip-municipios-geo` leaves out the slow step (~5570
+Nominatim calls at 1 req/s, about 1h40 the first time).
+
 Neither runs automatically — schedule `import-all` yourself (e.g. cron, an external scheduler) if you want periodic refreshes. Progress:
 
 ```bash
