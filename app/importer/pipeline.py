@@ -23,6 +23,7 @@ from app.db import SessionLocal
 from app.importer import client
 from app.importer.csv_reader import read_csv
 from app.importer.phone import parse as parse_phone
+from app.importer.progress import ProgressBar, human_bytes
 from app.models import (
     Cnae,
     EmpresaStaging,
@@ -128,28 +129,41 @@ def _process_file(db: Session, period: str, group: str, file: str) -> None:
             time.sleep(10 * attempt)
 
 
-DOWNLOAD_LOG_EVERY = 10  # loga no console a cada N chunks (~10MB) -- grava no banco em todos, sem isso o /import/status ficaria impreciso.
+DB_PROGRESS_INTERVAL = 1.0  # grava no banco no máximo 1x/s -- a barra no console já cobre o resto.
 
 
 def _download(db: Session, period: str, group: str, file: str, dest: str) -> None:
     url = client.period_url(period) + file
     total = client.file_size(url)
     downloaded = 0
-    logger.info("Baixando %s/%s (%s bytes)", group, file, total or "?")
+    logger.info("Baixando %s/%s (%s)", group, file, human_bytes(total) if total else "tamanho desconhecido")
+
+    bar = ProgressBar(f"  download {file}", total=total, unit="bytes")
+    last_db_write = 0.0
 
     with httpx.stream("GET", url, timeout=None, follow_redirects=True) as response:
         response.raise_for_status()
         with open(dest, "wb") as f:
-            for i, chunk in enumerate(response.iter_bytes(chunk_size=1024 * 1024)):
+            for chunk in response.iter_bytes(chunk_size=1024 * 1024):
                 f.write(chunk)
                 downloaded += len(chunk)
-                _set_progress(
-                    db, period=period, group=group, current_file=file, step="download",
-                    processed_rows=downloaded,
-                    message=f"{downloaded}/{total or '?'} bytes",
-                    log=(i % DOWNLOAD_LOG_EVERY == 0),
-                )
-    logger.info("Download de %s concluído: %s bytes", file, downloaded)
+                bar.update(downloaded)
+
+                now = time.monotonic()
+                if now - last_db_write >= DB_PROGRESS_INTERVAL:
+                    last_db_write = now
+                    _set_progress(
+                        db, period=period, group=group, current_file=file, step="download",
+                        processed_rows=downloaded, message=f"{downloaded}/{total or '?'} bytes", log=False,
+                    )
+
+    bar.update(downloaded, force=True)
+    bar.close()
+    _set_progress(
+        db, period=period, group=group, current_file=file, step="download",
+        processed_rows=downloaded, message=f"{downloaded}/{total or '?'} bytes", log=False,
+    )
+    logger.info("Download de %s concluído: %s", file, human_bytes(downloaded))
 
 
 def _extract(db: Session, period: str, group: str, file: str, zip_path: str, csv_path: str) -> None:
@@ -157,10 +171,23 @@ def _extract(db: Session, period: str, group: str, file: str, zip_path: str, csv
 
     with zipfile.ZipFile(zip_path) as zf:
         inner_name = zf.namelist()[0]
-        with zf.open(inner_name) as src, open(csv_path, "wb") as dst:
-            shutil.copyfileobj(src, dst)
+        total = zf.getinfo(inner_name).file_size
+        bar = ProgressBar(f"  extraindo {file}", total=total, unit="bytes")
+        written = 0
 
-    logger.info("Extraído %s", file)
+        with zf.open(inner_name) as src, open(csv_path, "wb") as dst:
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                written += len(chunk)
+                bar.update(written)
+
+        bar.update(written, force=True)
+        bar.close()
+
+    logger.info("Extraído %s: %s", file, human_bytes(written))
 
 
 def _import_file(db: Session, period: str, group: str, file: str, csv_path: str) -> int:
@@ -211,6 +238,9 @@ def _import_file(db: Session, period: str, group: str, file: str, csv_path: str)
     count = 0
     batch = []
 
+    bar = ProgressBar(f"  importando {file}", total=os.path.getsize(csv_path), unit="bytes")
+    last_db_write = 0.0
+
     def flush():
         nonlocal count
         if not batch:
@@ -224,7 +254,18 @@ def _import_file(db: Session, period: str, group: str, file: str, csv_path: str)
         batch.clear()
         return count_local
 
-    for row in read_csv(csv_path, spec["columns"]):
+    def on_progress(bytes_read: int, _total_bytes: int, rows_read: int) -> None:
+        nonlocal last_db_write
+        bar.update(bytes_read, extra=f"{rows_read} linhas")
+        now = time.monotonic()
+        if now - last_db_write >= DB_PROGRESS_INTERVAL:
+            last_db_write = now
+            _set_progress(
+                db, period=period, group=group, current_file=file, step="import",
+                processed_rows=rows_read, message=f"{rows_read} linhas", log=False,
+            )
+
+    for row in read_csv(csv_path, spec["columns"], on_progress=on_progress):
         mapped = {k: row.get(k) for k in spec["keep"]}
         for field in date_fields:
             mapped[field] = _parse_date(mapped.get(field))
@@ -236,12 +277,14 @@ def _import_file(db: Session, period: str, group: str, file: str, csv_path: str)
 
         if len(batch) >= BATCH_SIZE:
             count += flush()
-            _set_progress(
-                db, period=period, group=group, current_file=file, step="import",
-                processed_rows=count, message=f"{count} linhas",
-            )
 
     count += flush() or 0
+    bar.update(os.path.getsize(csv_path), extra=f"{count} linhas", force=True)
+    bar.close()
+    _set_progress(
+        db, period=period, group=group, current_file=file, step="import",
+        processed_rows=count, message=f"{count} linhas", log=False,
+    )
     logger.info("Importado %s: %d linhas", file, count)
     return count
 
@@ -255,7 +298,12 @@ def _import_reference(db: Session, period: str, group: str, file: str, csv_path:
     table = model.__table__
     count = 0
 
-    for row in read_csv(csv_path, columns):
+    bar = ProgressBar(f"  importando {file}", total=os.path.getsize(csv_path), unit="bytes")
+
+    def on_progress(bytes_read: int, _total_bytes: int, rows_read: int) -> None:
+        bar.update(bytes_read, extra=f"{rows_read} linhas")
+
+    for row in read_csv(csv_path, columns, on_progress=on_progress):
         stmt = pg_insert(table).values(**row)
         update_cols = {c: stmt.excluded[c] for c in row if c != key}
         stmt = stmt.on_conflict_do_update(index_elements=[key], set_=update_cols)
@@ -263,7 +311,9 @@ def _import_reference(db: Session, period: str, group: str, file: str, csv_path:
         count += 1
 
     db.commit()
-    _set_progress(db, period=period, group=group, current_file=file, step="import", processed_rows=count)
+    bar.update(os.path.getsize(csv_path), extra=f"{count} linhas", force=True)
+    bar.close()
+    _set_progress(db, period=period, group=group, current_file=file, step="import", processed_rows=count, log=False)
     logger.info("Importado %s: %d linhas", file, count)
     return count
 
