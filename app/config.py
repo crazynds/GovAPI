@@ -31,7 +31,14 @@ class Settings(BaseSettings):
         # @, /, etc.) que quebrariam a URL se colados direto.
         user = quote(self.db_user, safe="")
         password = quote(self.db_password, safe="")
-        return f"postgresql+psycopg2://{user}:{password}@{self.db_host}:{self.db_port}/{self.db_name}"
+        # client_encoding=utf8 explicito -- sem isso, servidores cujo
+        # encoding padrão não é UTF-8 (ex. banco criado como SQL_ASCII)
+        # fazem o psycopg2 negociar ascii e o import quebra em qualquer
+        # acento (visto na prática: UnicodeEncodeError em CNAEs/nomes).
+        return (
+            f"postgresql+psycopg2://{user}:{password}"
+            f"@{self.db_host}:{self.db_port}/{self.db_name}?client_encoding=utf8"
+        )
 
 
 settings = Settings()
