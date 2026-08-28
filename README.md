@@ -259,7 +259,11 @@ address columns are nullable. The CEP import's upsert lists only the address
 columns in its `DO UPDATE`, which is what keeps coordinates intact across an
 `import-ceps`.
 
-Note: `correios_cep` (the e-DNE table) is **not** managed by Alembic — it's owned by `edne-correios-loader`, which rebuilds it on every `import-ceps` run.
+`import-ceps` shows progress for both the download and the table loads that
+follow — the library itself only logs, in silence for the download and one
+terse line per table for the rest, so `app/importer/edne_progress.py` drives a
+progress bar off the one hook it exposes (`download_report_hook`) and off a
+thin wrapper around `populate_table` that counts rows as they stream through.
 
 ## API reference
 

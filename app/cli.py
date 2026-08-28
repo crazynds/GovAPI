@@ -234,6 +234,8 @@ def _import_ceps(source: str | None) -> None:
     """
     from edne_correios_loader import DneLoader, TableSetEnum
 
+    from app.importer import edne_progress
+
     db = SessionLocal()
     try:
         db.execute(text(f"DROP TABLE IF EXISTS {ceps.SCRATCH_TABLE}"))
@@ -244,7 +246,8 @@ def _import_ceps(source: str | None) -> None:
             dne_source=source,
             table_names={"cep_unificado": ceps.SCRATCH_TABLE},
         )
-        loader.load(table_set=TableSetEnum.UNIFIED_CEP_ONLY)
+        with edne_progress.progress(loader):
+            loader.load(table_set=TableSetEnum.UNIFIED_CEP_ONLY)
 
         inserted, updated, stale = ceps.upsert_from(db, ceps.SCRATCH_TABLE)
 
