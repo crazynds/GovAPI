@@ -154,6 +154,15 @@ attempt didn't fully succeed, though: once all five phases complete, the
 following call treats itself as a real periodic refresh (a new CNPJ period, an
 updated e-DNE) and redoes everything rather than skipping forever.
 
+The OSM coordinates phase (2/5) is best-effort: it enriches `correios_cep`
+with lat/long, nothing downstream depends on it, and the Geofabrik mirror it
+downloads from does go down (`503`, seen in practice). A failure there logs a
+warning and moves on to CNPJ/IBGE/geocoding rather than blocking the run —
+but the overall status only becomes `success` once every phase actually is
+`success` or deliberately `skipped`, so a follow-up call resumes by retrying
+just that one phase instead of treating a silent OSM failure as "done" and
+redoing all four other phases (CNPJ's rebuild included) from scratch.
+
 Neither runs automatically — schedule `import-all` yourself (e.g. cron, an external scheduler) if you want periodic refreshes. Progress:
 
 ```bash

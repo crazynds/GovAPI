@@ -170,7 +170,9 @@ def import_all(
          lugar, esse dado é duplicado em dezenas de milhões de linhas e a
          FOREIGN KEY de `establishments.cep` não é criada.
       2. Coordenadas em massa (extrato do OSM) -- preenche lat/long dos CEPs
-         que acabaram de entrar.
+         que acabaram de entrar. Best-effort: se falhar (o mirror do
+         Geofabrik já deu 503, por exemplo), avisa e segue pra próxima etapa
+         em vez de travar o resto -- é um enriquecimento, nada depende dela.
       3. CNPJ da Receita Federal -- é aqui que o vínculo com o CEP acontece.
          Também é o que preenche `municipios.uf`, que os dois passos
          seguintes exigem.
@@ -210,15 +212,28 @@ def import_all(
 
         _set_import_all(db, status="running", **phases)
 
+        # required=False só na 2/5: coordenadas do OSM são um enriquecimento
+        # (fallback de baixa precisão via centroide do município já cobre a
+        # busca por proximidade sem elas -- ver import-municipios-geo), não
+        # uma dependência de nada depois dela no pipeline. Um mirror externo
+        # fora do ar (visto na prática: 503 do Geofabrik) não devia travar
+        # CNPJ/IBGE/geocodificação, que não dependem dela em nada.
         steps = [
-            ("ceps", "1/5 CEPs (Correios / e-DNE)", lambda: _import_ceps(source=None)),
-            ("ceps_osm", "2/5 Coordenadas de CEP (extrato do OpenStreetMap)", _run_ceps_osm),
-            ("cnpj", "3/5 CNPJ (Receita Federal)", lambda: _import_cnpj(period=None, only=None)),
-            ("ibge", "4/5 População e área dos municípios (IBGE)", _run_ibge),
-            ("municipios_geo", "5/5 Centroide dos municípios (Nominatim, ~1h40)", _run_municipios_geo),
+            ("ceps", "1/5 CEPs (Correios / e-DNE)", lambda: _import_ceps(source=None), True),
+            ("ceps_osm", "2/5 Coordenadas de CEP (extrato do OpenStreetMap)", _run_ceps_osm, False),
+            ("cnpj", "3/5 CNPJ (Receita Federal)", lambda: _import_cnpj(period=None, only=None), True),
+            ("ibge", "4/5 População e área dos municípios (IBGE)", _run_ibge, True),
+            ("municipios_geo", "5/5 Centroide dos municípios (Nominatim, ~1h40)", _run_municipios_geo, True),
         ]
 
-        for key, label, action in steps:
+        # Estado final de cada fase, pra decidir o status GERAL no fim -- não dá
+        # pra assumir "o loop não levantou exceção" == "tudo terminou": uma
+        # fase opcional pode falhar sem abortar nada (ver `required` abaixo) e
+        # ficar parada em "running". Começa igual a `phases` (o que já valia
+        # antes desta chamada) e cada fase atualiza a sua conforme roda.
+        final_status = dict(phases)
+
+        for key, label, action, required in steps:
             if phases.get(key) == "success":
                 typer.echo(f"== {label} -- já concluído ==")
                 continue
@@ -226,20 +241,45 @@ def import_all(
             if key == "municipios_geo" and skip_municipios_geo:
                 typer.echo(f"== {label} -- pulado (--skip-municipios-geo) ==")
                 _set_import_all(db, municipios_geo="skipped")
+                final_status[key] = "skipped"
                 continue
 
             typer.echo(f"== {label} ==")
-            # Só marca "running" antes e "success" depois -- sem try/except.
-            # Se `action()` for interrompida (Ctrl-C, crash, o que for), a
-            # fase fica parada em "running" (nunca chega a "success"), e é
-            # exatamente esse status que a retomada usa pra saber que ela não
-            # terminou e precisa ser refeita -- não precisa capturar nada.
+            # Só marca "running" antes e "success" depois -- sem try/except
+            # pras fases obrigatórias. Se `action()` for interrompida (Ctrl-C,
+            # crash, o que for), a fase fica parada em "running" (nunca chega
+            # a "success"), e é exatamente esse status que a retomada usa pra
+            # saber que ela não terminou e precisa ser refeita.
             _set_import_all(db, **{key: "running"})
-            action()
+            final_status[key] = "running"
+            if required:
+                action()
+            else:
+                # Fase opcional: uma falha (rede, serviço externo fora do ar)
+                # não deve travar o resto do import-all. Fica em "running" --
+                # não em "success" -- pra uma retomada tentar de novo depois,
+                # e ela mesma continua idempotente (ver import_ceps_from_osm).
+                try:
+                    action()
+                except Exception as exc:  # noqa: BLE001 -- deliberado: qualquer falha aqui é best-effort, não motivo pra abortar o resto
+                    typer.echo(f"  Aviso: {label} falhou, pulando e seguindo pra próxima etapa: {exc}")
+                    continue
             _set_import_all(db, **{key: "success"})
+            final_status[key] = "success"
 
-        _set_import_all(db, status="success", message="import-all concluído")
-        typer.echo("Todas as importações concluídas.")
+        # "success" geral exige TODAS as fases resolvidas (success ou skipped
+        # de propósito) -- não só "o loop terminou sem lançar". Senão a
+        # próxima chamada veria status="success" e trataria como refresh
+        # periódico (reprocessa as 5 do zero, CNPJ incluso -- rebuild de
+        # establishments, FK, índices, todo o custo de novo) só pra tentar de
+        # novo uma fase opcional que falhou silenciosamente.
+        if all(status in ("success", "skipped") for status in final_status.values()):
+            _set_import_all(db, status="success", message="import-all concluído")
+            typer.echo("Todas as importações concluídas.")
+        else:
+            pendentes = [name for name, status in final_status.items() if status not in ("success", "skipped")]
+            _set_import_all(db, status="failed", message=f"pendente: {', '.join(pendentes)}"[:255])
+            typer.echo(f"Concluído com pendências ({', '.join(pendentes)}) -- rode de novo pra tentar de novo.")
     finally:
         db.close()
 
