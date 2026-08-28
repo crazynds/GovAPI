@@ -130,6 +130,12 @@ def _process_file(db: Session, period: str, group: str, file: str) -> None:
             return
         except Exception:  # noqa: BLE001
             logger.exception("Falha processando %s (tentativa %d/%d)", file, attempt, MAX_ATTEMPTS_PER_FILE)
+            # Sem isso, a sessão fica com a transação abortada depois de
+            # qualquer erro de SQL -- toda tentativa seguinte falha na
+            # primeira query (mesmo uma trivial, tipo _set_progress) com
+            # "current transaction is aborted", mascarando o erro real e
+            # nunca dando chance de retry funcionar de fato.
+            db.rollback()
             for path in (zip_path, csv_path):
                 if os.path.exists(path):
                     os.remove(path)
@@ -328,13 +334,24 @@ def _import_file(db: Session, period: str, group: str, file: str, csv_path: str)
     ] + ['"source_file"']
     update_cols = [c for c in copy_columns if c not in unique]
     set_clause = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in update_cols)
+    unique_cols_quoted = ", ".join(f'"{c}"' for c in unique)
 
     t0 = time.monotonic()
     db.execute(text(f"""
         INSERT INTO {table_name} ({quoted_cols})
         SELECT {", ".join(select_cols)}
-        FROM {tmp_table}
-        ON CONFLICT ({", ".join(f'"{c}"' for c in unique)}) DO UPDATE SET {set_clause}
+        FROM (
+            -- O CSV oficial às vezes repete a mesma chave dentro do mesmo
+            -- arquivo (visto na prática: Empresas2.zip) -- um único INSERT
+            -- ... ON CONFLICT DO UPDATE não aceita conflitar duas vezes com
+            -- a mesma linha, então dedup primeiro (fica com a ocorrência
+            -- mais recente pela ordem física de carga, igual o UPSERT
+            -- linha a linha antigo já fazia implicitamente).
+            SELECT DISTINCT ON ({unique_cols_quoted}) *
+            FROM {tmp_table}
+            ORDER BY {unique_cols_quoted}, ctid DESC
+        ) AS deduped
+        ON CONFLICT ({unique_cols_quoted}) DO UPDATE SET {set_clause}
     """))
     db.execute(text(f"DROP TABLE {tmp_table}"))
     db.commit()
