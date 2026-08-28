@@ -6,6 +6,7 @@ não precisa de DISTINCT ON/window function (caro numa tabela de dezenas de
 milhões de linhas). Progresso é gravado em import_progress a cada lote, e
 lido por GET /import/status."""
 
+import logging
 import os
 import shutil
 import time
@@ -31,6 +32,9 @@ from app.models import (
     Municipio,
     SimplesStaging,
 )
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("importer")
 
 GROUPS = ["reference", "simples", "empresas", "estabelecimentos"]
 
@@ -74,7 +78,10 @@ def run_import(period: str | None = None, only: list[str] | None = None) -> None
         _set_progress(db, period=resolved_period, status="running", message="iniciando")
 
         for group in groups:
-            for file in files_for_group(all_files, group):
+            group_files = files_for_group(all_files, group)
+            logger.info("Grupo %s: %d arquivo(s)", group, len(group_files))
+            for i, file in enumerate(group_files, start=1):
+                logger.info("[%s] arquivo %d/%d: %s", group, i, len(group_files), file)
                 _process_file(db, resolved_period, group, file)
 
         if run_build:
@@ -112,6 +119,7 @@ def _process_file(db: Session, period: str, group: str, file: str) -> None:
             _mark_imported(db, period, file, rows)
             return
         except Exception:  # noqa: BLE001
+            logger.exception("Falha processando %s (tentativa %d/%d)", file, attempt, MAX_ATTEMPTS_PER_FILE)
             for path in (zip_path, csv_path):
                 if os.path.exists(path):
                     os.remove(path)
@@ -120,22 +128,28 @@ def _process_file(db: Session, period: str, group: str, file: str) -> None:
             time.sleep(10 * attempt)
 
 
+DOWNLOAD_LOG_EVERY = 10  # loga no console a cada N chunks (~10MB) -- grava no banco em todos, sem isso o /import/status ficaria impreciso.
+
+
 def _download(db: Session, period: str, group: str, file: str, dest: str) -> None:
     url = client.period_url(period) + file
     total = client.file_size(url)
     downloaded = 0
+    logger.info("Baixando %s/%s (%s bytes)", group, file, total or "?")
 
     with httpx.stream("GET", url, timeout=None, follow_redirects=True) as response:
         response.raise_for_status()
         with open(dest, "wb") as f:
-            for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+            for i, chunk in enumerate(response.iter_bytes(chunk_size=1024 * 1024)):
                 f.write(chunk)
                 downloaded += len(chunk)
                 _set_progress(
                     db, period=period, group=group, current_file=file, step="download",
                     processed_rows=downloaded,
                     message=f"{downloaded}/{total or '?'} bytes",
+                    log=(i % DOWNLOAD_LOG_EVERY == 0),
                 )
+    logger.info("Download de %s concluído: %s bytes", file, downloaded)
 
 
 def _extract(db: Session, period: str, group: str, file: str, zip_path: str, csv_path: str) -> None:
@@ -145,6 +159,8 @@ def _extract(db: Session, period: str, group: str, file: str, zip_path: str, csv
         inner_name = zf.namelist()[0]
         with zf.open(inner_name) as src, open(csv_path, "wb") as dst:
             shutil.copyfileobj(src, dst)
+
+    logger.info("Extraído %s", file)
 
 
 def _import_file(db: Session, period: str, group: str, file: str, csv_path: str) -> int:
@@ -226,6 +242,7 @@ def _import_file(db: Session, period: str, group: str, file: str, csv_path: str)
             )
 
     count += flush() or 0
+    logger.info("Importado %s: %d linhas", file, count)
     return count
 
 
@@ -247,6 +264,7 @@ def _import_reference(db: Session, period: str, group: str, file: str, csv_path:
 
     db.commit()
     _set_progress(db, period=period, group=group, current_file=file, step="import", processed_rows=count)
+    logger.info("Importado %s: %d linhas", file, count)
     return count
 
 
@@ -396,7 +414,11 @@ def _mark_imported(db: Session, period: str, filename: str, rows: int) -> None:
     db.commit()
 
 
-def _set_progress(db: Session, **fields) -> None:
+def _set_progress(db: Session, *, log: bool = True, **fields) -> None:
+    if log:
+        prefix = "/".join(p for p in (fields.get("group"), fields.get("current_file"), fields.get("step")) if p)
+        logger.info("[%s] %s", prefix, fields.get("message", "")) if prefix else logger.info(fields.get("message", ""))
+
     fields["updated_at"] = datetime.now(timezone.utc)
     if fields.get("status") == "running" and "started_at" not in fields:
         existing = db.get(ImportProgress, 1)
