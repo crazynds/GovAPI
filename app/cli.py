@@ -102,21 +102,23 @@ def import_ibge_command():
 @cli.command("import-municipios-geo")
 def import_municipios_geo_command():
     """
-    Geocodifica o centroide de cada município (latitude/longitude) via
-    Nominatim/OpenStreetMap, sem chave -- usado como fallback de baixa
-    precisão em /enderecos/proximos e /enderecos/buscar?lat=&lon= quando
-    um CEP específico ainda não tem coordenada exata cacheada.
+    Preenche o centroide de cada município (latitude/longitude) a partir de um
+    dataset público estático (kelvins/municipios-brasileiros, casado por
+    código IBGE exato) -- usado como fallback de baixa precisão em
+    /enderecos/proximos e /enderecos/buscar?lat=&lon= quando um CEP específico
+    ainda não tem coordenada exata cacheada.
 
-    Só ~5570 chamadas (uma por município), a 1 req/s (política de uso do
-    Nominatim) -- leva cerca de 1h40 na primeira vez. Pula município que já
-    tem coordenada, então rodar de novo depois de uma queda só continua.
+    Uma request só (~5570 municípios de uma vez), não mais 1 por município via
+    Nominatim -- isso era ~1h40 pela política de 1 req/s deles. Precisa que
+    `import-ibge` já tenha rodado (o match é por código IBGE, que só
+    `import-ibge` preenche em `municipios`).
     """
     from app.importer.geocoding import geocode_municipios
 
     db = SessionLocal()
     try:
         geocoded, total = geocode_municipios(db)
-        typer.echo(f"Geocodificação: {geocoded}/{total} municípios pendentes resolvidos.")
+        typer.echo(f"Geocodificação: {geocoded} município(s) atualizado(s) (dataset tem {total}).")
     finally:
         db.close()
 
@@ -154,11 +156,7 @@ IMPORT_ALL_PHASES = ["ceps", "ceps_osm", "cnpj", "ibge", "municipios_geo"]
 
 
 @cli.command("import-all")
-def import_all(
-    skip_municipios_geo: bool = typer.Option(
-        False, "--skip-municipios-geo", help="Pula a geocodificação de municípios (a etapa lenta, ~1h40)."
-    ),
-):
+def import_all():
     """
     Roda todas as importações, na ordem em que uma depende da outra.
 
@@ -177,11 +175,10 @@ def import_all(
          Também é o que preenche `municipios.uf`, que os dois passos
          seguintes exigem.
       4. População e área dos municípios (IBGE) -- casa por nome+UF.
-      5. Centroide dos municípios (Nominatim) -- fallback de baixa precisão
-         na busca por proximidade. É a etapa lenta: ~5570 chamadas a 1 req/s
-         (política de uso do Nominatim), cerca de 1h40 na primeira vez. Pula
-         município que já tem coordenada, então rodar de novo só continua de
-         onde parou. Use --skip-municipios-geo pra deixar pra depois.
+      5. Centroide dos municípios -- dataset público estático (kelvins/
+         municipios-brasileiros), casado por código IBGE exato numa request
+         só. Já foi geocodificação município a município via Nominatim
+         (1 req/s, ~1h40); não é mais.
 
     Se for cancelado no meio (Ctrl-C ou qualquer falha), a PRÓXIMA chamada
     retoma da fase em que parou -- pula toda fase já concluída na tentativa
@@ -223,7 +220,7 @@ def import_all(
             ("ceps_osm", "2/5 Coordenadas de CEP (extrato do OpenStreetMap)", _run_ceps_osm, False),
             ("cnpj", "3/5 CNPJ (Receita Federal)", lambda: _import_cnpj(period=None, only=None), True),
             ("ibge", "4/5 População e área dos municípios (IBGE)", _run_ibge, True),
-            ("municipios_geo", "5/5 Centroide dos municípios (Nominatim, ~1h40)", _run_municipios_geo, True),
+            ("municipios_geo", "5/5 Centroide dos municípios (dataset estático)", _run_municipios_geo, True),
         ]
 
         # Estado final de cada fase, pra decidir o status GERAL no fim -- não dá
@@ -236,12 +233,6 @@ def import_all(
         for key, label, action, required in steps:
             if phases.get(key) == "success":
                 typer.echo(f"== {label} -- já concluído ==")
-                continue
-
-            if key == "municipios_geo" and skip_municipios_geo:
-                typer.echo(f"== {label} -- pulado (--skip-municipios-geo) ==")
-                _set_import_all(db, municipios_geo="skipped")
-                final_status[key] = "skipped"
                 continue
 
             typer.echo(f"== {label} ==")
@@ -311,7 +302,7 @@ def _run_municipios_geo() -> None:
     db = SessionLocal()
     try:
         geocoded, total = geocode_municipios(db)
-        typer.echo(f"Geocodificação: {geocoded}/{total} municípios pendentes resolvidos.")
+        typer.echo(f"Geocodificação: {geocoded} município(s) atualizado(s) (dataset tem {total}).")
     finally:
         db.close()
 

@@ -143,8 +143,9 @@ coordinates from the OSM extract, the Revenue's CNPJ base, then IBGE population
 and municipality centroids. The order is not a preference — the CNPJ build links
 addresses to `correios_cep`, and it is what fills `municipios.uf`, which the two
 IBGE/geocoding steps need. Chaining the individual commands means respecting
-that order yourself. `--skip-municipios-geo` leaves out the slow step (~5570
-Nominatim calls at 1 req/s, about 1h40 the first time).
+that order yourself. Step 5 (municipality centroids) fetches a static public dataset
+(kelvins/municipios-brasileiros) in one request and matches by exact IBGE
+code — no Nominatim, no 1h40 wait, no `--skip` flag needed.
 
 If interrupted — Ctrl-C or a genuine failure — the next `import-all` resumes
 from the phase that didn't finish rather than starting over at CEPs. Each
