@@ -983,6 +983,12 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
         # com digitacao errada, extinto, ou de endereco no exterior.
         # Agora que o CEP orfao vira NULL, a contagem sai direto das colunas:
         # `address IS NOT NULL` e exatamente "nao casou com a base dos Correios".
+        #
+        # display.set explicito aqui: sem isso a tela ficava presa em "INSERT
+        # establishments_new ..." durante essa contagem (um count(*) com 3
+        # FILTER varrendo as ~70M linhas recem-inseridas) -- ja rodou o
+        # suficiente, sozinho, pra alguem achar que o INSERT reiniciou.
+        display.set(slot, "  build: contando cobertura de CEP")
         cov = db.execute(text("""
             SELECT count(*) FILTER (WHERE cep IS NOT NULL) AS vinculados,
                    count(*) FILTER (WHERE cep IS NOT NULL AND street IS NULL) AS resolvidos,
@@ -1000,6 +1006,7 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
     # /municipios/search devolve vazio e o import-ibge (que casa por nome+UF)
     # nao casa nada.
     _set_step(progress, "build", period=period, group="build", status="running", message="preenchendo UF dos municípios")
+    display.set(slot, "  build: preenchendo UF dos municípios")
     # `municipios.uf` continua em texto (e a sigla que a API expoe, e a tabela
     # tem ~5,5k linhas), enquanto o staging guarda o codigo numerico -- dai o
     # join contra a lista de codigos, montada do mapa de app/regions.py pra nao
