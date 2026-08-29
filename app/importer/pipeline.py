@@ -995,9 +995,17 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
                    count(*) FILTER (WHERE address IS NOT NULL) AS sem_vinculo
             FROM establishments_new
         """)).mappings().one()
+        # `resolvidos` e SUBCONJUNTO de `vinculados` (todo resolvido tambem
+        # tem cep, so que sem precisar do endereco da Receita) -- por isso o
+        # log explicita "dos quais" em vez de listar como se fossem 3 grupos
+        # que iam somar o total. So `vinculados + sem_vinculo` fecha o total.
+        localidade = cov["vinculados"] - cov["resolvidos"]
         logger.info(
-            "CEP: %d vinculados (%d com logradouro dos Correios), %d sem vínculo (endereço em address)",
-            cov["vinculados"], cov["resolvidos"], cov["sem_vinculo"],
+            "CEP: %d vinculados + %d sem vínculo (endereço em address) = %d no total. "
+            "Dos vinculados: %d com logradouro resolvido pelos Correios, %d de CEP de localidade "
+            "(sem rua cadastrada -- usam o endereço da Receita mesmo com CEP vinculado).",
+            cov["vinculados"], cov["sem_vinculo"], cov["vinculados"] + cov["sem_vinculo"],
+            cov["resolvidos"], localidade,
         )
 
     # `Municipios.zip` da Receita so tem codigo+nome, sem UF -- pega o UF de
