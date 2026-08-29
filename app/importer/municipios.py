@@ -33,6 +33,16 @@ def normalize_name(name: str) -> str:
     return unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().strip().lower()
 
 
+def _extract_uf(item: dict) -> str:
+    """A maioria dos municípios tem `microrregiao.mesorregiao.UF`, mas
+    distritos estaduais sem microrregião (ex: Fernando de Noronha/PE) só
+    trazem `regiao-imediata.regiao-intermediaria.UF`."""
+    microrregiao = item.get("microrregiao")
+    if microrregiao:
+        return microrregiao["mesorregiao"]["UF"]["sigla"]
+    return item["regiao-imediata"]["regiao-intermediaria"]["UF"]["sigla"]
+
+
 def import_municipios(db: Session) -> int:
     """Busca todos os municípios do IBGE de uma vez e faz upsert por
     `ibge_code` -- chave exata, sem ambiguidade (ao contrário do nome, que se
@@ -44,7 +54,7 @@ def import_municipios(db: Session) -> int:
 
     count = 0
     for item in data:
-        uf = item["microrregiao"]["mesorregiao"]["UF"]["sigla"]
+        uf = _extract_uf(item)
         # Nome em maiuscula, pra bater com a convencao que o Municipios.zip da
         # Receita ja usa (esse import roda depois e sobrescreve `name` de
         # qualquer forma quando casa, mas ate la o nome fica no mesmo padrao).
