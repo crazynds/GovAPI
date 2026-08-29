@@ -22,18 +22,31 @@ from app.db import Base
 
 
 class Municipio(Base):
+    """Nasce da API de localidades do IBGE (`import-municipios`, sem chave,
+    uma request só) -- ibge_code/name/uf exatos, sem fuzzy match. Roda antes
+    de tudo (CEPs, CNPJ): é o que dá a `correios_cep` uma FK de verdade pra
+    cá, e o que fecha establishments.cep -> correios_cep.municipio_cod_ibge
+    -> municipios.ibge_code.
+
+    `receita_code` só chega depois, com o `Municipios.zip` da própria Receita
+    (grupo "reference" do import-cnpj) -- esse arquivo não traz UF nem código
+    IBGE, só código+nome, então o casamento com as linhas já existentes (via
+    IBGE) é por nome normalizado. Nullable: uma linha pode existir só com o
+    lado IBGE até esse import rodar (ou pra sempre, no raro caso de nome sem
+    correspondência exata -- ver app.importer.pipeline._import_reference).
+    """
+
     __tablename__ = "municipios"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    # Integer (nao texto) pro JOIN do build casar tipo com
-    # estabelecimentos_staging.municipio_codigo sem CAST. A API continua
-    # falando em string -- ver app/routers/municipios.py.
-    receita_code: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    receita_code: Mapped[int | None] = mapped_column(Integer, unique=True, index=True, nullable=True)
     name: Mapped[str] = mapped_column(String(120))
     uf: Mapped[str | None] = mapped_column(String(2), nullable=True)
-    # Preenchidos por `python -m app.cli import-ibge` (IBGE/SIDRA) -- ver
-    # app/importer/ibge.py. Nulos até essa importação rodar pela primeira vez.
-    ibge_code: Mapped[str | None] = mapped_column(String(7), nullable=True, index=True)
+    # Integer (nao String) pra poder ser alvo de FOREIGN KEY de
+    # correios_cep.municipio_cod_ibge, que ja e Integer -- Postgres nao aceita
+    # FK entre tipos diferentes. unique=True pela mesma razao: FK exige indice
+    # unico do lado referenciado.
+    ibge_code: Mapped[int | None] = mapped_column(Integer, unique=True, index=True, nullable=True)
     population: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     area_km2: Mapped[float | None] = mapped_column(Numeric(12, 3), nullable=True)
     # Centroide do municipio (Nominatim/OSM) -- ver `import-municipios-geo`.
@@ -316,7 +329,11 @@ class Cep(Base):
     __tablename__ = "correios_cep"
 
     cep: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
-    municipio_cod_ibge: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # NULL quando o e-DNE traz um codigo IBGE que nao existe na lista atual
+    # (municipio historico/fundido/extinto) -- mesmo tratamento de CEP orfao
+    # ja usado em establishments.cep: guardar um codigo que nao bate com nada
+    # nao serviria pra nada e impediria a FK. Ver app.ceps.upsert_from.
+    municipio_cod_ibge: Mapped[int | None] = mapped_column(ForeignKey("municipios.ibge_code"), nullable=True)
     latitude: Mapped[float | None] = mapped_column(Numeric(10, 7), nullable=True)
     longitude: Mapped[float | None] = mapped_column(Numeric(10, 7), nullable=True)
     coord_updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -396,17 +413,17 @@ class ImportRun(Base):
 
 
 class ImportAllRun(Base):
-    """Estado do comando `import-all` em si -- as 5 fases que ele encadeia
-    (CEPs, coordenadas OSM, CNPJ, IBGE, centroide de municipio), nao o
-    pipeline do CNPJ (que ja tem o proprio ImportRun/ImportProgress). Uma
-    linha so (id=1).
+    """Estado do comando `import-all` em si -- as 6 fases que ele encadeia
+    (municipios, CEPs, coordenadas OSM, CNPJ, IBGE, centroide de municipio),
+    nao o pipeline do CNPJ (que ja tem o proprio ImportRun/ImportProgress).
+    Uma linha so (id=1).
 
     Existe pra `import-all` retomar de onde parou se for cancelado no meio:
     cada fase tem seu proprio status, e uma nova chamada pula toda fase ja
     'success' -- MAS so enquanto a tentativa anterior nao tiver terminado com
     sucesso. Se `status` (o geral) for 'success', a proxima chamada e um
     refresh periodico de verdade (mes que vem, novo periodo de CNPJ, e-DNE
-    atualizado) e reprocessa as 5 fases do zero -- ver app.cli.import_all,
+    atualizado) e reprocessa as 6 fases do zero -- ver app.cli.import_all,
     que decide isso comparando o status geral antes de começar.
     """
 
@@ -416,6 +433,7 @@ class ImportAllRun(Base):
     status: Mapped[str] = mapped_column(String(20), default="idle")  # idle|running|success|failed
     # pending|running|success|failed|skipped, uma coluna por fase (na ordem
     # em que import_all as executa).
+    municipios: Mapped[str] = mapped_column(String(20), default="pending")
     ceps: Mapped[str] = mapped_column(String(20), default="pending")
     ceps_osm: Mapped[str] = mapped_column(String(20), default="pending")
     cnpj: Mapped[str] = mapped_column(String(20), default="pending")

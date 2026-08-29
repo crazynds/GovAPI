@@ -36,17 +36,18 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import httpx
-from sqlalchemy import text
+from sqlalchemy import text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
+from app.cnpj import ORDEM_SPAN
 from app.config import settings
 from app.db import SessionLocal
 from app.importer import client
+from app.importer import municipios as municipios_bootstrap
 from app.importer.csv_reader import read_csv
 from app.importer.progress import ProgressDisplay, human_bytes, log_through
 from app.importer.rows import GROUP_SPECS, Counters
-from app.cnpj import ORDEM_SPAN
 from app.regions import CODE_TO_UF
 from app.models import (
     Cnae,
@@ -714,8 +715,6 @@ def _import_group(db: Session, progress: Session, job: Job, display: ProgressDis
 
 def _import_reference(db: Session, progress: Session, job: Job, display: ProgressDisplay, slot: int) -> int:
     columns, model, key = REFERENCE_SPECS[job.file]
-    table = model.__table__
-    count = 0
 
     csv_size = os.path.getsize(job.csv_path)
     bar = display.bar(slot, f"  importando {job.file}", total=csv_size, unit="bytes")
@@ -723,28 +722,85 @@ def _import_reference(db: Session, progress: Session, job: Job, display: Progres
     def on_progress(bytes_read: int, _total: int, rows_read: int) -> None:
         bar.update(bytes_read, extra=f"{rows_read} linhas")
 
-    for row in read_csv(job.csv_path, columns, on_progress=on_progress):
-        if key == "receita_code":
-            # Coluna Integer no banco (pro JOIN do build casar tipo com
-            # estabelecimentos_staging.municipio_codigo sem CAST).
-            code = (row.get("receita_code") or "").strip()
-            if not code.isdigit():
-                continue
-            row["receita_code"] = int(code)
+    rows = read_csv(job.csv_path, columns, on_progress=on_progress)
+    if job.file == "Municipios.zip":
+        count = _merge_municipios_receita(db, rows)
+    else:
+        count = _upsert_reference_rows(db, model.__table__, key, rows)
 
-        stmt = pg_insert(table).values(**row)
-        update_cols = {c: stmt.excluded[c] for c in row if c != key}
-        stmt = stmt.on_conflict_do_update(index_elements=[key], set_=update_cols)
-        db.execute(stmt)
-        count += 1
-
-    db.commit()
     bar.update(csv_size, extra=f"{count} linhas", force=True)
     _set_step(
         progress, "import", period=job.period, group=job.group, current_file=job.file, status="running",
         processed_rows=count, message=f"{count} linhas",
     )
     logger.info("Importado %s: %d linhas", job.file, count)
+    return count
+
+
+def _upsert_reference_rows(db: Session, table, key: str, rows) -> int:
+    count = 0
+    for row in rows:
+        stmt = pg_insert(table).values(**row)
+        update_cols = {c: stmt.excluded[c] for c in row if c != key}
+        stmt = stmt.on_conflict_do_update(index_elements=[key], set_=update_cols)
+        db.execute(stmt)
+        count += 1
+    db.commit()
+    return count
+
+
+def _merge_municipios_receita(db: Session, rows) -> int:
+    """`Municipios.zip` da Receita so traz codigo+nome -- sem UF, sem codigo
+    IBGE. Ate aqui, `municipios` ja foi bootstrapada pela API do IBGE (ver
+    app.importer.municipios.import_municipios, que roda ANTES de tudo), com
+    ibge_code/uf exatos. Este passo so precisa achar, pra cada linha da
+    Receita, a linha correspondente ja existente -- por nome normalizado,
+    unica chave em comum entre as duas fontes -- e completar `receita_code`
+    nela.
+
+    Nome duplicado entre estados (a Receita nao manda UF pra desempatar) e o
+    unico jeito de isso falhar: nesse caso a linha nova entra so com
+    receita_code+nome, sem ibge_code/uf, igual ao caso de "nome sem
+    correspondencia" -- ambos ficam pra tras do FK com `correios_cep` ate
+    alguem resolver a ambiguidade a mao, mas nao travam o import.
+    """
+    existing = db.query(Municipio.id, Municipio.name).all()
+    by_name: dict[str, list[int]] = {}
+    for municipio_id, name in existing:
+        by_name.setdefault(municipios_bootstrap.normalize_name(name), []).append(municipio_id)
+
+    count = matched = ambiguous = unmatched = 0
+    for row in rows:
+        code = (row.get("receita_code") or "").strip()
+        if not code.isdigit():
+            continue
+        receita_code = int(code)
+        name = (row.get("name") or "").strip()
+        count += 1
+
+        candidates = by_name.get(municipios_bootstrap.normalize_name(name), [])
+        if len(candidates) == 1:
+            db.execute(
+                update(Municipio.__table__)
+                .where(Municipio.id == candidates[0])
+                .values(receita_code=receita_code, name=name)
+            )
+            matched += 1
+        else:
+            if len(candidates) > 1:
+                ambiguous += 1
+            else:
+                unmatched += 1
+            stmt = pg_insert(Municipio.__table__).values(receita_code=receita_code, name=name)
+            stmt = stmt.on_conflict_do_update(index_elements=["receita_code"], set_={"name": stmt.excluded.name})
+            db.execute(stmt)
+
+    db.commit()
+    logger.info(
+        "Municípios (Receita): %d casados com o IBGE por nome, %d nome ambíguo (repete em >1 UF), "
+        "%d sem correspondência -- esses %d ficam sem ibge_code/uf até alguém resolver a mão.",
+        matched, ambiguous, unmatched, ambiguous + unmatched,
+    )
     return count
 
 

@@ -76,22 +76,33 @@ def buscar_cep(cep: str, db: Session = Depends(get_db)):
     if data.get("erro"):
         raise HTTPException(404, "CEP não encontrado")
 
+    municipio_cod_ibge = int(data["ibge"]) if data.get("ibge") else None
+    if municipio_cod_ibge is not None:
+        # `municipio_cod_ibge` agora tem FOREIGN KEY pra `municipios.ibge_code`
+        # -- um código que o ViaCEP mande e que não exista lá (município
+        # renomeado/fundido, ou `import-municipios` nunca rodou) faria o
+        # INSERT abaixo falhar inteiro. NULL nesse caso, mesmo tratamento que
+        # o upsert em massa já dá a código órfão (ver app.ceps.upsert_from).
+        known = db.execute(text("SELECT 1 FROM municipios WHERE ibge_code = :c"), {"c": municipio_cod_ibge}).scalar()
+        if not known:
+            municipio_cod_ibge = None
+
     row = {
         "cep": value,
         "logradouro": data.get("logradouro") or None,
         "complemento": data.get("complemento") or None,
         "bairro": data.get("bairro") or None,
         "municipio": data.get("localidade"),
-        "municipio_cod_ibge": int(data["ibge"]) if data.get("ibge") else None,
+        "municipio_cod_ibge": municipio_cod_ibge,
         "uf": data.get("uf"),
         "nome": None,
     }
 
-    # Só persiste se o ViaCEP trouxe município/UF/código IBGE; senão devolve a
-    # resposta sem gravar. Não é mais uma restrição de schema (essas colunas são
+    # Só persiste se o ViaCEP trouxe município e UF; senão devolve a resposta
+    # sem gravar. Não é mais uma restrição de schema (essas colunas são
     # nullable desde a fusão com as coordenadas), é critério: gravar um CEP sem
     # município nenhum não ajudaria nenhuma busca.
-    if row["municipio"] and row["uf"] and row["municipio_cod_ibge"]:
+    if row["municipio"] and row["uf"]:
         db.execute(
             text(f"""
                 INSERT INTO {CORREIOS_CEP_TABLE} ({", ".join(ceps.COLUMNS)})
@@ -133,7 +144,7 @@ _DISTANCE_KM_SQL = """
 # funcionaria pra CEPs já consultados individualmente, o que na prática é
 # quase nenhum. `exata` diz qual das duas foi usada.
 _COORD_JOIN_SQL = """
-    LEFT JOIN municipios mu ON mu.ibge_code = e.municipio_cod_ibge::text
+    LEFT JOIN municipios mu ON mu.ibge_code = e.municipio_cod_ibge
     CROSS JOIN LATERAL (
         SELECT
             coalesce(e.latitude, mu.latitude) AS lat_final,

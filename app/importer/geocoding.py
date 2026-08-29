@@ -39,7 +39,10 @@ def geocode_municipios(db: Session) -> tuple[int, int]:
     response.raise_for_status()
 
     reader = csv.DictReader(io.StringIO(response.text))
-    coords = {row["codigo_ibge"]: (float(row["latitude"]), float(row["longitude"])) for row in reader}
+    # int(...): `Municipio.ibge_code` e Integer, mas csv.DictReader so devolve
+    # str -- comparar str contra int nunca bate, e o lookup abaixo falharia
+    # silenciosamente pra TODO municipio (visto na pratica, testando isto).
+    coords = {int(row["codigo_ibge"]): (float(row["latitude"]), float(row["longitude"])) for row in reader}
 
     # So os que ja tem ibge_code (import-ibge casa isso por nome+UF antes) --
     # sem ele nao ha como bater com o dataset, que so identifica por codigo.

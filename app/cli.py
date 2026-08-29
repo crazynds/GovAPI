@@ -57,6 +57,29 @@ def reset_db(
     typer.echo("Migrations aplicadas — banco vazio e em dia.")
 
 
+@cli.command("import-municipios")
+def import_municipios_command():
+    """
+    Bootstrapa `municipios` a partir da API de Localidades do IBGE (sem
+    chave, uma request só) -- ibge_code + nome + UF exatos, sem fuzzy match.
+
+    Roda ANTES de tudo (CEPs, CNPJ): é o que dá a `correios_cep` uma FOREIGN
+    KEY de verdade pra `municipios`, fechando a cadeia establishments.cep ->
+    correios_cep.municipio_cod_ibge -> municipios.ibge_code. O código de
+    município da própria Receita (`receita_code`) só chega depois, com o
+    `Municipios.zip` dela (dentro de `import-cnpj`), casado por nome contra
+    as linhas que este comando já criou.
+    """
+    from app.importer.municipios import import_municipios
+
+    db = SessionLocal()
+    try:
+        count = import_municipios(db)
+        typer.echo(f"Municípios: {count} carregados do IBGE.")
+    finally:
+        db.close()
+
+
 @cli.command("import-cnpj")
 def import_cnpj(
     period: str = typer.Option(None, help="Período específico (YYYY-MM-DD). Padrão: descobre o mais recente."),
@@ -86,8 +109,8 @@ def import_ibge_command():
     """
     Busca população estimada e área territorial de todos os municípios de
     uma vez via API pública do IBGE (SIDRA/Agregados, sem chave) e casa por
-    nome+UF com os municípios já importados. Precisa que `import-cnpj`
-    já tenha rodado ao menos uma vez (usa o UF preenchido no build).
+    ibge_code -- exato, sem fuzzy match. Precisa que `import-municipios`
+    já tenha rodado (é ele que preenche `ibge_code` em `municipios`).
     """
     from app.importer.ibge import import_ibge
 
@@ -110,8 +133,9 @@ def import_municipios_geo_command():
 
     Uma request só (~5570 municípios de uma vez), não mais 1 por município via
     Nominatim -- isso era ~1h40 pela política de 1 req/s deles. Precisa que
-    `import-ibge` já tenha rodado (o match é por código IBGE, que só
-    `import-ibge` preenche em `municipios`).
+    `import-municipios` já tenha rodado (o match é por código IBGE, que é
+    ele quem preenche em `municipios` -- não depende de `import-ibge`, que só
+    cuida de população/área, um enriquecimento à parte).
     """
     from app.importer.geocoding import geocode_municipios
 
@@ -150,9 +174,9 @@ def import_ceps_osm_command():
         db.close()
 
 
-# Ordem das 5 fases de `import_all` -- a mesma ordem em que elas rodam, e a
+# Ordem das 6 fases de `import_all` -- a mesma ordem em que elas rodam, e a
 # mesma dos nomes das colunas de ImportAllRun.
-IMPORT_ALL_PHASES = ["ceps", "ceps_osm", "cnpj", "ibge", "municipios_geo"]
+IMPORT_ALL_PHASES = ["municipios", "ceps", "ceps_osm", "cnpj", "ibge", "municipios_geo"]
 
 
 @cli.command("import-all")
@@ -162,27 +186,32 @@ def import_all():
 
     A ordem não é preferência, é dependência:
 
-      1. CEPs dos Correios (e-DNE) -- tem que vir primeiro. O build do CNPJ
-         liga cada estabelecimento ao seu CEP e, quando o CEP já resolve o
-         endereço, deixa de guardar logradouro/bairro. Sem a base de CEP no
-         lugar, esse dado é duplicado em dezenas de milhões de linhas e a
-         FOREIGN KEY de `establishments.cep` não é criada.
-      2. Coordenadas em massa (extrato do OSM) -- preenche lat/long dos CEPs
+      1. Municípios (API de Localidades do IBGE) -- tem que vir primeiro de
+         todos. É o que dá a `correios_cep` uma FOREIGN KEY de verdade pra
+         `municipios` (por ibge_code), fechando establishments.cep ->
+         correios_cep.municipio_cod_ibge -> municipios.ibge_code.
+      2. CEPs dos Correios (e-DNE) -- o build do CNPJ liga cada
+         estabelecimento ao seu CEP e, quando o CEP já resolve o endereço,
+         deixa de guardar logradouro/bairro. Sem a base de CEP no lugar, esse
+         dado é duplicado em dezenas de milhões de linhas e a FOREIGN KEY de
+         `establishments.cep` não é criada.
+      3. Coordenadas em massa (extrato do OSM) -- preenche lat/long dos CEPs
          que acabaram de entrar. Best-effort: se falhar (o mirror do
          Geofabrik já deu 503, por exemplo), avisa e segue pra próxima etapa
          em vez de travar o resto -- é um enriquecimento, nada depende dela.
-      3. CNPJ da Receita Federal -- é aqui que o vínculo com o CEP acontece.
-         Também é o que preenche `municipios.uf`, que os dois passos
-         seguintes exigem.
-      4. População e área dos municípios (IBGE) -- casa por nome+UF.
-      5. Centroide dos municípios -- dataset público estático (kelvins/
+      4. CNPJ da Receita Federal -- é aqui que o vínculo com o CEP acontece.
+         O `Municipios.zip` dela (código+nome, sem UF nem ibge_code) casa por
+         nome com as linhas que a fase 1 já criou, preenchendo
+         `receita_code`.
+      5. População e área dos municípios (IBGE) -- casa por ibge_code exato.
+      6. Centroide dos municípios -- dataset público estático (kelvins/
          municipios-brasileiros), casado por código IBGE exato numa request
          só. Já foi geocodificação município a município via Nominatim
          (1 req/s, ~1h40); não é mais.
 
     Se for cancelado no meio (Ctrl-C ou qualquer falha), a PRÓXIMA chamada
     retoma da fase em que parou -- pula toda fase já concluída na tentativa
-    anterior, em vez de recomeçar da 1/5. Isso só vale enquanto a tentativa
+    anterior, em vez de recomeçar da 1/6. Isso só vale enquanto a tentativa
     anterior não tiver terminado com sucesso: depois de um `import-all`
     completo, a próxima chamada é tratada como um refresh de verdade (mês que
     vem, novo período de CNPJ, e-DNE atualizado) e roda as 5 fases de novo.
@@ -209,18 +238,19 @@ def import_all():
 
         _set_import_all(db, status="running", **phases)
 
-        # required=False só na 2/5: coordenadas do OSM são um enriquecimento
+        # required=False só na 3/6: coordenadas do OSM são um enriquecimento
         # (fallback de baixa precisão via centroide do município já cobre a
         # busca por proximidade sem elas -- ver import-municipios-geo), não
         # uma dependência de nada depois dela no pipeline. Um mirror externo
         # fora do ar (visto na prática: 503 do Geofabrik) não devia travar
         # CNPJ/IBGE/geocodificação, que não dependem dela em nada.
         steps = [
-            ("ceps", "1/5 CEPs (Correios / e-DNE)", lambda: _import_ceps(source=None), True),
-            ("ceps_osm", "2/5 Coordenadas de CEP (extrato do OpenStreetMap)", _run_ceps_osm, False),
-            ("cnpj", "3/5 CNPJ (Receita Federal)", lambda: _import_cnpj(period=None, only=None), True),
-            ("ibge", "4/5 População e área dos municípios (IBGE)", _run_ibge, True),
-            ("municipios_geo", "5/5 Centroide dos municípios (dataset estático)", _run_municipios_geo, True),
+            ("municipios", "1/6 Municípios (API de Localidades do IBGE)", _run_municipios, True),
+            ("ceps", "2/6 CEPs (Correios / e-DNE)", lambda: _import_ceps(source=None), True),
+            ("ceps_osm", "3/6 Coordenadas de CEP (extrato do OpenStreetMap)", _run_ceps_osm, False),
+            ("cnpj", "4/6 CNPJ (Receita Federal)", lambda: _import_cnpj(period=None, only=None), True),
+            ("ibge", "5/6 População e área dos municípios (IBGE)", _run_ibge, True),
+            ("municipios_geo", "6/6 Centroide dos municípios (dataset estático)", _run_municipios_geo, True),
         ]
 
         # Estado final de cada fase, pra decidir o status GERAL no fim -- não dá
@@ -271,6 +301,17 @@ def import_all():
             pendentes = [name for name, status in final_status.items() if status not in ("success", "skipped")]
             _set_import_all(db, status="failed", message=f"pendente: {', '.join(pendentes)}"[:255])
             typer.echo(f"Concluído com pendências ({', '.join(pendentes)}) -- rode de novo pra tentar de novo.")
+    finally:
+        db.close()
+
+
+def _run_municipios() -> None:
+    from app.importer.municipios import import_municipios
+
+    db = SessionLocal()
+    try:
+        count = import_municipios(db)
+        typer.echo(f"Municípios: {count} carregados do IBGE.")
     finally:
         db.close()
 

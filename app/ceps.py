@@ -133,12 +133,26 @@ def upsert_from(db: Session, source_table: str) -> tuple[int, int, int]:
     cols = ", ".join(COLUMNS)
     updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in COLUMNS if c != "cep")
     # A scratch vem da lib com `cep` VARCHAR -- cast aqui, filtrando a 8 digitos
-    # pro cast nunca estourar numa linha estranha.
-    incoming_cols = ", ".join(f"{c}::integer" if c == "cep" else c for c in COLUMNS)
-    incoming = f"SELECT {incoming_cols} FROM {source_table} WHERE cep ~ '^[0-9]{{8}}$'"
+    # pro cast nunca estourar numa linha estranha. `municipio_cod_ibge` vira
+    # NULL quando nao bate com nenhum `municipios.ibge_code` (municipio
+    # extinto/fundido, fora da lista atual do IBGE) -- mesmo tratamento que
+    # `establishments.cep` ja da a CEP orfao, e pelo mesmo motivo: um codigo
+    # que nao resolve nada so serviria pra travar a FOREIGN KEY do upsert
+    # inteiro.
+    select_cols = ", ".join(
+        "s.cep::integer" if c == "cep"
+        else "CASE WHEN mu.ibge_code IS NOT NULL THEN s.municipio_cod_ibge END" if c == "municipio_cod_ibge"
+        else f"s.{c}"
+        for c in COLUMNS
+    )
+    incoming = (
+        f"SELECT {select_cols} FROM {source_table} s "
+        f"LEFT JOIN municipios mu ON mu.ibge_code = s.municipio_cod_ibge "
+        f"WHERE s.cep ~ '^[0-9]{{8}}$'"
+    )
 
     before = db.execute(text(f"SELECT count(*) FROM {TABLE}")).scalar() or 0
-    total_in = db.execute(text(f"SELECT count(*) FROM ({incoming}) s")).scalar() or 0
+    total_in = db.execute(text(f"SELECT count(*) FROM ({incoming}) AS src")).scalar() or 0
 
     db.execute(text(f"""
         INSERT INTO {TABLE} ({cols})
@@ -160,7 +174,7 @@ def upsert_from(db: Session, source_table: str) -> tuple[int, int, int]:
     stale = db.execute(text(f"""
         SELECT count(*) FROM {TABLE} c
         WHERE c.municipio IS NOT NULL
-          AND NOT EXISTS (SELECT 1 FROM ({incoming}) s WHERE s.cep = c.cep)
+          AND NOT EXISTS (SELECT 1 FROM ({incoming}) AS src WHERE src.cep = c.cep)
     """)).scalar() or 0
 
     inserted = after - before

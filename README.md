@@ -11,8 +11,8 @@
 | **CNPJ / CNAE** | Federal Revenue's public CNPJ database | Company search by CNAE (business activity), state, region, size, MEI/Simples status, legal nature, registration status (active/suspended/closed/etc — all companies, not just active ones), etc. |
 | **Partners (Sócios)** | Federal Revenue's public CNPJ database | Company shareholders/partners — search by company or by partner name/document. |
 | **Reference tables** | Federal Revenue's public CNPJ database | Legal nature, partner/officer qualification, country, and deregistration-reason codes — small lookup tables. |
-| **Municipalities** | Official IBGE/Revenue list, enriched with [IBGE/SIDRA](https://servicodados.ibge.gov.br) | Municipality lookup by name, state, region, or code, with estimated population and territorial area. |
-| **CEP / Address** | [e-DNE Básico](https://github.com/cauethenorio/edne-correios-loader) | Address lookup by ZIP code or free text. Falls back to [ViaCEP](https://viacep.com.br) for anything not yet covered, and saves the result for next time. Coordinates (lat/long) via [BrasilAPI](https://brasilapi.com.br), cached once looked up; radius search and distance sort fall back to the municipality's centroid ([Nominatim](https://nominatim.openstreetmap.org)) for everything else, so they work across the whole CEP base, just at city-level precision where no exact coordinate is cached yet. |
+| **Municipalities** | [IBGE Localidades](https://servicodados.ibge.gov.br) (exact code/name/state), enriched with [IBGE/SIDRA](https://servicodados.ibge.gov.br) | Municipality lookup by name, state, region, or code, with estimated population and territorial area. |
+| **CEP / Address** | [e-DNE Básico](https://github.com/cauethenorio/edne-correios-loader) | Address lookup by ZIP code or free text. Falls back to [ViaCEP](https://viacep.com.br) for anything not yet covered, and saves the result for next time. Coordinates (lat/long) via [BrasilAPI](https://brasilapi.com.br), cached once looked up; radius search and distance sort fall back to the municipality's centroid (a static public dataset, matched by exact IBGE code) for everything else, so they work across the whole CEP base, just at city-level precision where no exact coordinate is cached yet. |
 | **States** | Static list | Brazilian states (UF + name + region). |
 | **Taxes (Simples Nacional)** | LC 123/2006 Anexos I–V | Effective tax rate and DAS amount calculation, Fator R calculation. Pure math, no import needed. |
 
@@ -121,6 +121,9 @@ docker compose run --rm app python -m app.cli import-all
 Or import each source independently:
 
 ```bash
+# Municipalities (IBGE Localidades) -- run first, everything else links to this
+docker compose run --rm app python -m app.cli import-municipios
+
 # CNPJ (Federal Revenue)
 docker compose run --rm app python -m app.cli import-cnpj
 
@@ -130,22 +133,27 @@ docker compose run --rm app python -m app.cli import-cnpj --only estabelecimento
 # CEPs (Post Office e-DNE Básico)
 docker compose run --rm app python -m app.cli import-ceps
 
-# Municipality population/area (IBGE/SIDRA) -- run after import-cnpj at least once
+# Municipality population/area (IBGE/SIDRA) -- run after import-municipios
 docker compose run --rm app python -m app.cli import-ibge
 
-# Municipality centroid coordinates (Nominatim/OSM) -- one-time, ~1h40 (rate-limited
-# to 1 req/s), resumable. Backs the low-precision fallback in the address geo endpoints.
+# Municipality centroid coordinates -- static public dataset, matched by exact
+# IBGE code, one request. Backs the low-precision fallback in the address geo
+# endpoints.
 docker compose run --rm app python -m app.cli import-municipios-geo
 ```
 
-`import-all` chains all five in dependency order: Post Office CEPs, bulk
-coordinates from the OSM extract, the Revenue's CNPJ base, then IBGE population
-and municipality centroids. The order is not a preference — the CNPJ build links
-addresses to `correios_cep`, and it is what fills `municipios.uf`, which the two
-IBGE/geocoding steps need. Chaining the individual commands means respecting
-that order yourself. Step 5 (municipality centroids) fetches a static public dataset
-(kelvins/municipios-brasileiros) in one request and matches by exact IBGE
-code — no Nominatim, no 1h40 wait, no `--skip` flag needed.
+`import-all` chains all six in dependency order: municipalities, Post Office
+CEPs, bulk coordinates from the OSM extract, the Revenue's CNPJ base, then IBGE
+population and municipality centroids. The order is not a preference:
+`correios_cep.municipio_cod_ibge` has a real foreign key to `municipios.ibge_code`,
+which only exists once municipalities are loaded first; the CNPJ build links
+addresses to `correios_cep`; and the Revenue's own `Municipios.zip` (code+name,
+no state, no IBGE code) matches by name against the municipality rows the first
+step already created, filling in `receita_code`. Chaining the individual
+commands means respecting that order yourself. The last step (municipality
+centroids) fetches a static public dataset (kelvins/municipios-brasileiros) in
+one request and matches by exact IBGE code — no Nominatim, no 1h40 wait, no
+`--skip` flag needed.
 
 If interrupted — Ctrl-C or a genuine failure — the next `import-all` resumes
 from the phase that didn't finish rather than starting over at CEPs. Each
@@ -267,6 +275,22 @@ instead of deleting, `establishments.cep` carries a real foreign key to
 the check is one pass at the end instead of a per-row cost across the whole
 insert. `correios_cep` is an ordinary model now (`models.Cep`) — the loader only ever
 populates the scratch table — so Alembic manages it like any other.
+
+`correios_cep.municipio_cod_ibge` carries its own foreign key to
+`municipios.ibge_code`, same graceful-degradation rule: a code the current IBGE
+list doesn't recognize (a merged or renamed municipality) becomes NULL on
+upsert rather than failing. That FK is only possible because `municipios` is no
+longer sourced from the Revenue's own `Municipios.zip` — that file has no state
+and no IBGE code, just an internal code and a name, which is why `import-ibge`
+used to match it against SIDRA by name+state (fragile: names repeat across
+states). Municipalities now come from the IBGE Localidades API first
+(`import-municipios`, exact code+name+state, no matching at all), and
+`Municipios.zip` fills in `receita_code` afterward by matching name against
+those rows — the one name-based step left, and now checked against the
+authoritative municipality list itself rather than a population dataset's
+labels. `receita_code` is nullable for exactly this: a name with no match, or
+one that collides across states, leaves the row without it rather than
+guessing wrong.
 
 That table also absorbed `cep_coordenadas`. The two were keyed identically and
 only lived apart because a coordinate column glued onto `correios_cep` would
