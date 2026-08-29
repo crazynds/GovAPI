@@ -30,6 +30,18 @@ class Settings(BaseSettings):
     # estagio seguinte esta lento. 0 = calcula 70% do espaco livre no boot.
     disk_budget: int = 0
 
+    # `work_mem`/`maintenance_work_mem` (em MB) usados SO na sessao do build
+    # (ver app/importer/pipeline.py:_build_final_table) -- nao global, pra nao
+    # multiplicar por toda conexao concorrente da API e estourar RAM. O
+    # default do Postgres (4MB/64MB) e pensado pra muitas conexoes pequenas
+    # concorrentes, nao pra um hash join de dezenas de milhoes de linhas: sem
+    # isso, o join do build (varias tabelas de ate ~29M linhas) e o CREATE
+    # INDEX dos indices adiados correm risco de estourar o limite e derramar
+    # em disco, que e ordens de magnitude mais lento que ficar em RAM. Suba
+    # via APP_BUILD_WORK_MEM_MB se a maquina tiver RAM sobrando.
+    build_work_mem_mb: int = 512
+    build_maintenance_work_mem_mb: int = 1024
+
     class Config:
         env_prefix = "APP_"
 

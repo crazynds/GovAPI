@@ -267,6 +267,14 @@ class ImportPipeline:
         if self.error:
             raise self.error
 
+        # Independente de `run_build` (que so governa o build de
+        # establishments): o swap de socios acontece sempre que o grupo
+        # "socios" fez parte deste run, nao so quando "build" foi pedido
+        # explicitamente -- socios nao depende de establishments em nada.
+        # `_finalize_socios` e um no-op seguro se socios_new nao existir
+        # (grupo nao fez parte deste `--only`).
+        _finalize_socios(main_db, progress, self.display)
+
         if self.run_build:
             _build_final_table(main_db, progress, self.period, self.display)
 
@@ -284,16 +292,19 @@ class ImportPipeline:
             logger.info("Grupo %s: %d arquivo(s), %d pendente(s)", group, len(group_files), len(pending))
 
             if group == "socios" and group_files and len(pending) == len(group_files):
-                # socios nao tem staging+swap (cada Socios<N>.zip cobre uma
-                # faixa disjunta de cnpj_basico, nao tem o que dar merge entre
-                # arquivos) -- zera uma vez no inicio de um run NOVO (nenhum
-                # arquivo do grupo ainda marcado em ImportLog), senao um
-                # reimport mensal ficaria empilhando linha repetida. Numa
-                # RETOMADA nao zera, senao perderia os arquivos ja concluidos.
-                # RESTART IDENTITY pro `id` (Integer) nao acumular import a
-                # import -- sem isso a sequence seguiria subindo e um dia
-                # estouraria os 2,1 bilhoes.
-                db.execute(text("TRUNCATE socios RESTART IDENTITY"))
+                # socios nao tem merge entre arquivos (cada Socios<N>.zip
+                # cobre uma faixa disjunta de cnpj_basico) -- so carregar. Mas
+                # carrega numa tabela-SOMBRA (socios_new), nao na `socios` ao
+                # vivo: truncar a tabela viva deixaria /socios/* respondendo
+                # vazio pelos minutos que o import leva, e cada INSERT direto
+                # nela pagaria WAL linha a linha (ela e LOGGED, a API depende
+                # de durabilidade). socios_new e UNLOGGED ate o swap no fim
+                # (ver _finalize_socios) -- mesmo padrao de establishments_new.
+                #
+                # So cria a sombra numa run NOVA (nenhum arquivo do grupo
+                # ainda marcado em ImportLog); numa RETOMADA, socios_new ja
+                # existe com o que foi carregado antes de parar.
+                _create_socios_shadow(db)
                 db.commit()
 
             for file in pending:
@@ -756,10 +767,78 @@ DEFERRED_INDEXES = [
     ("ix_establishments_cep", "(cep)", "cep IS NOT NULL", None),
 ]
 
+SOCIOS_DEFERRED_INDEXES = [
+    ("ix_socios_cnpj_basico", "(cnpj_basico)", None),
+    ("ix_socios_cpf_cnpj_socio", "(cpf_cnpj_socio)", "cpf_cnpj_socio IS NOT NULL"),
+]
+
+
+def _create_socios_shadow(db: Session) -> None:
+    """Cria `socios_new` -- UNLOGGED, sem indices secundarios (adiados pro
+    fim, ver `_finalize_socios`) -- pra receber o INSERT direto de cada
+    Socios<N>.zip (ver GROUP_SPECS['socios'].table)."""
+    db.execute(text("DROP TABLE IF EXISTS socios_new"))
+    db.execute(text("CREATE UNLOGGED TABLE socios_new (LIKE socios INCLUDING DEFAULTS)"))
+    # LIKE...INCLUDING DEFAULTS copia o DEFAULT nextval(...) literal -- ficaria
+    # preso a sequence da tabela ANTIGA, e o DROP TABLE socios_old do swap
+    # (que apaga a sequence dona de socios_old.id) quebraria o default de
+    # socios_new. Sequence propria antes de qualquer INSERT usar o default.
+    db.execute(text("CREATE SEQUENCE IF NOT EXISTS socios_new_id_seq OWNED BY socios_new.id"))
+    db.execute(text("ALTER TABLE socios_new ALTER COLUMN id SET DEFAULT nextval('socios_new_id_seq')"))
+    db.execute(text("ALTER TABLE socios_new ADD CONSTRAINT socios_new_pkey PRIMARY KEY (id)"))
+
+
+def _finalize_socios(db: Session, progress: Session, display: ProgressDisplay) -> None:
+    """Indices + SET LOGGED + swap atomico de socios_new -> socios.
+
+    No-op se `socios_new` nao existir -- acontece quando o grupo "socios" nao
+    fez parte deste run (`--only` sem "socios").
+    """
+    slot = STEPS.index("import")
+    if db.execute(text("SELECT to_regclass('socios_new')")).scalar() is None:
+        return
+
+    _set_step(progress, "build", group="build", status="running", message="índices de socios")
+    for name, cols, where in SOCIOS_DEFERRED_INDEXES:
+        display.set(slot, f"  build: criando índice {name}")
+        where_sql = f" WHERE {where}" if where else ""
+        db.execute(text(f'CREATE INDEX "{name}_new" ON socios_new {cols}{where_sql}'))
+        db.commit()
+
+    # Mesmo motivo do establishments_new: grava a tabela inteira no WAL de uma
+    # vez, em vez de a cada linha/indice durante o bulk load.
+    _set_step(progress, "build", group="build", status="running", message="tornando socios durável (SET LOGGED)")
+    display.set(slot, "  build: SET LOGGED em socios_new")
+    db.execute(text("ALTER TABLE socios_new SET LOGGED"))
+    db.commit()
+
+    display.set(slot, "  build: swap atômico de socios")
+    db.execute(text("ALTER TABLE socios RENAME TO socios_old"))
+    db.execute(text("ALTER TABLE socios_new RENAME TO socios"))
+    # So depois de dropar a tabela antiga (e a sequence dona de socios_old.id
+    # junto) pra liberar os nomes canonicos sem colisao.
+    db.execute(text("DROP TABLE socios_old"))
+    for name, _cols, _where in SOCIOS_DEFERRED_INDEXES:
+        db.execute(text(f'ALTER INDEX "{name}_new" RENAME TO "{name}"'))
+    db.execute(text("ALTER INDEX socios_new_pkey RENAME TO socios_pkey"))
+    db.execute(text("ALTER SEQUENCE socios_new_id_seq RENAME TO socios_id_seq"))
+    db.commit()
+
+    _set_step(progress, "build", group="build", status="success", message="socios trocado atomicamente")
+
 
 def _build_final_table(db: Session, progress: Session, period: str, display: ProgressDisplay) -> None:
     slot = STEPS.index("import")
     _set_step(progress, "build", period=period, group="build", status="running", message="montando establishments")
+
+    # So nesta sessao, nao global -- o default do Postgres (4MB/64MB) e feito
+    # pra muitas conexoes pequenas concorrentes (a API), nao pro hash join de
+    # varias tabelas de dezenas de milhoes de linhas nem pro CREATE INDEX dos
+    # indices adiados que rodam logo abaixo. Sem isso, cada um dos ate 3 hash
+    # joins grandes do INSERT corre risco de derramar em disco (temp files),
+    # que e ordens de magnitude mais lento que ficar em RAM.
+    db.execute(text(f"SET work_mem = '{settings.build_work_mem_mb}MB'"))
+    db.execute(text(f"SET maintenance_work_mem = '{settings.build_maintenance_work_mem_mb}MB'"))
 
     db.execute(text("DROP TABLE IF EXISTS establishments_new"))
     # UNLOGGED aqui, LOGGED soh antes do swap (ver mais abaixo): o INSERT de

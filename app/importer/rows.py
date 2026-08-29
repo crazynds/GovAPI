@@ -300,10 +300,12 @@ GROUP_SPECS: dict[str, GroupSpec] = {
             "qualificacao_socio", "data_entrada_sociedade", "pais", "representante_legal",
             "nome_representante", "qualificacao_representante_legal", "faixa_etaria",
         ],
-        table="socios",
+        # `socios_new`, nao `socios`: carrega numa tabela-sombra que so vira
+        # `socios` no fim de todo o grupo, via swap atomico -- ver
+        # app.importer.pipeline._create_socios_shadow/_finalize_socios.
+        table="socios_new",
         # Sem chave natural: cada Socios<N>.zip cobre uma faixa disjunta de
-        # cnpj_basico, nao tem o que dar merge entre arquivos (a tabela e zerada
-        # no inicio do grupo, ver run_import).
+        # cnpj_basico, nao tem o que dar merge entre arquivos.
         columns=[
             "cnpj_basico", "cpf_cnpj_socio", "representante_legal", "data_entrada_sociedade",
             "identificador_socio", "qualificacao_socio", "qualificacao_representante_legal",
