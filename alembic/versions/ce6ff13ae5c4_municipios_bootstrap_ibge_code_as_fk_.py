@@ -17,6 +17,17 @@ nome sem correspondência exata entre as duas fontes.
 `import_all_run.municipios`: nova fase 1/6 de `import-all` (o bootstrap tem
 que rodar antes de CEPs e CNPJ).
 
+A FK entra como NOT VALID: migrations rodam sozinhas no boot do container,
+antes de qualquer `import-*` manual, então num banco que já tinha
+`correios_cep` populado por um `import-ceps` anterior (schema antigo, sem
+esta FK), `municipios` ainda está vazia ou incompleta no exato momento em
+que esta migration roda -- validar a FK contra as linhas existentes falharia
+na hora (visto na prática: ForeignKeyViolation logo na ADD CONSTRAINT).
+NOT VALID cria a constraint sem revisar quem já está lá, e passa a valer só
+daí pra frente -- as linhas antigas se corrigem sozinhas no próximo
+`import-ceps` (o upsert já filtra `municipio_cod_ibge` órfão, ver
+app.ceps.upsert_from), que é o próximo passo depois desta migration mesmo.
+
 Revision ID: ce6ff13ae5c4
 Revises: f2b5d9f51a11
 Create Date: 2026-08-29 02:15:27.326160
@@ -59,10 +70,14 @@ def upgrade() -> None:
                postgresql_using='ibge_code::integer')
     op.drop_index('ix_municipios_ibge_code', table_name='municipios')
     op.create_index(op.f('ix_municipios_ibge_code'), 'municipios', ['ibge_code'], unique=True)
-    op.create_foreign_key(
-        'correios_cep_municipio_cod_ibge_fkey', 'correios_cep', 'municipios',
-        ['municipio_cod_ibge'], ['ibge_code'],
-    )
+    # NOT VALID (ver docstring do modulo) -- op.create_foreign_key nao expoe
+    # essa opcao, entao SQL direto.
+    op.execute("""
+        ALTER TABLE correios_cep
+        ADD CONSTRAINT correios_cep_municipio_cod_ibge_fkey
+        FOREIGN KEY (municipio_cod_ibge) REFERENCES municipios (ibge_code)
+        NOT VALID
+    """)
 
 
 def downgrade() -> None:
