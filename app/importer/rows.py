@@ -120,6 +120,16 @@ def _documento(identificador: str | None, raw: str | None) -> int | None:
     A Receita entrega o CPF mascarado por LGPD (`***123456**`): so os 6 digitos
     do meio existem, e e isso que fica guardado. PJ/estrangeiro vem com o CNPJ
     completo, que vai em base 36 como qualquer outro CNPJ nosso.
+
+    Pra socio PJ o valor guardado *tem* que ser base 36, porque a saida
+    (`routers/socios._documento`) decodifica em base 36 sempre que
+    `identificador_socio == 1`. Entao aqui a decisao e pelo identificador, e
+    nao pelo tamanho: parte dos registros vem so com a raiz de 8 posicoes
+    (`cnpj_codec.parse` completa com a ordem da matriz, 0001), e quando eles
+    caiam no `int(cleaned)` decimal a API devolvia um documento inventado --
+    e o registro ficava inalcancavel por `?documento=`. O que nem assim da um
+    CNPJ valido vira NULL: qualquer inteiro fora da base 36 sairia corrompido
+    na leitura de qualquer forma.
     """
     if not raw:
         return None
@@ -128,7 +138,7 @@ def _documento(identificador: str | None, raw: str | None) -> int | None:
     if not cleaned:
         return None
 
-    if (identificador or "").strip() == "1" and len(cleaned) in (cnpj_codec.BODY_LEN, cnpj_codec.BODY_LEN + 2):
+    if (identificador or "").strip() == "1":
         try:
             return cnpj_codec.parse(cleaned)
         except ValueError:

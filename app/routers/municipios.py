@@ -58,11 +58,33 @@ def search(
     return [_serialize(m) for m in results]
 
 
-@router.get("/by-code/{receita_code}")
-def by_code(receita_code: str, db: Session = Depends(get_db)):
-    if not receita_code.strip().isdigit():
-        raise HTTPException(422, f"Código de município inválido: {receita_code!r}")
-    m = db.query(Municipio).filter(Municipio.receita_code == int(receita_code)).first()
+@router.get("/by-code/{code}")
+def by_code(code: str, db: Session = Depends(get_db)):
+    """Municipio por codigo da Receita (4 digitos) ou do IBGE (7).
+
+    As duas larguras nao colidem, e as duas colunas sao unique e indexadas,
+    entao qual delas consultar sai do proprio tamanho do codigo -- sem
+    parametro extra. Aceitar so o da Receita era uma armadilha: o codigo IBGE
+    e o que aparece em todo lugar (inclusive no `municipio_cod_ibge` dos
+    enderecos daqui), e `4106902` dava 404 em silencio.
+    """
+    cleaned = code.strip()
+    if not cleaned.isdigit():
+        raise HTTPException(422, f"Código de município inválido: {code!r}")
+
+    value = int(cleaned)
+    if len(cleaned) <= RECEITA_CODE_WIDTH:
+        column = Municipio.receita_code
+    elif len(cleaned) == IBGE_CODE_WIDTH:
+        column = Municipio.ibge_code
+    else:
+        raise HTTPException(
+            422,
+            f"Código de município deve ter {RECEITA_CODE_WIDTH} dígitos (Receita) "
+            f"ou {IBGE_CODE_WIDTH} (IBGE), veio {len(cleaned)}: {code!r}",
+        )
+
+    m = db.query(Municipio).filter(column == value).first()
     if not m:
         raise HTTPException(404, "Município não encontrado")
     return _serialize(m)

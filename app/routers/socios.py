@@ -64,7 +64,13 @@ def _documento(socio: Socio) -> str | None:
     if socio.cpf_cnpj_socio is None:
         return None
     if socio.identificador_socio == 1:
-        return cnpj_codec.full(socio.cpf_cnpj_socio)
+        try:
+            return cnpj_codec.full(socio.cpf_cnpj_socio)
+        except ValueError:
+            # Fora da faixa da base 36: o valor nao foi gravado pelo codec (dado
+            # legado do import antigo). Melhor nao devolver nada do que devolver
+            # um CNPJ inventado.
+            return None
     return f"***{socio.cpf_cnpj_socio:06d}**"
 
 
@@ -141,8 +147,11 @@ def _parse_documento(raw: str) -> int:
     if not cleaned:
         raise HTTPException(422, f"Documento inválido: {raw!r}")
     if cleaned.isdigit():
-        # CPF mascarado (6 dígitos) ou CPF/CNPJ inteiro em dígitos.
-        if len(cleaned) in (cnpj_codec.BODY_LEN, cnpj_codec.BODY_LEN + 2):
+        # CPF mascarado (6 dígitos) ou CPF/CNPJ inteiro em dígitos. A raiz de 8
+        # posições também é base 36 aqui: é assim que o import guarda o sócio PJ
+        # que vem só com a raiz, e sem isso esses registros eram impossíveis de
+        # achar por documento.
+        if len(cleaned) in (cnpj_codec.BASICO_LEN, cnpj_codec.BODY_LEN, cnpj_codec.BODY_LEN + 2):
             return cnpj_codec.parse(cleaned)
         return int(cleaned)
     try:
