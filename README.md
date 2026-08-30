@@ -373,6 +373,23 @@ The one exception is `/enderecos`: passing `lat`+`lon` (and `/enderecos/proximos
 distance, because "nearest first" is the entire point of those. They pay for it, so use them
 only when you want proximity.
 
+### Precomputed stats
+
+`/establishments/stats` reads `establishments_stats`, an aggregate table keyed by state,
+registration status, company size, main CNAE and the MEI/Simples/headquarters flags, with the
+counts as measures. Summing a few million aggregate rows replaces counting 70M+ detail rows.
+
+This works because `establishments` is rebuilt wholesale by the import and never written to
+while it's being served: there is nothing to invalidate. The import builds the aggregate from
+the same snapshot and swaps it in the same atomic `RENAME`, so the two tables can never
+disagree — there's no moment where `/stats` answers about one snapshot and `/establishments`
+about another.
+
+The aggregate deliberately doesn't carry every filter. `cnae_codes` is the notable one: the
+search matches the main CNAE *or* a secondary one, and `secondary_cnaes` is an array —
+flattening it would count a company once per secondary CNAE and inflate every sum. Requests
+using an uncovered filter fall back to the full table rather than return a fast wrong number.
+
 ### Text search
 
 `?name=`, `?nome=`, `?logradouro=`, `?bairro=` and `?municipio=` are substring matches
@@ -390,7 +407,7 @@ arbitrary slice.
 |---|---|---|
 | `GET` | `/establishments` | Search companies. Filters: `cnae_codes` (+ `cnae_match=any\|all`), `uf`, `regiao`, `municipio_codes`, `company_size`, `is_mei`, `is_simples`, `is_headquarters`, `name`, `situacao` (registration status, code or label — includes all statuses unless filtered), `has_phone`, `only_with_cellphone`, `only_with_email`, `opened_after`/`opened_before`; paginated by cursor via `cursor`/`limit` (see [Pagination](#pagination)). Results include CNAE, legal-nature, and deregistration-reason descriptions, plus human-readable labels for company size and registration status. |
 | `GET` | `/establishments/by-cnpj` | Look up specific companies by CNPJ (`cnpjs=...`, repeatable). Accepts punctuation, a full CNPJ, or just the 8-position root. |
-| `GET` | `/establishments/stats` | Totals over the same filters as `/establishments`: how many match, how many have a mobile number, how many have an email — one pass over the data. The breakdowns by state/region/company size and top CNAE codes need `include_breakdowns=true`, and each one is a `GROUP BY` that scans every matching row, so a broad filter (a whole state) can take a long time or time out. Filtering by a single state gives you `by_uf`/`by_regiao` for free, without the breakdowns. |
+| `GET` | `/establishments/stats` | Totals and breakdowns over the same filters as `/establishments`. Answered from a precomputed aggregate table rebuilt by the import, so it doesn't scan the 70M-row table at request time. Filters the aggregate doesn't carry (`name`, `opened_after`/`opened_before`, `municipio_codes`, `cnae_codes`, `only_with_cellphone`/`only_with_email`, `has_phone`) fall back to the full table and can be slow — for those, `include_breakdowns=true` is what makes it expensive. |
 | `GET` | `/cnaes/search-by-description` | Search CNAE codes by description (`words=...`, repeatable). |
 | `GET` | `/cnaes/codes` | List all CNAE codes. |
 | `GET` | `/municipios/search` | Search municipalities by `name`, `uf`, and/or `regiao`. Includes `population` and `area_km2` once `import-ibge` has run. |

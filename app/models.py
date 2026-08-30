@@ -216,6 +216,53 @@ def _staging() -> dict:
     return {"prefixes": ["UNLOGGED"]}
 
 
+class EstablishmentStats(Base):
+    """Agregado pre-calculado de `establishments`, pra /establishments/stats.
+
+    Existe por uma propriedade especifica desta base: `establishments` e
+    reconstruida inteira a cada import e NUNCA escrita enquanto esta em uso.
+    Nao ha invalidacao a fazer, nem risco de o agregado divergir dos dados no
+    meio do dia -- ele e montado do mesmo snapshot, no mesmo build, e trocado
+    no mesmo RENAME atomico (ver _build_final_table).
+
+    O grao sao as dimensoes de baixa cardinalidade que /stats filtra e agrupa;
+    as medidas sao contagens, entao a resposta e `sum()` sobre este agregado em
+    vez de `count()` sobre 72M linhas. Reduz de ~72M pra ~1-3M linhas.
+
+    NAO cobre todo filtro do endpoint: `name` (ILIKE), `opened_at`,
+    `municipio_codes` e CNAE secundario ficam de fora -- os tres primeiros por
+    cardinalidade, o ultimo porque `secondary_cnaes` e array e desnormalizar
+    contaria a mesma empresa mais de uma vez. Pedido que use qualquer um deles
+    cai na tabela grande; quem decide e `_stats_from_rollup` no router.
+    """
+
+    __tablename__ = "establishments_stats"
+    __table_args__ = (
+        # A tabela e pequena o bastante pra varrer inteira, mas UF e o filtro
+        # mais comum de longe e corta 27x logo de cara.
+        Index("ix_establishments_stats_uf", "uf"),
+        Index("ix_establishments_stats_main_cnae", "main_cnae"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    # Dimensoes -- mesmos codigos numericos de `establishments`, todas
+    # nullable pelos mesmos motivos que la.
+    uf: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    situacao_cadastral: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    company_size: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    main_cnae: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    is_mei: Mapped[bool] = mapped_column(Boolean)
+    is_simples: Mapped[bool] = mapped_column(Boolean)
+    is_headquarters: Mapped[bool] = mapped_column(Boolean)
+
+    # Medidas.
+    total: Mapped[int] = mapped_column(BigInteger)
+    with_cellphone: Mapped[int] = mapped_column(BigInteger)
+    with_email: Mapped[int] = mapped_column(BigInteger)
+    with_phone: Mapped[int] = mapped_column(BigInteger)
+
+
 class EmpresaStaging(Base):
     """CNPJ basico alfanumerico a partir de 2026 (Receita), guardado em base 36
     -- ver app/cnpj.py."""

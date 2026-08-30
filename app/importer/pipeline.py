@@ -46,6 +46,7 @@ from app.db import SessionLocal
 from app.importer import client
 from app.importer import municipios as municipios_bootstrap
 from app.importer.csv_reader import read_csv
+from app import stats_rollup
 from app.importer.progress import ProgressDisplay, human_bytes, log_through
 from app.importer.rows import GROUP_SPECS, Counters
 from app.regions import CODE_TO_UF
@@ -1147,6 +1148,18 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
     db.execute(text("ALTER TABLE establishments_new SET LOGGED"))
     db.commit()
 
+    # Agregado de /establishments/stats, montado do MESMO snapshot e trocado no
+    # mesmo swap -- e isso que garante que ele nunca discorda da tabela. Uma
+    # varredura de establishments_new, aqui onde ela ainda esta quente.
+    _set_step(progress, "build", period=period, group="build", status="running", message="agregado de stats")
+    display.set(slot, "  build: agregado de stats")
+    db.execute(text(f"DROP TABLE IF EXISTS {stats_rollup.TABLE}_new"))
+    db.execute(text(stats_rollup.create_sql(f"{stats_rollup.TABLE}_new")))
+    db.execute(text(stats_rollup.build_sql(f"{stats_rollup.TABLE}_new", "establishments_new")))
+    for statement in stats_rollup.index_sql(f"{stats_rollup.TABLE}_new", "_new"):
+        db.execute(text(statement))
+    db.commit()
+
     display.set(slot, "  build: swap atômico")
     db.execute(text("ALTER TABLE establishments RENAME TO establishments_old"))
     db.execute(text("ALTER TABLE establishments_new RENAME TO establishments"))
@@ -1156,6 +1169,18 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
     for name, _cols, _where, _using in DEFERRED_INDEXES:
         db.execute(text(f'ALTER INDEX "{name}_new" RENAME TO "{name}"'))
     db.execute(text("ALTER INDEX establishments_new_pkey RENAME TO establishments_pkey"))
+
+    # O agregado entra no mesmo RENAME: as duas tabelas viram visiveis juntas,
+    # entao nao existe instante em que /stats responda sobre um snapshot e
+    # /establishments sobre outro.
+    db.execute(text(f"DROP TABLE IF EXISTS {stats_rollup.TABLE}_old"))
+    db.execute(text(f"ALTER TABLE IF EXISTS {stats_rollup.TABLE} RENAME TO {stats_rollup.TABLE}_old"))
+    db.execute(text(f"ALTER TABLE {stats_rollup.TABLE}_new RENAME TO {stats_rollup.TABLE}"))
+    db.execute(text(f"DROP TABLE IF EXISTS {stats_rollup.TABLE}_old"))
+    for name, _cols in stats_rollup.INDEXES:
+        db.execute(text(f'ALTER INDEX "{name}_new" RENAME TO "{name}"'))
+    db.execute(text(f"ALTER INDEX {stats_rollup.TABLE}_new_pkey RENAME TO {stats_rollup.TABLE}_pkey"))
+
     db.execute(text("TRUNCATE TABLE empresas_staging, simples_staging, estabelecimentos_staging"))
     db.execute(text("DELETE FROM import_log WHERE period = :period"), {"period": period})
     db.commit()
@@ -1168,6 +1193,7 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
     display.set(slot, "  build: ANALYZE na tabela final")
     _set_step(progress, "build", period=period, group="build", status="running", message="ANALYZE establishments")
     db.execute(text("ANALYZE establishments"))
+    db.execute(text(f"ANALYZE {stats_rollup.TABLE}"))
     db.commit()
 
     display.set(slot, "")

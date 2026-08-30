@@ -17,7 +17,7 @@ from sqlalchemy import text
 from app import ceps as ceps_codec
 from app import cnpj as cnpj_codec
 from app.db import get_db
-from app.models import Cnae, Establishment, Motivo, Municipio, NaturezaJuridica
+from app.models import Cnae, Establishment, EstablishmentStats as S, Motivo, Municipio, NaturezaJuridica
 from app.regions import UF_TO_REGIAO, uf_code, uf_name, ufs_for_regiao
 from app.pagination import SortKey, make_fingerprint, paginate
 from app.schemas import AddressOut, EstablishmentOut, EstablishmentPage, EstablishmentStatsOut
@@ -411,6 +411,39 @@ def by_cnpjs(
     return _serialize_many(db, query.all())
 
 
+def _rollup_query(
+    db: Session,
+    *,
+    uf_codes: list[int],
+    company_size: list[str] | None,
+    situacao: list[str] | None,
+    is_mei: bool | None,
+    is_simples: bool | None,
+    is_headquarters: bool | None,
+):
+    """Os filtros de /stats aplicados ao agregado (models.EstablishmentStats).
+
+    So os filtros que o agregado carrega chegam aqui -- quem decide se e o caso
+    de usar este caminho e `uncovered`, no proprio endpoint.
+    """
+    query = db.query(S)
+
+    if uf_codes:
+        query = query.filter(S.uf.in_(uf_codes))
+    if company_size:
+        query = query.filter(S.company_size.in_([int(c) for c in company_size if str(c).strip().isdigit()]))
+    if situacao:
+        query = query.filter(S.situacao_cadastral.in_(_resolve_situacao_codes(situacao)))
+    if is_mei is not None:
+        query = query.filter(S.is_mei.is_(is_mei))
+    if is_simples is not None:
+        query = query.filter(S.is_simples.is_(is_simples))
+    if is_headquarters is not None:
+        query = query.filter(S.is_headquarters.is_(is_headquarters))
+
+    return query
+
+
 @router.get("/stats", response_model=EstablishmentStatsOut)
 def stats(
     cnae_codes: list[str] | None = Query(None),
@@ -471,47 +504,82 @@ def stats(
         resolved_ufs |= set(ufs_for_regiao(regiao))
     uf_codes = [uf_code(u) for u in sorted(resolved_ufs)]
 
-    # Uma passada em vez de tres. `total`, `with_cellphone` e `with_email` eram
-    # tres count() separados sobre o mesmo conjunto -- tres varreduras
-    # identicas. FILTER faz os tres contadores numa leitura so.
-    total, with_cellphone, with_email = base.with_entities(
-        func.count(),
-        func.count().filter(Establishment.cellphone.isnot(None)),
-        func.count().filter(Establishment.email.isnot(None)),
-    ).one()
+    # Filtros que o agregado nao carrega -- ver models.EstablishmentStats. Com
+    # qualquer um deles a pergunta so tem resposta na tabela grande.
+    #
+    # `cnae_codes` entra aqui, e nao e obvio: o agregado TEM `main_cnae`, mas o
+    # filtro do endpoint casa CNAE principal OU secundario, e `secondary_cnaes`
+    # e um array -- desnormalizar contaria a mesma empresa uma vez por CNAE
+    # secundario e as somas sairiam infladas. Melhor cair na tabela grande do
+    # que devolver numero errado rapido.
+    #
+    # `only_with_cellphone`/`only_with_email` tambem entram, por um motivo mais
+    # sutil: eles restringem a POPULACAO, e ai `with_email` passa a significar
+    # "tem celular E email" -- um cruzamento que o agregado nao guarda (ele tem
+    # as duas contagens por balde, nao a intersecao delas). Somar do jeito
+    # errado daria um numero plausivel e falso, que e o pior resultado
+    # possivel. Os dois sao `false` por padrao aqui, entao o caminho rapido
+    # continua valendo pro uso normal.
+    uncovered = (
+        cnae_codes or name or municipio_codes
+        or opened_after or opened_before or has_phone is not None
+        or only_with_cellphone or only_with_email
+    )
+
+    if uncovered:
+        total, with_cellphone, with_email = base.with_entities(
+            func.count(),
+            func.count().filter(Establishment.cellphone.isnot(None)),
+            func.count().filter(Establishment.email.isnot(None)),
+        ).one()
+        rows_source = None
+    else:
+        # Caminho rapido: soma o agregado em vez de contar `establishments`.
+        rollup = _rollup_query(
+            db, uf_codes=uf_codes, company_size=company_size, situacao=situacao,
+            is_mei=is_mei, is_simples=is_simples, is_headquarters=is_headquarters,
+        )
+        total, with_cellphone, with_email = rollup.with_entities(
+            func.coalesce(func.sum(S.total), 0),
+            func.coalesce(func.sum(S.with_cellphone), 0),
+            func.coalesce(func.sum(S.with_email), 0),
+        ).one()
+        rows_source = rollup
 
     by_uf_rows: list = []
     by_company_size_rows: list = []
     by_main_cnae_rows: list = []
 
-    if uf_codes and not include_breakdowns:
-        # Filtrando por UF, `GROUP BY uf` so pode devolver essas UFs -- e a
-        # soma delas ja e o `total`. Com uma unica UF a resposta e exata sem
-        # consultar nada; com varias nao da pra dividir o total entre elas, e
-        # ai a distribuicao exige `include_breakdowns`.
-        if len(uf_codes) == 1:
-            by_uf_rows = [(uf_codes[0], total)]
-
-    if include_breakdowns:
-        # Cada um destes varre todas as linhas que passam no filtro. Sem
-        # ORDER BY no SQL: ordenar e trabalho pras poucas linhas agregadas,
-        # feito em Python logo abaixo, nao pro banco.
-        by_uf_rows = (
-            base.with_entities(Establishment.uf, func.count().label("total"))
-            .group_by(Establishment.uf)
-            .all()
-        )
+    if include_breakdowns and rows_source is not None:
+        # Sobre o agregado (~1-3M linhas em vez de 72M), entao deixa de ser
+        # opcional na pratica -- mas o parametro fica, porque com filtro nao
+        # coberto o caminho abaixo ainda e caro.
+        by_uf_rows = rows_source.with_entities(S.uf, func.sum(S.total)).group_by(S.uf).all()
         by_company_size_rows = (
-            base.with_entities(Establishment.company_size, func.count().label("total"))
-            .group_by(Establishment.company_size)
-            .all()
+            rows_source.with_entities(S.company_size, func.sum(S.total))
+            .group_by(S.company_size).all()
         )
         by_main_cnae_rows = (
-            base.with_entities(Establishment.main_cnae, func.count().label("total"))
-            .filter(Establishment.main_cnae.isnot(None))
-            .group_by(Establishment.main_cnae)
-            .all()
+            rows_source.with_entities(S.main_cnae, func.sum(S.total))
+            .filter(S.main_cnae.isnot(None)).group_by(S.main_cnae).all()
         )
+    elif include_breakdowns:
+        # Filtro nao coberto: GROUP BY na tabela grande, uma varredura cada.
+        # Sem ORDER BY no SQL -- ordenar e trabalho pras poucas linhas
+        # agregadas, feito em Python logo abaixo.
+        by_uf_rows = base.with_entities(Establishment.uf, func.count()).group_by(Establishment.uf).all()
+        by_company_size_rows = (
+            base.with_entities(Establishment.company_size, func.count())
+            .group_by(Establishment.company_size).all()
+        )
+        by_main_cnae_rows = (
+            base.with_entities(Establishment.main_cnae, func.count())
+            .filter(Establishment.main_cnae.isnot(None))
+            .group_by(Establishment.main_cnae).all()
+        )
+    elif len(uf_codes) == 1:
+        # Filtrando por uma UF so, `by_uf` e o proprio total -- sem consulta.
+        by_uf_rows = [(uf_codes[0], total)]
 
     # A ordenacao por contagem acontece aqui, sobre dezenas/centenas de linhas
     # ja agregadas -- de graca, e sem pedir sort nenhum ao banco.
