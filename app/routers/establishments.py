@@ -329,7 +329,13 @@ def search(
     has_phone: bool | None = Query(None, description="Filtra por ter (true) ou não ter (false) telefone fixo"),
     opened_after: date | None = Query(None, description="Data de abertura >= (YYYY-MM-DD)"),
     opened_before: date | None = Query(None, description="Data de abertura <= (YYYY-MM-DD)"),
-    sort_by: str = Query("cellphone_confidence", pattern="^(cellphone_confidence|opened_at|company_name)$"),
+    sort_by: str | None = Query(
+        None,
+        pattern="^(cellphone_confidence|opened_at|company_name)$",
+        description="Ordena por esta coluna. Omitido (o default), a busca só filtra e sai na "
+                    "ordem da chave primária -- muito mais barato: ordenar por qualquer outra "
+                    "coluna obriga o banco a ordenar o resultado inteiro antes de cortar a página.",
+    ),
     sort_dir: str = Query("desc", pattern="^(asc|desc)$"),
     cursor: str | None = Query(
         None,
@@ -363,15 +369,23 @@ def search(
         opened_before=opened_before,
     )
 
-    # `cnpj` (a PK) fecha a ordenacao pra ela ficar total -- sem desempate,
-    # duas linhas com o mesmo `cellphone_confidence` trocariam de lugar entre
-    # uma pagina e a proxima, e a da virada apareceria duas vezes ou nenhuma.
-    sort_column = getattr(Establishment, sort_by)
+    # Sem `sort_by`, ordena SO pela PK. Isso nao e detalhe de implementacao: e
+    # a diferenca entre a query varrer o indice ate juntar a pagina e ordenar o
+    # resultado inteiro antes de cortar. Ordenar por `cellphone_confidence`
+    # (o default antigo deste endpoint) obrigava o segundo caminho, e era o que
+    # levava `?uf=PR` a timeout mesmo com `limit=1`: pra saber quem tem a maior
+    # confianca, o banco precisa olhar todas as linhas de PR.
+    #
+    # A PK sozinha ja e uma ordem TOTAL, entao serve de cursor sem desempate
+    # extra. Com `sort_by`, o `cnpj` entra depois como desempate -- sem ele,
+    # linhas com o mesmo valor trocariam de lugar entre uma pagina e a proxima
+    # e a da virada apareceria duas vezes ou nenhuma.
     descending = sort_dir == "desc"
-    keys = [
-        SortKey(sort_column, sort_by, desc=descending, nullable=sort_by == "opened_at"),
-        SortKey(Establishment.cnpj, "cnpj", desc=descending, nullable=False),
-    ]
+    keys = [SortKey(Establishment.cnpj, "cnpj", desc=descending, nullable=False)]
+    if sort_by:
+        sort_column = getattr(Establishment, sort_by)
+        keys.insert(0, SortKey(sort_column, sort_by, desc=descending,
+                               nullable=sort_by == "opened_at"))
 
     items, next_cursor = paginate(
         query, keys, cursor, limit,

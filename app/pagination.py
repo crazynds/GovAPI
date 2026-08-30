@@ -17,11 +17,18 @@ existe mais numero total de paginas nem salto pra uma pagina arbitraria -- so
 Keyset exige uma ordem TOTAL: se duas linhas empatam na coluna de ordenacao, a
 posicao relativa delas entre uma pagina e a proxima nao e garantida, e a linha
 do empate ou se repete ou some. Por isso toda ordenacao aqui termina na chave
-primaria como desempate -- `cellphone_confidence DESC, cnpj DESC` e nao so
-`cellphone_confidence DESC`.
+primaria como desempate.
 
-NULL entra como NULLS LAST em qualquer direcao (o default do Postgres pra ASC,
-mas nao pra DESC -- por isso e sempre explicito nos ORDER BY montados aqui).
+Mas "precisa de uma ordem" nao quer dizer "pode ser qualquer ordem". Ordenar
+pela PK sozinha e de graca: o indice ja existe e a pagina sai de uma faixa
+continua dele. Ordenar por outra coluna obriga o banco a ordenar o resultado
+filtrado INTEIRO antes de cortar a pagina -- pra saber quem tem o maior
+`cellphone_confidence` em PR, ele precisa olhar todas as linhas de PR, e ai
+nem o `LIMIT 1` salva. Por isso /establishments so ordena por outra coluna
+quando o cliente pede `sort_by` explicitamente.
+
+NULLS LAST e explicito, mas SO em coluna nullable -- ver `order_by_clause`,
+onde essa distincao decide se o indice e usado ou nao.
 """
 
 from __future__ import annotations
@@ -178,13 +185,25 @@ class SortKey:
 
 
 def order_by_clause(keys: list[SortKey]) -> list:
-    """ORDER BY com NULLS LAST explicito nas duas direcoes.
+    """ORDER BY com NULLS LAST explicito -- mas SO em coluna que aceita NULL.
 
     Explicito porque o default do Postgres e assimetrico (NULLS LAST em ASC,
-    NULLS FIRST em DESC) -- e o predicado de keyset abaixo assume NULLS LAST
-    sempre. Divergir aqui repetiria ou pularia linhas na virada da pagina.
+    NULLS FIRST em DESC), e o predicado de keyset abaixo assume NULLS LAST
+    sempre; divergir aqui repetiria ou pularia linhas na virada da pagina.
+
+    A ressalva do `nullable` e o que faz o indice ser usado. A mesma
+    assimetria vale pra DEFINICAO do indice: `(col DESC)` e NULLS FIRST. O
+    planner compara a ordenacao pedida com a do indice incluindo esse flag,
+    entao pedir `col DESC NULLS LAST` contra um indice `(col DESC)` nao casa --
+    ele descarta o indice e ordena o resultado inteiro na mao. Numa coluna NOT
+    NULL a distincao nao muda resultado nenhum, so impede o match, entao aqui
+    ela nao e emitida.
     """
-    return [k.column.desc().nullslast() if k.desc else k.column.asc().nullslast() for k in keys]
+    clauses = []
+    for k in keys:
+        column = k.column.desc() if k.desc else k.column.asc()
+        clauses.append(column.nullslast() if k.nullable else column)
+    return clauses
 
 
 def keyset_filter(keys: list[SortKey], values: tuple[Any, ...]):
@@ -264,8 +283,13 @@ class SqlSortKey:
 
 
 def order_by_sql(keys: list[SqlSortKey]) -> str:
-    direction = lambda k: "DESC" if k.desc else "ASC"  # noqa: E731
-    return ", ".join(f"{k.expr} {direction(k)} NULLS LAST" for k in keys)
+    """Mesma regra de `order_by_clause`: NULLS LAST so onde a coluna aceita
+    NULL, senao o flag impede o match com o indice."""
+    parts = []
+    for k in keys:
+        direction = "DESC" if k.desc else "ASC"
+        parts.append(f"{k.expr} {direction} NULLS LAST" if k.nullable else f"{k.expr} {direction}")
+    return ", ".join(parts)
 
 
 def keyset_sql(keys: list[SqlSortKey], values: tuple[Any, ...], params: dict) -> str | None:

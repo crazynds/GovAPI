@@ -833,7 +833,10 @@ DEFERRED_INDEXES = [
     ("ix_establishments_uf_confidence", "(uf, cellphone_confidence DESC, cnpj DESC)", None, None),
     # Mesma ordenacao pras buscas sem filtro de UF.
     ("ix_establishments_confidence", "(cellphone_confidence DESC, cnpj DESC)", None, None),
-    ("ix_establishments_opened_at", "(opened_at DESC, cnpj DESC)", None, None),
+    # NULLS LAST explicito: `opened_at` e nullable, entao o ORDER BY da API
+    # pede NULLS LAST, e `DESC` sozinho no indice seria NULLS FIRST -- o
+    # planner compara esse flag e descarta o indice se ele nao casar.
+    ("ix_establishments_opened_at", "(opened_at DESC NULLS LAST, cnpj DESC)", None, None),
     ("ix_establishments_main_cnae", "(main_cnae)", None, None),
     ("ix_establishments_secondary_cnaes", "(secondary_cnaes)", "secondary_cnaes IS NOT NULL", "gin"),
     ("ix_establishments_situacao_cadastral", "(situacao_cadastral)", None, None),

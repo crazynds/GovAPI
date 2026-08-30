@@ -132,7 +132,7 @@ class Establishment(Base):
         # e ordena por (coluna, PK) -- ver app/pagination.py.
         Index("ix_establishments_uf_confidence", "uf", text("cellphone_confidence DESC"), text("cnpj DESC")),
         Index("ix_establishments_confidence", text("cellphone_confidence DESC"), text("cnpj DESC")),
-        Index("ix_establishments_opened_at", text("opened_at DESC"), text("cnpj DESC")),
+        Index("ix_establishments_opened_at", text("opened_at DESC NULLS LAST"), text("cnpj DESC")),
         Index("ix_establishments_main_cnae", "main_cnae"),
         Index(
             "ix_establishments_secondary_cnaes",

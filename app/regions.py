@@ -30,3 +30,4 @@ def uf_name(code: int | None) -> str | None:
 
 def ufs_for_regiao(regiao: str) -> list[str] | None:
     return REGIOES.get(regiao.lower().strip())
+
