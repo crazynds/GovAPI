@@ -373,6 +373,13 @@ The one exception is `/enderecos`: passing `lat`+`lon` (and `/enderecos/proximos
 distance, because "nearest first" is the entire point of those. They pay for it, so use them
 only when you want proximity.
 
+### Text search
+
+`?name=`, `?nome=`, `?logradouro=`, `?bairro=` and `?municipio=` are substring matches
+(`ILIKE '%term%'`), backed by `pg_trgm` GIN indexes so they don't degenerate into a full scan.
+Trigrams need **at least 3 characters** to be useful — a one- or two-letter term can't use the
+index and falls back to scanning, so keep search terms reasonably long.
+
 Treat the cursor as opaque. Filters and sort must stay the same across a paginated run; a
 cursor used with different ones is rejected with `422` rather than silently returning an
 arbitrary slice.

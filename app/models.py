@@ -141,6 +141,13 @@ class Establishment(Base):
         ),
         Index("ix_establishments_situacao_cadastral", "situacao_cadastral"),
         Index("ix_establishments_cep", "cep", postgresql_where=text("cep IS NOT NULL")),
+        # `?name=` e ILIKE '%x%', que btree nenhum avalia -- so um GIN de
+        # trigramas serve. Sem isso a busca por nome varre a tabela inteira.
+        Index("ix_establishments_company_name_trgm", "company_name",
+              postgresql_using="gin", postgresql_ops={"company_name": "gin_trgm_ops"}),
+        Index("ix_establishments_trade_name_trgm", "trade_name",
+              postgresql_using="gin", postgresql_ops={"trade_name": "gin_trgm_ops"},
+              postgresql_where=text("trade_name IS NOT NULL")),
     )
     # fillfactor = 100 (sem UPDATE depois do bulk load, nao faz sentido
     # reservar espaco livre por pagina pra HOT update) e aplicado por SQL na
@@ -289,6 +296,9 @@ class Socio(Base):
     __table_args__ = (
         Index("ix_socios_cnpj_basico", "cnpj_basico"),
         Index("ix_socios_cpf_cnpj_socio", "cpf_cnpj_socio", postgresql_where=text("cpf_cnpj_socio IS NOT NULL")),
+        # `?nome=` e ILIKE '%x%' -- ver o comentario em Establishment.
+        Index("ix_socios_nome_socio_trgm", "nome_socio",
+              postgresql_using="gin", postgresql_ops={"nome_socio": "gin_trgm_ops"}),
     )
 
     # Integer e nao BigInteger: sao ~24M linhas, e o TRUNCATE do inicio do
@@ -332,6 +342,13 @@ class Cep(Base):
     """
 
     __tablename__ = "correios_cep"
+    __table_args__ = tuple(
+        # Os tres filtros de texto de /enderecos/buscar sao ILIKE '%x%'.
+        Index(f"ix_correios_cep_{col}_trgm", col,
+              postgresql_using="gin", postgresql_ops={col: "gin_trgm_ops"})
+        for col in ("logradouro", "bairro", "municipio")
+    )
+
     cep: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
     # NULL quando o e-DNE traz um codigo IBGE que nao existe na lista atual
     # (municipio historico/fundido/extinto) -- mesmo tratamento de CEP orfao

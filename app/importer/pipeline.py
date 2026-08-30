@@ -832,11 +832,20 @@ DEFERRED_INDEXES = [
     ("ix_establishments_secondary_cnaes", "(secondary_cnaes)", "secondary_cnaes IS NOT NULL", "gin"),
     ("ix_establishments_situacao_cadastral", "(situacao_cadastral)", None, None),
     ("ix_establishments_cep", "(cep)", "cep IS NOT NULL", None),
+    # Busca por nome (`?name=`) e `ILIKE '%x%'`, que um btree nao consegue
+    # avaliar de jeito nenhum -- e a unica estrutura que serve e um GIN de
+    # trigramas. Sem isso a busca por nome varre a tabela inteira.
+    # `trade_name` e nullable e a maioria das empresas nao tem, entao esse fica
+    # parcial; `company_name` e NOT NULL e nao tem o que podar.
+    ("ix_establishments_company_name_trgm", "(company_name gin_trgm_ops)", None, "gin"),
+    ("ix_establishments_trade_name_trgm", "(trade_name gin_trgm_ops)", "trade_name IS NOT NULL", "gin"),
 ]
 
 SOCIOS_DEFERRED_INDEXES = [
-    ("ix_socios_cnpj_basico", "(cnpj_basico)", None),
-    ("ix_socios_cpf_cnpj_socio", "(cpf_cnpj_socio)", "cpf_cnpj_socio IS NOT NULL"),
+    ("ix_socios_cnpj_basico", "(cnpj_basico)", None, None),
+    ("ix_socios_cpf_cnpj_socio", "(cpf_cnpj_socio)", "cpf_cnpj_socio IS NOT NULL", None),
+    # `?nome=` e ILIKE '%x%' -- ver o comentario em DEFERRED_INDEXES.
+    ("ix_socios_nome_socio_trgm", "(nome_socio gin_trgm_ops)", None, "gin"),
 ]
 
 
@@ -866,10 +875,11 @@ def _finalize_socios(db: Session, progress: Session, display: ProgressDisplay) -
         return
 
     _set_step(progress, "build", group="build", status="running", message="índices de socios")
-    for name, cols, where in SOCIOS_DEFERRED_INDEXES:
+    for name, cols, where, using in SOCIOS_DEFERRED_INDEXES:
         display.set(slot, f"  build: criando índice {name}")
+        using_sql = f" USING {using}" if using else ""
         where_sql = f" WHERE {where}" if where else ""
-        db.execute(text(f'CREATE INDEX "{name}_new" ON socios_new {cols}{where_sql}'))
+        db.execute(text(f'CREATE INDEX "{name}_new" ON socios_new{using_sql} {cols}{where_sql}'))
         db.commit()
 
     # Mesmo motivo do establishments_new: grava a tabela inteira no WAL de uma
@@ -885,7 +895,7 @@ def _finalize_socios(db: Session, progress: Session, display: ProgressDisplay) -
     # So depois de dropar a tabela antiga (e a sequence dona de socios_old.id
     # junto) pra liberar os nomes canonicos sem colisao.
     db.execute(text("DROP TABLE socios_old"))
-    for name, _cols, _where in SOCIOS_DEFERRED_INDEXES:
+    for name, _cols, _where, _using in SOCIOS_DEFERRED_INDEXES:
         db.execute(text(f'ALTER INDEX "{name}_new" RENAME TO "{name}"'))
     db.execute(text("ALTER INDEX socios_new_pkey RENAME TO socios_pkey"))
     db.execute(text("ALTER SEQUENCE socios_new_id_seq RENAME TO socios_id_seq"))
@@ -1116,6 +1126,11 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
             FOREIGN KEY (cep) REFERENCES correios_cep (cep)
         """))
         db.commit()
+
+    # Os indices de trigrama abaixo dependem dela. A migration ja cria, mas o
+    # import roda contra bancos que podem ter sido restaurados de dump.
+    db.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+    db.commit()
 
     for name, cols, where, using in DEFERRED_INDEXES:
         _set_step(progress, "build", period=period, group="build", status="running", message=f"índice {name}")
