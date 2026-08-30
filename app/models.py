@@ -261,6 +261,53 @@ class EstablishmentStats(Base):
     with_cellphone: Mapped[int] = mapped_column(BigInteger)
     with_email: Mapped[int] = mapped_column(BigInteger)
     with_phone: Mapped[int] = mapped_column(BigInteger)
+    # A intersecao, e nao e derivavel das outras duas. Sem ela,
+    # `only_with_cellphone=true` nao tem resposta: restringir a populacao faz
+    # `with_email` significar "tem os dois".
+    with_cellphone_and_email: Mapped[int] = mapped_column(BigInteger)
+
+
+class EstablishmentCnaeStats(Base):
+    """Agregado por CNAE, contando o codigo como principal OU secundario.
+
+    Existe separado de `EstablishmentStats` porque o filtro `?cnae_codes=` casa
+    os dois, e `secondary_cnaes` e um array: nao da pra ter CNAE principal e
+    secundario como uma dimensao so sem desnormalizar. Medido em producao --
+    CNAE 4781400 em PR: 240.771 como principal, 397.369 contando secundarios.
+    Ignorar o secundario subnotificaria 39,4%.
+
+    O grao e uma linha por (CNAE, dimensoes), com a empresa aparecendo em um
+    balde por CNAE distinto que ela tem. CONSEQUENCIA IMPORTANTE: os baldes NAO
+    podem ser somados entre CNAEs diferentes -- uma empresa com dois CNAEs esta
+    em dois baldes e seria contada duas vezes. Dentro de um unico `cnae` a soma
+    e exata, e e so assim que o router usa esta tabela (um codigo por consulta;
+    varios caem na tabela grande).
+
+    `main_cnae` nao e dimensao aqui de proposito: cruzar CNAE com CNAE
+    principal multiplicaria a cardinalidade por ~1300 sem uso claro.
+    """
+
+    __tablename__ = "establishments_cnae_stats"
+    __table_args__ = (
+        # CNAE na frente: e sempre igualdade, e e o que define a consulta.
+        Index("ix_establishments_cnae_stats_cnae_uf", "cnae", "uf"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    cnae: Mapped[int] = mapped_column(Integer)
+    uf: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    situacao_cadastral: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    company_size: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    is_mei: Mapped[bool] = mapped_column(Boolean)
+    is_simples: Mapped[bool] = mapped_column(Boolean)
+    is_headquarters: Mapped[bool] = mapped_column(Boolean)
+
+    total: Mapped[int] = mapped_column(BigInteger)
+    with_cellphone: Mapped[int] = mapped_column(BigInteger)
+    with_email: Mapped[int] = mapped_column(BigInteger)
+    with_phone: Mapped[int] = mapped_column(BigInteger)
+    with_cellphone_and_email: Mapped[int] = mapped_column(BigInteger)
 
 
 class EmpresaStaging(Base):

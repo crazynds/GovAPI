@@ -385,10 +385,16 @@ the same snapshot and swaps it in the same atomic `RENAME`, so the two tables ca
 disagree — there's no moment where `/stats` answers about one snapshot and `/establishments`
 about another.
 
-The aggregate deliberately doesn't carry every filter. `cnae_codes` is the notable one: the
-search matches the main CNAE *or* a secondary one, and `secondary_cnaes` is an array —
-flattening it would count a company once per secondary CNAE and inflate every sum. Requests
-using an uncovered filter fall back to the full table rather than return a fast wrong number.
+A second table, `establishments_cnae_stats`, answers CNAE filters. It's keyed by CNAE with the
+code counted as main *or* secondary, which matters more than it sounds: for CNAE 4781400 in
+Paraná, 240,771 companies have it as their main activity and 397,369 have it at all — ignoring
+secondary CNAEs would undercount by 39%. A company appears in one bucket per distinct CNAE it
+has, so buckets can't be summed *across* CNAEs; within a single CNAE the sum is exact, and
+that's the only way it's used — **one CNAE per request**. Several CNAEs at once fall back.
+
+Requests using a filter neither aggregate carries — `name`, `opened_after`/`opened_before`,
+`municipio_codes`, `has_phone`, several CNAEs, or a CNAE together with `include_breakdowns` —
+fall back to the full table rather than return a fast wrong number, and can be slow.
 
 ### Text search
 

@@ -1160,6 +1160,18 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
         db.execute(text(statement))
     db.commit()
 
+    # Segundo agregado, por CNAE principal-ou-secundario. Passada separada
+    # porque o LATERAL abre cada empresa em uma linha por CNAE -- nao da pra
+    # sair do mesmo GROUP BY do agregado acima.
+    _set_step(progress, "build", period=period, group="build", status="running", message="agregado de stats por CNAE")
+    display.set(slot, "  build: agregado de stats por CNAE")
+    db.execute(text(f"DROP TABLE IF EXISTS {stats_rollup.CNAE_TABLE}_new"))
+    db.execute(text(stats_rollup.cnae_create_sql(f"{stats_rollup.CNAE_TABLE}_new")))
+    db.execute(text(stats_rollup.cnae_build_sql(f"{stats_rollup.CNAE_TABLE}_new", "establishments_new")))
+    for statement in stats_rollup.cnae_index_sql(f"{stats_rollup.CNAE_TABLE}_new", "_new"):
+        db.execute(text(statement))
+    db.commit()
+
     display.set(slot, "  build: swap atômico")
     db.execute(text("ALTER TABLE establishments RENAME TO establishments_old"))
     db.execute(text("ALTER TABLE establishments_new RENAME TO establishments"))
@@ -1173,13 +1185,17 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
     # O agregado entra no mesmo RENAME: as duas tabelas viram visiveis juntas,
     # entao nao existe instante em que /stats responda sobre um snapshot e
     # /establishments sobre outro.
-    db.execute(text(f"DROP TABLE IF EXISTS {stats_rollup.TABLE}_old"))
-    db.execute(text(f"ALTER TABLE IF EXISTS {stats_rollup.TABLE} RENAME TO {stats_rollup.TABLE}_old"))
-    db.execute(text(f"ALTER TABLE {stats_rollup.TABLE}_new RENAME TO {stats_rollup.TABLE}"))
-    db.execute(text(f"DROP TABLE IF EXISTS {stats_rollup.TABLE}_old"))
-    for name, _cols in stats_rollup.INDEXES:
-        db.execute(text(f'ALTER INDEX "{name}_new" RENAME TO "{name}"'))
-    db.execute(text(f"ALTER INDEX {stats_rollup.TABLE}_new_pkey RENAME TO {stats_rollup.TABLE}_pkey"))
+    for table, indexes in (
+        (stats_rollup.TABLE, stats_rollup.INDEXES),
+        (stats_rollup.CNAE_TABLE, stats_rollup.CNAE_INDEXES),
+    ):
+        db.execute(text(f"DROP TABLE IF EXISTS {table}_old"))
+        db.execute(text(f"ALTER TABLE IF EXISTS {table} RENAME TO {table}_old"))
+        db.execute(text(f"ALTER TABLE {table}_new RENAME TO {table}"))
+        db.execute(text(f"DROP TABLE IF EXISTS {table}_old"))
+        for name, _cols in indexes:
+            db.execute(text(f'ALTER INDEX "{name}_new" RENAME TO "{name}"'))
+        db.execute(text(f"ALTER INDEX {table}_new_pkey RENAME TO {table}_pkey"))
 
     db.execute(text("TRUNCATE TABLE empresas_staging, simples_staging, estabelecimentos_staging"))
     db.execute(text("DELETE FROM import_log WHERE period = :period"), {"period": period})
@@ -1194,6 +1210,7 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
     _set_step(progress, "build", period=period, group="build", status="running", message="ANALYZE establishments")
     db.execute(text("ANALYZE establishments"))
     db.execute(text(f"ANALYZE {stats_rollup.TABLE}"))
+    db.execute(text(f"ANALYZE {stats_rollup.CNAE_TABLE}"))
     db.commit()
 
     display.set(slot, "")

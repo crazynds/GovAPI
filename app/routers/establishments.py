@@ -17,7 +17,15 @@ from sqlalchemy import text
 from app import ceps as ceps_codec
 from app import cnpj as cnpj_codec
 from app.db import get_db
-from app.models import Cnae, Establishment, EstablishmentStats as S, Motivo, Municipio, NaturezaJuridica
+from app.models import (
+    Cnae,
+    Establishment,
+    EstablishmentCnaeStats as C,
+    EstablishmentStats as S,
+    Motivo,
+    Municipio,
+    NaturezaJuridica,
+)
 from app.regions import UF_TO_REGIAO, uf_code, uf_name, ufs_for_regiao
 from app.pagination import SortKey, make_fingerprint, paginate
 from app.schemas import AddressOut, EstablishmentOut, EstablishmentPage, EstablishmentStatsOut
@@ -411,8 +419,32 @@ def by_cnpjs(
     return _serialize_many(db, query.all())
 
 
+def _measure_columns(model, only_with_cellphone: bool, only_with_email: bool):
+    """Quais medidas do agregado respondem (total, com_celular, com_email).
+
+    `only_with_*` nao filtra linha no agregado: a linha nao e uma empresa, e um
+    balde com contagens. Restringir a populacao e trocar QUAL medida faz o
+    papel de cada numero.
+
+    Pedindo so quem tem celular, o total passa a ser `with_cellphone`, e
+    "quantos desses tem email" e a intersecao -- nao `with_email`, que conta
+    tambem quem tem email e nao tem celular. Era exatamente esse cruzamento que
+    faltava no agregado, e por isso `only_with_cellphone` caia na tabela grande
+    antes de `with_cellphone_and_email` existir.
+    """
+    if only_with_cellphone and only_with_email:
+        both = model.with_cellphone_and_email
+        return both, both, both
+    if only_with_cellphone:
+        return model.with_cellphone, model.with_cellphone, model.with_cellphone_and_email
+    if only_with_email:
+        return model.with_email, model.with_cellphone_and_email, model.with_email
+    return model.total, model.with_cellphone, model.with_email
+
+
 def _rollup_query(
     db: Session,
+    model,
     *,
     uf_codes: list[int],
     company_size: list[str] | None,
@@ -421,12 +453,14 @@ def _rollup_query(
     is_simples: bool | None,
     is_headquarters: bool | None,
 ):
-    """Os filtros de /stats aplicados ao agregado (models.EstablishmentStats).
+    """Os filtros de /stats aplicados a um dos agregados.
 
-    So os filtros que o agregado carrega chegam aqui -- quem decide se e o caso
-    de usar este caminho e `uncovered`, no proprio endpoint.
+    Serve os dois (`EstablishmentStats` e `EstablishmentCnaeStats`): as
+    dimensoes que interessam aqui existem com o mesmo nome nas duas. So os
+    filtros que o agregado carrega chegam aqui -- quem decide e `uncovered`.
     """
-    query = db.query(S)
+    S = model
+    query = db.query(model)
 
     if uf_codes:
         query = query.filter(S.uf.in_(uf_codes))
@@ -504,26 +538,24 @@ def stats(
         resolved_ufs |= set(ufs_for_regiao(regiao))
     uf_codes = [uf_code(u) for u in sorted(resolved_ufs)]
 
-    # Filtros que o agregado nao carrega -- ver models.EstablishmentStats. Com
-    # qualquer um deles a pergunta so tem resposta na tabela grande.
-    #
-    # `cnae_codes` entra aqui, e nao e obvio: o agregado TEM `main_cnae`, mas o
-    # filtro do endpoint casa CNAE principal OU secundario, e `secondary_cnaes`
-    # e um array -- desnormalizar contaria a mesma empresa uma vez por CNAE
-    # secundario e as somas sairiam infladas. Melhor cair na tabela grande do
-    # que devolver numero errado rapido.
-    #
-    # `only_with_cellphone`/`only_with_email` tambem entram, por um motivo mais
-    # sutil: eles restringem a POPULACAO, e ai `with_email` passa a significar
-    # "tem celular E email" -- um cruzamento que o agregado nao guarda (ele tem
-    # as duas contagens por balde, nao a intersecao delas). Somar do jeito
-    # errado daria um numero plausivel e falso, que e o pior resultado
-    # possivel. Os dois sao `false` por padrao aqui, entao o caminho rapido
-    # continua valendo pro uso normal.
-    uncovered = (
-        cnae_codes or name or municipio_codes
-        or opened_after or opened_before or has_phone is not None
-        or only_with_cellphone or only_with_email
+    # Um unico CNAE tem resposta exata no agregado por CNAE. Varios nao: uma
+    # empresa que tenha dois deles esta em dois baldes e a soma a contaria duas
+    # vezes -- ver models.EstablishmentCnaeStats. `cnae_match` nao importa com
+    # um codigo so ("qualquer um" e "todos" sao a mesma coisa).
+    single_cnae = None
+    if cnae_codes:
+        codes = _cnae_codes_to_int(cnae_codes)
+        if len(set(codes)) == 1:
+            single_cnae = codes[0]
+
+    # Filtros que agregado nenhum carrega -- ver models.EstablishmentStats.
+    uncovered = bool(
+        name or municipio_codes or opened_after or opened_before
+        or has_phone is not None
+        or (cnae_codes and single_cnae is None)
+        # Com filtro de CNAE o `top_cnaes` seria "os CNAEs principais de quem
+        # tem este CNAE", e `main_cnae` nao e dimensao do agregado por CNAE.
+        or (single_cnae is not None and include_breakdowns)
     )
 
     if uncovered:
@@ -533,16 +565,19 @@ def stats(
             func.count().filter(Establishment.email.isnot(None)),
         ).one()
         rows_source = None
+        measures = None
     else:
-        # Caminho rapido: soma o agregado em vez de contar `establishments`.
+        model = C if single_cnae is not None else S
         rollup = _rollup_query(
-            db, uf_codes=uf_codes, company_size=company_size, situacao=situacao,
+            db, model, uf_codes=uf_codes, company_size=company_size, situacao=situacao,
             is_mei=is_mei, is_simples=is_simples, is_headquarters=is_headquarters,
         )
+        if single_cnae is not None:
+            rollup = rollup.filter(C.cnae == single_cnae)
+
+        measures = _measure_columns(model, only_with_cellphone, only_with_email)
         total, with_cellphone, with_email = rollup.with_entities(
-            func.coalesce(func.sum(S.total), 0),
-            func.coalesce(func.sum(S.with_cellphone), 0),
-            func.coalesce(func.sum(S.with_email), 0),
+            *(func.coalesce(func.sum(m), 0) for m in measures)
         ).one()
         rows_source = rollup
 
@@ -551,16 +586,20 @@ def stats(
     by_main_cnae_rows: list = []
 
     if include_breakdowns and rows_source is not None:
-        # Sobre o agregado (~1-3M linhas em vez de 72M), entao deixa de ser
-        # opcional na pratica -- mas o parametro fica, porque com filtro nao
-        # coberto o caminho abaixo ainda e caro.
-        by_uf_rows = rows_source.with_entities(S.uf, func.sum(S.total)).group_by(S.uf).all()
+        # Sempre o agregado principal (S): CNAE unico + breakdowns cai em
+        # `uncovered` la em cima, porque `main_cnae` nao e dimensao do agregado
+        # por CNAE. Se isso mudar, estas tres linhas precisam escolher o model.
+        #
+        # A medida agrupada e a MESMA que virou `total` -- agrupar `total`
+        # enquanto o total e `with_cellphone` faria as partes nao somarem o todo.
+        measure = measures[0]
+        by_uf_rows = rows_source.with_entities(S.uf, func.sum(measure)).group_by(S.uf).all()
         by_company_size_rows = (
-            rows_source.with_entities(S.company_size, func.sum(S.total))
+            rows_source.with_entities(S.company_size, func.sum(measure))
             .group_by(S.company_size).all()
         )
         by_main_cnae_rows = (
-            rows_source.with_entities(S.main_cnae, func.sum(S.total))
+            rows_source.with_entities(S.main_cnae, func.sum(measure))
             .filter(S.main_cnae.isnot(None)).group_by(S.main_cnae).all()
         )
     elif include_breakdowns:
