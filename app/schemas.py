@@ -118,6 +118,15 @@ class CnaeCountOut(BaseModel):
 
 
 class EstablishmentStatsOut(BaseModel):
+    """Agregações de /establishments/stats.
+
+    `by_uf`, `by_regiao`, `by_company_size` e `top_cnaes` vêm vazios a menos que
+    `include_breakdowns=true`: cada um é um GROUP BY que varre todas as linhas
+    do filtro, e num recorte grande isso não termina em tempo de request.
+    A exceção é `by_uf`/`by_regiao` quando se filtra por uma única UF -- aí a
+    resposta é o próprio total, sem consultar nada.
+    """
+
     total: int
     with_cellphone: int
     with_email: int

@@ -430,6 +430,12 @@ def stats(
     opened_after: date | None = Query(None),
     opened_before: date | None = Query(None),
     top_cnaes: int = Query(10, ge=1, le=50),
+    include_breakdowns: bool = Query(
+        False,
+        description="Inclui as distribuições por UF, porte e CNAE. Desligado por padrão: cada "
+                    "uma é um GROUP BY que precisa varrer todas as linhas que passam no filtro, "
+                    "e num recorte grande (uma UF inteira) isso não termina em tempo de request.",
+    ),
     db: Session = Depends(get_db),
 ):
     """Agregações sobre o mesmo conjunto de filtros de `/establishments`:
@@ -456,28 +462,62 @@ def stats(
         opened_before=opened_before,
     )
 
-    total = base.count()
+    # As UFs que sobraram depois de resolver `regiao` -- mesma conta que
+    # `_apply_filters` faz. Serve pra saber quando `by_uf` e deduzivel do total
+    # em vez de precisar de um GROUP BY. `_apply_filters` ja validou os nomes,
+    # entao aqui nao ha UF desconhecida.
+    resolved_ufs = set(uf or [])
+    if regiao:
+        resolved_ufs |= set(ufs_for_regiao(regiao))
+    uf_codes = [uf_code(u) for u in sorted(resolved_ufs)]
 
-    by_uf_rows = (
-        base.with_entities(Establishment.uf, func.count().label("total"))
-        .group_by(Establishment.uf)
-        .order_by(func.count().desc())
-        .all()
-    )
-    by_company_size_rows = (
-        base.with_entities(Establishment.company_size, func.count().label("total"))
-        .group_by(Establishment.company_size)
-        .order_by(func.count().desc())
-        .all()
-    )
-    by_main_cnae_rows = (
-        base.with_entities(Establishment.main_cnae, func.count().label("total"))
-        .filter(Establishment.main_cnae.isnot(None))
-        .group_by(Establishment.main_cnae)
-        .order_by(func.count().desc())
-        .limit(top_cnaes)
-        .all()
-    )
+    # Uma passada em vez de tres. `total`, `with_cellphone` e `with_email` eram
+    # tres count() separados sobre o mesmo conjunto -- tres varreduras
+    # identicas. FILTER faz os tres contadores numa leitura so.
+    total, with_cellphone, with_email = base.with_entities(
+        func.count(),
+        func.count().filter(Establishment.cellphone.isnot(None)),
+        func.count().filter(Establishment.email.isnot(None)),
+    ).one()
+
+    by_uf_rows: list = []
+    by_company_size_rows: list = []
+    by_main_cnae_rows: list = []
+
+    if uf_codes and not include_breakdowns:
+        # Filtrando por UF, `GROUP BY uf` so pode devolver essas UFs -- e a
+        # soma delas ja e o `total`. Com uma unica UF a resposta e exata sem
+        # consultar nada; com varias nao da pra dividir o total entre elas, e
+        # ai a distribuicao exige `include_breakdowns`.
+        if len(uf_codes) == 1:
+            by_uf_rows = [(uf_codes[0], total)]
+
+    if include_breakdowns:
+        # Cada um destes varre todas as linhas que passam no filtro. Sem
+        # ORDER BY no SQL: ordenar e trabalho pras poucas linhas agregadas,
+        # feito em Python logo abaixo, nao pro banco.
+        by_uf_rows = (
+            base.with_entities(Establishment.uf, func.count().label("total"))
+            .group_by(Establishment.uf)
+            .all()
+        )
+        by_company_size_rows = (
+            base.with_entities(Establishment.company_size, func.count().label("total"))
+            .group_by(Establishment.company_size)
+            .all()
+        )
+        by_main_cnae_rows = (
+            base.with_entities(Establishment.main_cnae, func.count().label("total"))
+            .filter(Establishment.main_cnae.isnot(None))
+            .group_by(Establishment.main_cnae)
+            .all()
+        )
+
+    # A ordenacao por contagem acontece aqui, sobre dezenas/centenas de linhas
+    # ja agregadas -- de graca, e sem pedir sort nenhum ao banco.
+    by_uf_rows = sorted(by_uf_rows, key=lambda r: r[1], reverse=True)
+    by_company_size_rows = sorted(by_company_size_rows, key=lambda r: r[1], reverse=True)
+    by_main_cnae_rows = sorted(by_main_cnae_rows, key=lambda r: r[1], reverse=True)[:top_cnaes]
 
     # Os group_by devolvem os codigos numericos do banco -- decodifica aqui,
     # nas poucas dezenas de linhas agregadas, nao nas 63M.
@@ -491,8 +531,8 @@ def stats(
     cnae_width = CODE_WIDTHS["cnae"]
     return EstablishmentStatsOut(
         total=total,
-        with_cellphone=base.filter(Establishment.cellphone.isnot(None)).count(),
-        with_email=base.filter(Establishment.email.isnot(None)).count(),
+        with_cellphone=with_cellphone,
+        with_email=with_email,
         by_uf=by_uf,
         by_regiao=by_regiao,
         by_company_size={(_code(size) or "desconhecido"): count for size, count in by_company_size_rows},
