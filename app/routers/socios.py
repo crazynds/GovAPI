@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app import cnpj as cnpj_codec
 from app.db import get_db
+from app.pagination import SortKey, make_fingerprint, paginate
 from app.models import Establishment, Pais, Qualificacao, Socio
 from app.schemas import SocioOut, SocioPageOut
 
@@ -170,12 +171,19 @@ def buscar(
             "dígitos visíveis (123456). CNPJ aceita com ou sem pontuação."
         ),
     ),
-    page: int = Query(1, ge=1),
-    per_page: int = Query(25, ge=1, le=200),
+    cursor: str | None = Query(
+        None,
+        description="Cursor da página anterior (`next_cursor`). Sem ele, começa do início. "
+                    "Os filtros precisam ser os mesmos que geraram o cursor.",
+    ),
+    limit: int = Query(25, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
     """Busca sócios por nome e/ou documento -- útil pra achar em quais
-    empresas uma pessoa/empresa aparece como sócia."""
+    empresas uma pessoa/empresa aparece como sócia.
+
+    Paginada por cursor: repasse o `next_cursor` da resposta em `?cursor=` pra
+    próxima página. Sem `total` nem número de páginas -- ver app/pagination.py."""
     query = db.query(Socio)
     if nome:
         query = query.filter(Socio.nome_socio.ilike(f"%{nome}%"))
@@ -184,13 +192,17 @@ def buscar(
         # `ILIKE '%...%'` que varria as ~24M linhas sem usar índice.
         query = query.filter(Socio.cpf_cnpj_socio == _parse_documento(documento))
 
-    total = query.count()
-    items = query.order_by(Socio.nome_socio).offset((page - 1) * per_page).limit(per_page).all()
+    # `id` (a PK) desempata nomes iguais -- homonimo e a regra, nao a excecao,
+    # num arquivo de 24M socios, e sem desempate a linha da virada de pagina
+    # se repetiria ou sumiria.
+    keys = [
+        SortKey(Socio.nome_socio, "nome_socio", nullable=False),
+        SortKey(Socio.id, "id", nullable=False),
+    ]
 
-    return SocioPageOut(
-        data=_serialize_many(db, items),
-        total=total,
-        per_page=per_page,
-        current_page=page,
-        last_page=max(1, -(-total // per_page)),
+    items, next_cursor = paginate(
+        query, keys, cursor, limit,
+        make_fingerprint(nome=nome, documento=documento),
     )
+
+    return SocioPageOut(data=_serialize_many(db, items), next_cursor=next_cursor, limit=limit)

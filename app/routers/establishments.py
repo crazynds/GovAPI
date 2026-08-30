@@ -19,6 +19,7 @@ from app import cnpj as cnpj_codec
 from app.db import get_db
 from app.models import Cnae, Establishment, Motivo, Municipio, NaturezaJuridica
 from app.regions import UF_TO_REGIAO, uf_code, uf_name, ufs_for_regiao
+from app.pagination import SortKey, make_fingerprint, paginate
 from app.schemas import AddressOut, EstablishmentOut, EstablishmentPage, EstablishmentStatsOut
 
 router = APIRouter(prefix="/establishments", tags=["establishments"])
@@ -330,10 +331,18 @@ def search(
     opened_before: date | None = Query(None, description="Data de abertura <= (YYYY-MM-DD)"),
     sort_by: str = Query("cellphone_confidence", pattern="^(cellphone_confidence|opened_at|company_name)$"),
     sort_dir: str = Query("desc", pattern="^(asc|desc)$"),
-    page: int = Query(1, ge=1),
-    per_page: int = Query(25, ge=1, le=200),
+    cursor: str | None = Query(
+        None,
+        description="Cursor da página anterior (`next_cursor`). Sem ele, começa do início. "
+                    "Filtros e ordenação precisam ser os mesmos que geraram o cursor.",
+    ),
+    limit: int = Query(25, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
+    """Busca paginada por cursor: devolve `next_cursor`, que você repassa em
+    `?cursor=` pra próxima página. Não há `total` nem número de páginas --
+    contá-los custaria uma varredura completa da tabela a cada request (ver
+    app/pagination.py)."""
     query = _apply_filters(
         db.query(Establishment),
         cnae_codes=cnae_codes,
@@ -354,19 +363,30 @@ def search(
         opened_before=opened_before,
     )
 
-    total = query.count()
-
+    # `cnpj` (a PK) fecha a ordenacao pra ela ficar total -- sem desempate,
+    # duas linhas com o mesmo `cellphone_confidence` trocariam de lugar entre
+    # uma pagina e a proxima, e a da virada apareceria duas vezes ou nenhuma.
     sort_column = getattr(Establishment, sort_by)
-    order = sort_column.desc() if sort_dir == "desc" else sort_column.asc()
-    items = query.order_by(order).offset((page - 1) * per_page).limit(per_page).all()
+    descending = sort_dir == "desc"
+    keys = [
+        SortKey(sort_column, sort_by, desc=descending, nullable=sort_by == "opened_at"),
+        SortKey(Establishment.cnpj, "cnpj", desc=descending, nullable=False),
+    ]
 
-    return EstablishmentPage(
-        data=_serialize_many(db, items),
-        total=total,
-        per_page=per_page,
-        current_page=page,
-        last_page=max(1, -(-total // per_page)),
+    items, next_cursor = paginate(
+        query, keys, cursor, limit,
+        make_fingerprint(
+            cnae_codes=cnae_codes, cnae_match=cnae_match, uf=uf, regiao=regiao,
+            municipio_codes=municipio_codes, company_size=company_size, is_mei=is_mei,
+            is_simples=is_simples, is_headquarters=is_headquarters, name=name,
+            situacao=situacao, only_with_cellphone=only_with_cellphone,
+            only_with_email=only_with_email, has_phone=has_phone,
+            opened_after=opened_after, opened_before=opened_before,
+            sort_by=sort_by, sort_dir=sort_dir,
+        ),
     )
+
+    return EstablishmentPage(data=_serialize_many(db, items), next_cursor=next_cursor, limit=limit)
 
 
 @router.get("/by-cnpj", response_model=list[EstablishmentOut])

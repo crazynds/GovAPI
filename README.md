@@ -340,17 +340,43 @@ different name, never part of the library's own schema.
 
 Full interactive docs (Swagger) at `/docs`.
 
+### Pagination
+
+`/establishments`, `/socios/buscar` and `/enderecos/buscar` paginate by **cursor**, not page number:
+
+```
+GET /establishments?uf=PR&limit=25
+{ "data": [...], "next_cursor": "eyJ2IjoxLCJrIjpb...", "limit": 25 }
+
+GET /establishments?uf=PR&limit=25&cursor=eyJ2IjoxLCJrIjpb...
+```
+
+Keep following `next_cursor` until it comes back `null` — that's the last page.
+
+There is deliberately **no `total` and no page count**. Producing them means running a
+`count()` over the whole result set on every request, which on a 70M+ row table costs the
+same as reading everything — a `?uf=PR&per_page=1` used to time out while counting millions
+of rows nobody was going to read. Cursors also make deep pages cheap: `OFFSET 50000` has to
+produce and throw away 50 000 rows, while a cursor is an index seek.
+
+The trade-off is that you can only move forward one page at a time — no jumping to an
+arbitrary page, and no "page 3 of 812".
+
+Treat the cursor as opaque. Filters and sort must stay the same across a paginated run; a
+cursor used with different ones is rejected with `422` rather than silently returning an
+arbitrary slice.
+
 ### CNPJ
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/establishments` | Search companies. Filters: `cnae_codes` (+ `cnae_match=any\|all`), `uf`, `regiao`, `municipio_codes`, `company_size`, `is_mei`, `is_simples`, `is_headquarters`, `name`, `situacao` (registration status, code or label — includes all statuses unless filtered), `has_phone`, `only_with_cellphone`, `only_with_email`, `opened_after`/`opened_before`; sortable via `sort_by`/`sort_dir`, paginated via `page`/`per_page`. Results include CNAE, legal-nature, and deregistration-reason descriptions, plus human-readable labels for company size and registration status. |
+| `GET` | `/establishments` | Search companies. Filters: `cnae_codes` (+ `cnae_match=any\|all`), `uf`, `regiao`, `municipio_codes`, `company_size`, `is_mei`, `is_simples`, `is_headquarters`, `name`, `situacao` (registration status, code or label — includes all statuses unless filtered), `has_phone`, `only_with_cellphone`, `only_with_email`, `opened_after`/`opened_before`; sortable via `sort_by`/`sort_dir`, paginated by cursor via `cursor`/`limit` (see [Pagination](#pagination)). Results include CNAE, legal-nature, and deregistration-reason descriptions, plus human-readable labels for company size and registration status. |
 | `GET` | `/establishments/by-cnpj` | Look up specific companies by CNPJ (`cnpjs=...`, repeatable). Accepts punctuation, a full CNPJ, or just the 8-position root. |
 | `GET` | `/establishments/stats` | Aggregates over the same filters as above: totals, breakdown by state/region/company size, and top CNAE codes — useful for sizing a segment before paginating individual results. |
 | `GET` | `/cnaes/search-by-description` | Search CNAE codes by description (`words=...`, repeatable). |
 | `GET` | `/cnaes/codes` | List all CNAE codes. |
 | `GET` | `/municipios/search` | Search municipalities by `name`, `uf`, and/or `regiao`. Includes `population` and `area_km2` once `import-ibge` has run. |
-| `GET` | `/municipios/by-code/{receita_code}` | Look up a municipality by its Revenue/IBGE code. |
+| `GET` | `/municipios/by-code/{code}` | Look up a municipality by code — either the Revenue's 4-digit code or the 7-digit IBGE code; the width decides which one is queried. |
 | `GET` | `/import/status` | Check import progress — the overall run plus one entry per pipeline stage (`stages`), since download/unzip/load run in parallel on different files. |
 | `POST` | `/import/trigger` | Trigger an import in the background. Unauthenticated. |
 
@@ -359,7 +385,7 @@ Full interactive docs (Swagger) at `/docs`.
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/socios/por-empresa/{cnpj}` | List a company's partners/shareholders — accepts a full CNPJ or just the 8-digit root. |
-| `GET` | `/socios/buscar` | Search partners by `nome` and/or `documento` — find every company a person/entity is a partner in. Paginated. `documento` is an exact match: for a CPF pass only the visible digits (the Revenue masks it itself, `***123456**` → `123456`); a CNPJ is accepted with or without punctuation. |
+| `GET` | `/socios/buscar` | Search partners by `nome` and/or `documento` — find every company a person/entity is a partner in. Paginated by cursor (see [Pagination](#pagination)). `documento` is an exact match: for a CPF pass only the visible digits (the Revenue masks it itself, `***123456**` → `123456`); a CNPJ is accepted with or without punctuation. |
 
 ### Reference tables
 
@@ -377,7 +403,7 @@ Small code/description lookups — same shape as `/cnaes`. Each has `/search?nam
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/enderecos/cep/{cep}` | Look up an address by ZIP code, including `latitude`/`longitude` when available (fetched from BrasilAPI on first lookup, cached after). |
-| `GET` | `/enderecos/buscar` | Free-text address search — `logradouro` (street), `bairro` (neighborhood), `municipio`, `uf` (repeatable), `regiao`, `municipio_cod_ibge`; paginated via `page`/`per_page`. Pass `lat`+`lon` to sort by distance instead — uses the ZIP code's own cached coordinate when available, otherwise falls back to its municipality's centroid (`import-municipios-geo`); each result's `exata` field says which one was used. |
+| `GET` | `/enderecos/buscar` | Free-text address search — `logradouro` (street), `bairro` (neighborhood), `municipio`, `uf` (repeatable), `regiao`, `municipio_cod_ibge`; paginated by cursor via `cursor`/`limit` (see [Pagination](#pagination)). Pass `lat`+`lon` to sort by distance instead — uses the ZIP code's own cached coordinate when available, otherwise falls back to its municipality's centroid (`import-municipios-geo`); each result's `exata` field says which one was used. |
 | `GET` | `/enderecos/proximos` | ZIP codes within `raio_km` of `lat`+`lon`, nearest first. Same exact-vs-municipality-centroid fallback as above. |
 | `GET` | `/enderecos/estados` | List all states. |
 

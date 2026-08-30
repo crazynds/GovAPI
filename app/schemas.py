@@ -81,20 +81,35 @@ class SocioOut(BaseModel):
     company_name: str | None
 
 
-class SocioPageOut(BaseModel):
+class CursorPage(BaseModel):
+    """Pagina de uma busca paginada por cursor.
+
+    Nao tem `total` nem `last_page` de proposito: produzir esses numeros exige
+    um `count()` sobre o resultado inteiro, que numa tabela de dezenas de
+    milhoes de linhas custa o mesmo que ler tudo -- era o que derrubava
+    /establishments por timeout mesmo com `per_page=1`. Ver app/pagination.py.
+
+    `next_cursor` e None na ultima pagina; enquanto vier preenchido, devolva-o
+    em `?cursor=` pra pegar a proxima.
+    """
+
+    next_cursor: str | None = None
+    limit: int
+
+
+class SocioPageOut(CursorPage):
     data: list[SocioOut]
-    total: int
-    per_page: int
-    current_page: int
-    last_page: int
 
 
-class EstablishmentPage(BaseModel):
+class EstablishmentPage(CursorPage):
     data: list[EstablishmentOut]
-    total: int
-    per_page: int
-    current_page: int
-    last_page: int
+
+
+class EnderecoPageOut(CursorPage):
+    # Linhas de `correios_cep` montadas em SQL direto (ver
+    # app/routers/enderecos.py), com `exata`/`distancia_km` a mais quando a
+    # busca e por proximidade -- por isso dict e nao um model fixo.
+    data: list[dict]
 
 
 class CnaeCountOut(BaseModel):

@@ -814,10 +814,27 @@ def _merge_municipios_receita(db: Session, rows) -> int:
 # magnitude mais rapido. Parciais: as consultas da API sao quase sempre sobre
 # empresas ativas e/ou com contato, e indexar as ~41M linhas que ninguem le
 # custaria vários GB.
+# NAO usar predicado parcial em `situacao_cadastral = 2` aqui de novo. Custou
+# caro: os indices de uf/main_cnae eram parciais assim, mas a busca so filtra
+# situacao quando o cliente pede (`?situacao=`), e o default e "todas as
+# situacoes". Sem `situacao_cadastral = 2` no WHERE o Postgres nao consegue
+# provar o predicado e descarta o indice inteiro -- `?uf=RR` (a menor UF do
+# pais) ia a seq scan e batia timeout, enquanto `?uf=RR&situacao=ativa`
+# respondia em 0,35s. Indice parcial so vale quando o predicado dele esta
+# SEMPRE no WHERE da query, o que aqui nao acontece.
 DEFERRED_INDEXES = [
     ("ix_establishments_cellphone", "(cellphone)", "cellphone IS NOT NULL", None),
-    ("ix_establishments_uf", "(uf)", "situacao_cadastral = 2", None),
-    ("ix_establishments_main_cnae", "(main_cnae)", "situacao_cadastral = 2", None),
+    # Ordenacao default da busca (`sort_by=cellphone_confidence`), com o `cnpj`
+    # junto porque a paginacao por keyset ordena por (coluna, PK) -- ver
+    # app/pagination.py. Com o `uf` na frente, uma busca por UF vira um seek
+    # numa faixa continua do indice em vez de ordenar milhoes de linhas.
+    # Substitui o antigo ix_establishments_uf: `(uf)` sozinho era prefixo
+    # deste, entao manter os dois so gastaria disco.
+    ("ix_establishments_uf_confidence", "(uf, cellphone_confidence DESC, cnpj DESC)", None, None),
+    # Mesma ordenacao pras buscas sem filtro de UF.
+    ("ix_establishments_confidence", "(cellphone_confidence DESC, cnpj DESC)", None, None),
+    ("ix_establishments_opened_at", "(opened_at DESC, cnpj DESC)", None, None),
+    ("ix_establishments_main_cnae", "(main_cnae)", None, None),
     ("ix_establishments_secondary_cnaes", "(secondary_cnaes)", "secondary_cnaes IS NOT NULL", "gin"),
     ("ix_establishments_situacao_cadastral", "(situacao_cadastral)", None, None),
     ("ix_establishments_cep", "(cep)", "cep IS NOT NULL", None),
@@ -826,6 +843,9 @@ DEFERRED_INDEXES = [
 SOCIOS_DEFERRED_INDEXES = [
     ("ix_socios_cnpj_basico", "(cnpj_basico)", None),
     ("ix_socios_cpf_cnpj_socio", "(cpf_cnpj_socio)", "cpf_cnpj_socio IS NOT NULL"),
+    # Ordenacao de /socios/buscar, com o `id` junto pelo mesmo motivo do
+    # `cnpj` acima (keyset precisa de ordem total).
+    ("ix_socios_nome_socio", "(nome_socio, id)", None),
 ]
 
 
@@ -878,6 +898,12 @@ def _finalize_socios(db: Session, progress: Session, display: ProgressDisplay) -
         db.execute(text(f'ALTER INDEX "{name}_new" RENAME TO "{name}"'))
     db.execute(text("ALTER INDEX socios_new_pkey RENAME TO socios_pkey"))
     db.execute(text("ALTER SEQUENCE socios_new_id_seq RENAME TO socios_id_seq"))
+    db.commit()
+
+    # Mesmo motivo do ANALYZE em establishments: o swap deixa a tabela sem
+    # estatistica pro planner.
+    display.set(slot, "  build: ANALYZE em socios")
+    db.execute(text("ANALYZE socios"))
     db.commit()
 
     _set_step(progress, "build", group="build", status="success", message="socios trocado atomicamente")
@@ -1126,6 +1152,16 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
     db.execute(text("ALTER INDEX establishments_new_pkey RENAME TO establishments_pkey"))
     db.execute(text("TRUNCATE TABLE empresas_staging, simples_staging, estabelecimentos_staging"))
     db.execute(text("DELETE FROM import_log WHERE period = :period"), {"period": period})
+    db.commit()
+
+    # O RENAME nao carrega estatistica nenhuma: pro planner, `establishments`
+    # acabou de virar uma tabela de 70M+ linhas sem uma linha de pg_statistic.
+    # Sem isso ele erra a cardinalidade por ordens de magnitude e escolhe seq
+    # scan onde tem indice. Autovacuum acabaria fazendo, mas so depois de um
+    # tempo -- e nesse meio tempo a API fica inutilizavel.
+    display.set(slot, "  build: ANALYZE na tabela final")
+    _set_step(progress, "build", period=period, group="build", status="running", message="ANALYZE establishments")
+    db.execute(text("ANALYZE establishments"))
     db.commit()
 
     display.set(slot, "")

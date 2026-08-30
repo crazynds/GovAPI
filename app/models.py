@@ -122,12 +122,18 @@ class Establishment(Base):
 
     __tablename__ = "establishments"
     __table_args__ = (
-        # Parciais de proposito: as consultas da API sao quase sempre sobre
-        # empresas ativas e/ou com contato, e um indice cheio sobre 63M linhas
-        # custa varios GB pra indexar linhas que nunca sao lidas.
+        # Parcial so onde o predicado esta SEMPRE no WHERE da query. `uf` e
+        # `main_cnae` ja foram parciais em `situacao_cadastral = 2` e isso
+        # quebrou a busca: o filtro de situacao e opcional na API, e sem ele no
+        # WHERE o Postgres descarta o indice e cai em seq scan sobre 72M linhas
+        # (ver DEFERRED_INDEXES em app/importer/pipeline.py).
         Index("ix_establishments_cellphone", "cellphone", postgresql_where=text("cellphone IS NOT NULL")),
-        Index("ix_establishments_uf", "uf", postgresql_where=text("situacao_cadastral = 2")),
-        Index("ix_establishments_main_cnae", "main_cnae", postgresql_where=text("situacao_cadastral = 2")),
+        # Compostos terminados em `cnpj` (a PK) porque a paginacao e por keyset
+        # e ordena por (coluna, PK) -- ver app/pagination.py.
+        Index("ix_establishments_uf_confidence", "uf", text("cellphone_confidence DESC"), text("cnpj DESC")),
+        Index("ix_establishments_confidence", text("cellphone_confidence DESC"), text("cnpj DESC")),
+        Index("ix_establishments_opened_at", text("opened_at DESC"), text("cnpj DESC")),
+        Index("ix_establishments_main_cnae", "main_cnae"),
         Index(
             "ix_establishments_secondary_cnaes",
             "secondary_cnaes",
@@ -284,6 +290,9 @@ class Socio(Base):
     __table_args__ = (
         Index("ix_socios_cnpj_basico", "cnpj_basico"),
         Index("ix_socios_cpf_cnpj_socio", "cpf_cnpj_socio", postgresql_where=text("cpf_cnpj_socio IS NOT NULL")),
+        # Ordenacao de /socios/buscar; `id` (a PK) fecha a ordem total exigida
+        # pelo keyset -- ver app/pagination.py.
+        Index("ix_socios_nome_socio", "nome_socio", "id"),
     )
 
     # Integer e nao BigInteger: sao ~24M linhas, e o TRUNCATE do inicio do
@@ -327,6 +336,11 @@ class Cep(Base):
     """
 
     __tablename__ = "correios_cep"
+    __table_args__ = (
+        # Ordenacao default de /enderecos/buscar, terminada na PK pro keyset
+        # ter ordem total -- ver app/pagination.py.
+        Index("ix_correios_cep_municipio_logradouro", "municipio", "logradouro", "cep"),
+    )
 
     cep: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
     # NULL quando o e-DNE traz um codigo IBGE que nao existe na lista atual

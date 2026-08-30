@@ -9,7 +9,16 @@ from sqlalchemy.orm import Session
 from app import ceps
 from app.db import get_db
 from app.models import Cep
+from app.pagination import (
+    SqlSortKey,
+    decode_cursor,
+    encode_cursor,
+    keyset_sql,
+    make_fingerprint,
+    order_by_sql,
+)
 from app.regions import ufs_for_regiao
+from app.schemas import EnderecoPageOut
 
 router = APIRouter(prefix="/enderecos", tags=["enderecos"])
 
@@ -154,7 +163,7 @@ _COORD_JOIN_SQL = """
 """
 
 
-@router.get("/buscar")
+@router.get("/buscar", response_model=EnderecoPageOut)
 def buscar_endereco(
     logradouro: str | None = Query(None),
     bairro: str | None = Query(None),
@@ -164,8 +173,12 @@ def buscar_endereco(
     municipio_cod_ibge: int | None = Query(None),
     lat: float | None = Query(None, description="Ordena por distância a partir daqui (combine com lon)"),
     lon: float | None = Query(None, description="Ordena por distância a partir daqui (combine com lat)"),
-    page: int = Query(1, ge=1),
-    per_page: int = Query(20, ge=1, le=100),
+    cursor: str | None = Query(
+        None,
+        description="Cursor da página anterior (`next_cursor`). Sem ele, começa do início. "
+                    "Os filtros precisam ser os mesmos que geraram o cursor.",
+    ),
+    limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
     """Busca por texto/filtros na base oficial dos Correios (e-DNE) -- precisa
@@ -177,9 +190,14 @@ def buscar_endereco(
     `/enderecos/cep/{cep}`), senão cai pro centroide do município (ver
     `import-municipios-geo`); cada item vem com `exata: true/false` dizendo
     qual das duas foi usada. CEPs sem nenhuma das duas (município ainda não
-    geocodificado) não entram no resultado."""
+    geocodificado) não entram no resultado.
+
+    Paginada por cursor: repasse o `next_cursor` da resposta em `?cursor=` pra
+    próxima página. Ver app/pagination.py."""
     conditions = []
-    params: dict = {"limit": per_page, "offset": (page - 1) * per_page}
+    # `limit + 1`: a linha extra so serve pra saber se existe proxima pagina,
+    # e e descartada antes de responder -- ver app.pagination.paginate.
+    params: dict = {"limit": limit + 1}
 
     if logradouro:
         conditions.append("logradouro ILIKE :logradouro")
@@ -204,28 +222,71 @@ def buscar_endereco(
         conditions.append("uf = ANY(:ufs)")
         params["ufs"] = list(ufs)
 
+    fingerprint = make_fingerprint(
+        logradouro=logradouro, bairro=bairro, municipio=municipio, uf=sorted(ufs),
+        regiao=regiao, municipio_cod_ibge=municipio_cod_ibge, lat=lat, lon=lon,
+    )
+
     order_by_distance = lat is not None and lon is not None
     if order_by_distance:
         params["lat"], params["lon"] = lat, lon
-        distance_conditions = conditions + ["coord.lat_final IS NOT NULL"]
+        conditions = conditions + ["coord.lat_final IS NOT NULL"]
+        # A distancia nao e coluna, entao o keyset compara contra a expressao
+        # inteira -- por isso `_DISTANCE_KM_SQL` e nao o alias: o alias do
+        # SELECT nao existe no WHERE. Nunca e NULL aqui (`lat_final IS NOT
+        # NULL` ja esta no filtro), daí `nullable=False`.
+        keys = [
+            SqlSortKey(_DISTANCE_KM_SQL, "distancia_km", nullable=False),
+            SqlSortKey("e.cep", "cep", nullable=False),
+        ]
+    else:
+        keys = [
+            SqlSortKey("municipio", "municipio"),
+            SqlSortKey("logradouro", "logradouro"),
+            SqlSortKey("cep", "cep", nullable=False),
+        ]
+
+    if cursor:
+        position = decode_cursor(cursor, fingerprint)
+        keyset = keyset_sql(keys, position.values, params)
+        if keyset is None:
+            return EnderecoPageOut(data=[], next_cursor=None, limit=limit)
+        conditions = conditions + [keyset]
+
+    where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    if order_by_distance:
         query_sql = f"""
             SELECT {_CORREIOS_CEP_COLUMNS_PREFIXED_E}, coord.exata, {_DISTANCE_KM_SQL} AS distancia_km
             FROM {CORREIOS_CEP_TABLE} e
             {_COORD_JOIN_SQL}
-            WHERE {' AND '.join(distance_conditions)}
-            ORDER BY distancia_km ASC
-            LIMIT :limit OFFSET :offset
+            {where_sql}
+            ORDER BY {order_by_sql(keys)}
+            LIMIT :limit
         """
     else:
         query_sql = f"""
             SELECT {CORREIOS_CEP_COLUMNS} FROM {CORREIOS_CEP_TABLE}
-            {f"WHERE {' AND '.join(conditions)}" if conditions else ""}
-            ORDER BY municipio, logradouro
-            LIMIT :limit OFFSET :offset
+            {where_sql}
+            ORDER BY {order_by_sql(keys)}
+            LIMIT :limit
         """
 
-    result = db.execute(text(query_sql), params)
-    return [dict(row._mapping) for row in result]
+    rows = [dict(row._mapping) for row in db.execute(text(query_sql), params)]
+
+    if len(rows) <= limit:
+        return EnderecoPageOut(data=rows, next_cursor=None, limit=limit)
+
+    rows = rows[:limit]
+    # `cep` sai do SELECT como texto com zero a esquerda (ver
+    # ceps.select_columns), mas a coluna e INTEGER -- o cursor tem que levar o
+    # inteiro, senao a comparacao no WHERE seria texto contra int.
+    last = rows[-1]
+    values = tuple(
+        ceps.to_int(last[k.alias]) if k.alias == "cep" else last[k.alias]
+        for k in keys
+    )
+    return EnderecoPageOut(data=rows, next_cursor=encode_cursor(values, fingerprint), limit=limit)
 
 
 @router.get("/proximos")
