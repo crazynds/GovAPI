@@ -329,14 +329,6 @@ def search(
     has_phone: bool | None = Query(None, description="Filtra por ter (true) ou não ter (false) telefone fixo"),
     opened_after: date | None = Query(None, description="Data de abertura >= (YYYY-MM-DD)"),
     opened_before: date | None = Query(None, description="Data de abertura <= (YYYY-MM-DD)"),
-    sort_by: str | None = Query(
-        None,
-        pattern="^(cellphone_confidence|opened_at|company_name)$",
-        description="Ordena por esta coluna. Omitido (o default), a busca só filtra e sai na "
-                    "ordem da chave primária -- muito mais barato: ordenar por qualquer outra "
-                    "coluna obriga o banco a ordenar o resultado inteiro antes de cortar a página.",
-    ),
-    sort_dir: str = Query("desc", pattern="^(asc|desc)$"),
     cursor: str | None = Query(
         None,
         description="Cursor da página anterior (`next_cursor`). Sem ele, começa do início. "
@@ -348,7 +340,12 @@ def search(
     """Busca paginada por cursor: devolve `next_cursor`, que você repassa em
     `?cursor=` pra próxima página. Não há `total` nem número de páginas --
     contá-los custaria uma varredura completa da tabela a cada request (ver
-    app/pagination.py)."""
+    app/pagination.py).
+
+    O resultado sai sempre na ordem da chave primária, e isso não é
+    configurável: ordenar por qualquer outra coluna obriga o banco a ordenar o
+    resultado filtrado inteiro antes de cortar a página, e nenhum `limit`
+    escapa disso."""
     query = _apply_filters(
         db.query(Establishment),
         cnae_codes=cnae_codes,
@@ -369,23 +366,15 @@ def search(
         opened_before=opened_before,
     )
 
-    # Sem `sort_by`, ordena SO pela PK. Isso nao e detalhe de implementacao: e
-    # a diferenca entre a query varrer o indice ate juntar a pagina e ordenar o
-    # resultado inteiro antes de cortar. Ordenar por `cellphone_confidence`
-    # (o default antigo deste endpoint) obrigava o segundo caminho, e era o que
-    # levava `?uf=PR` a timeout mesmo com `limit=1`: pra saber quem tem a maior
-    # confianca, o banco precisa olhar todas as linhas de PR.
+    # SEMPRE a PK, e so ela. O endpoint ja aceitou `sort_by`/`sort_dir`; foram
+    # removidos porque eram uma armadilha exposta como funcionalidade. Ordenar
+    # por coluna nao-chave obriga o banco a ordenar o resultado filtrado
+    # INTEIRO antes de cortar a pagina -- pra saber quem tem o maior
+    # `cellphone_confidence` em PR ele precisa olhar todas as linhas de PR, e
+    # o `limit` nao ajuda. Era o que levava `?uf=PR&limit=1` a timeout.
     #
-    # A PK sozinha ja e uma ordem TOTAL, entao serve de cursor sem desempate
-    # extra. Com `sort_by`, o `cnpj` entra depois como desempate -- sem ele,
-    # linhas com o mesmo valor trocariam de lugar entre uma pagina e a proxima
-    # e a da virada apareceria duas vezes ou nenhuma.
-    descending = sort_dir == "desc"
-    keys = [SortKey(Establishment.cnpj, "cnpj", desc=descending, nullable=False)]
-    if sort_by:
-        sort_column = getattr(Establishment, sort_by)
-        keys.insert(0, SortKey(sort_column, sort_by, desc=descending,
-                               nullable=sort_by == "opened_at"))
+    # A PK sozinha ja e uma ordem TOTAL, entao serve de cursor sem desempate.
+    keys = [SortKey(Establishment.cnpj, "cnpj", nullable=False)]
 
     items, next_cursor = paginate(
         query, keys, cursor, limit,
@@ -396,7 +385,6 @@ def search(
             situacao=situacao, only_with_cellphone=only_with_cellphone,
             only_with_email=only_with_email, has_phone=has_phone,
             opened_after=opened_after, opened_before=opened_before,
-            sort_by=sort_by, sort_dir=sort_dir,
         ),
     )
 

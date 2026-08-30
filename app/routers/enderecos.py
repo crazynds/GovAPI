@@ -240,11 +240,10 @@ def buscar_endereco(
             SqlSortKey("e.cep", "cep", nullable=False),
         ]
     else:
-        keys = [
-            SqlSortKey("municipio", "municipio"),
-            SqlSortKey("logradouro", "logradouro"),
-            SqlSortKey("cep", "cep", nullable=False),
-        ]
+        # So a PK, pelo mesmo motivo de /socios/buscar: os filtros daqui sao
+        # todos `ILIKE '%x%'`, e ordenar por municipio/logradouro faria o
+        # planner caminhar esse indice testando linha a linha.
+        keys = [SqlSortKey("cep", "cep", nullable=False)]
 
     if cursor:
         position = decode_cursor(cursor, fingerprint)

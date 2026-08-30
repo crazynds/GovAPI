@@ -362,12 +362,16 @@ produce and throw away 50 000 rows, while a cursor is an index seek.
 The trade-off is that you can only move forward one page at a time — no jumping to an
 arbitrary page, and no "page 3 of 812".
 
-`/establishments` sorts by primary key unless you ask for something else. That isn't cosmetic:
-the page then comes out of a contiguous stretch of an index, whereas `sort_by=<column>` forces
-the database to order the entire filtered result before it can cut the page — to know which
-company in Paraná has the highest `cellphone_confidence`, it has to look at every company in
-Paraná, and no `limit` saves you from that. Only pass `sort_by` when you actually need the
-ordering.
+**Results always come back in primary-key order, and that isn't configurable.** These endpoints
+used to accept `sort_by`/`sort_dir`; those are gone. Ordering by a non-key column forces the
+database to order the entire filtered result before it can cut the page — to know which company
+in Paraná has the highest `cellphone_confidence`, it has to look at every company in Paraná, and
+no `limit` saves you from that. Ordering by the primary key is free: the page comes out of a
+contiguous stretch of an index that already exists.
+
+The one exception is `/enderecos`: passing `lat`+`lon` (and `/enderecos/proximos`) sorts by
+distance, because "nearest first" is the entire point of those. They pay for it, so use them
+only when you want proximity.
 
 Treat the cursor as opaque. Filters and sort must stay the same across a paginated run; a
 cursor used with different ones is rejected with `422` rather than silently returning an
@@ -377,7 +381,7 @@ arbitrary slice.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/establishments` | Search companies. Filters: `cnae_codes` (+ `cnae_match=any\|all`), `uf`, `regiao`, `municipio_codes`, `company_size`, `is_mei`, `is_simples`, `is_headquarters`, `name`, `situacao` (registration status, code or label — includes all statuses unless filtered), `has_phone`, `only_with_cellphone`, `only_with_email`, `opened_after`/`opened_before`; paginated by cursor via `cursor`/`limit` (see [Pagination](#pagination)). By default the search only filters and comes back in primary-key order; `sort_by`/`sort_dir` order by a column instead, which is far more expensive on a large result set. Results include CNAE, legal-nature, and deregistration-reason descriptions, plus human-readable labels for company size and registration status. |
+| `GET` | `/establishments` | Search companies. Filters: `cnae_codes` (+ `cnae_match=any\|all`), `uf`, `regiao`, `municipio_codes`, `company_size`, `is_mei`, `is_simples`, `is_headquarters`, `name`, `situacao` (registration status, code or label — includes all statuses unless filtered), `has_phone`, `only_with_cellphone`, `only_with_email`, `opened_after`/`opened_before`; paginated by cursor via `cursor`/`limit` (see [Pagination](#pagination)). Results include CNAE, legal-nature, and deregistration-reason descriptions, plus human-readable labels for company size and registration status. |
 | `GET` | `/establishments/by-cnpj` | Look up specific companies by CNPJ (`cnpjs=...`, repeatable). Accepts punctuation, a full CNPJ, or just the 8-position root. |
 | `GET` | `/establishments/stats` | Aggregates over the same filters as above: totals, breakdown by state/region/company size, and top CNAE codes — useful for sizing a segment before paginating individual results. |
 | `GET` | `/cnaes/search-by-description` | Search CNAE codes by description (`words=...`, repeatable). |

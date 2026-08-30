@@ -824,19 +824,10 @@ def _merge_municipios_receita(db: Session, rows) -> int:
 # SEMPRE no WHERE da query, o que aqui nao acontece.
 DEFERRED_INDEXES = [
     ("ix_establishments_cellphone", "(cellphone)", "cellphone IS NOT NULL", None),
-    # Ordenacao default da busca (`sort_by=cellphone_confidence`), com o `cnpj`
-    # junto porque a paginacao por keyset ordena por (coluna, PK) -- ver
-    # app/pagination.py. Com o `uf` na frente, uma busca por UF vira um seek
-    # numa faixa continua do indice em vez de ordenar milhoes de linhas.
-    # Substitui o antigo ix_establishments_uf: `(uf)` sozinho era prefixo
-    # deste, entao manter os dois so gastaria disco.
+    # Filtro por UF. O sufixo de ordenacao e vestigial -- a API ordena sempre
+    # pela PK --, mas o prefixo `(uf)` e o que a busca usa. Substitui o antigo
+    # ix_establishments_uf, que era parcial em `situacao_cadastral = 2`.
     ("ix_establishments_uf_confidence", "(uf, cellphone_confidence DESC, cnpj DESC)", None, None),
-    # Mesma ordenacao pras buscas sem filtro de UF.
-    ("ix_establishments_confidence", "(cellphone_confidence DESC, cnpj DESC)", None, None),
-    # NULLS LAST explicito: `opened_at` e nullable, entao o ORDER BY da API
-    # pede NULLS LAST, e `DESC` sozinho no indice seria NULLS FIRST -- o
-    # planner compara esse flag e descarta o indice se ele nao casar.
-    ("ix_establishments_opened_at", "(opened_at DESC NULLS LAST, cnpj DESC)", None, None),
     ("ix_establishments_main_cnae", "(main_cnae)", None, None),
     ("ix_establishments_secondary_cnaes", "(secondary_cnaes)", "secondary_cnaes IS NOT NULL", "gin"),
     ("ix_establishments_situacao_cadastral", "(situacao_cadastral)", None, None),
@@ -846,9 +837,6 @@ DEFERRED_INDEXES = [
 SOCIOS_DEFERRED_INDEXES = [
     ("ix_socios_cnpj_basico", "(cnpj_basico)", None),
     ("ix_socios_cpf_cnpj_socio", "(cpf_cnpj_socio)", "cpf_cnpj_socio IS NOT NULL"),
-    # Ordenacao de /socios/buscar, com o `id` junto pelo mesmo motivo do
-    # `cnpj` acima (keyset precisa de ordem total).
-    ("ix_socios_nome_socio", "(nome_socio, id)", None),
 ]
 
 

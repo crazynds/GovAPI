@@ -192,13 +192,14 @@ def buscar(
         # `ILIKE '%...%'` que varria as ~24M linhas sem usar índice.
         query = query.filter(Socio.cpf_cnpj_socio == _parse_documento(documento))
 
-    # `id` (a PK) desempata nomes iguais -- homonimo e a regra, nao a excecao,
-    # num arquivo de 24M socios, e sem desempate a linha da virada de pagina
-    # se repetiria ou sumiria.
-    keys = [
-        SortKey(Socio.nome_socio, "nome_socio", nullable=False),
-        SortKey(Socio.id, "id", nullable=False),
-    ]
+    # Ordena SO pela PK. Ordenar por `nome_socio` (o que este endpoint fazia
+    # antes) e uma armadilha com o filtro de nome: `ILIKE '%x%'` nao e
+    # indexavel, entao o planner caminha o indice de nome em ordem alfabetica
+    # testando linha a linha ate juntar a pagina -- o custo vira funcao de onde
+    # o nome cai no alfabeto. Medido em producao: `?nome=abreu` 15,8s,
+    # `?nome=zuzu` estourou o timeout, mesma consulta. Pela PK a ordenacao sai
+    # de graca e o filtro e o unico custo.
+    keys = [SortKey(Socio.id, "id", nullable=False)]
 
     items, next_cursor = paginate(
         query, keys, cursor, limit,

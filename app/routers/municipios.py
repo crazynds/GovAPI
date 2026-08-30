@@ -54,7 +54,9 @@ def search(
     if ufs:
         query = query.filter(Municipio.uf.in_(ufs))
 
-    results = query.order_by(Municipio.name).limit(limit).all()
+    # Ordena pela PK, como todo o resto da API -- ordenar por `name` faria o
+    # banco ordenar o resultado filtrado antes de cortar o `limit`.
+    results = query.order_by(Municipio.id).limit(limit).all()
     return [_serialize(m) for m in results]
 
 

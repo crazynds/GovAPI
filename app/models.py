@@ -128,11 +128,10 @@ class Establishment(Base):
         # WHERE o Postgres descarta o indice e cai em seq scan sobre 72M linhas
         # (ver DEFERRED_INDEXES em app/importer/pipeline.py).
         Index("ix_establishments_cellphone", "cellphone", postgresql_where=text("cellphone IS NOT NULL")),
-        # Compostos terminados em `cnpj` (a PK) porque a paginacao e por keyset
-        # e ordena por (coluna, PK) -- ver app/pagination.py.
+        # O que serve o filtro por UF. O sufixo de ordenacao e vestigial (a API
+        # so ordena pela PK), mas o prefixo `(uf)` e o que importa e refazer o
+        # indice so pra encurtar nao paga.
         Index("ix_establishments_uf_confidence", "uf", text("cellphone_confidence DESC"), text("cnpj DESC")),
-        Index("ix_establishments_confidence", text("cellphone_confidence DESC"), text("cnpj DESC")),
-        Index("ix_establishments_opened_at", text("opened_at DESC NULLS LAST"), text("cnpj DESC")),
         Index("ix_establishments_main_cnae", "main_cnae"),
         Index(
             "ix_establishments_secondary_cnaes",
@@ -290,9 +289,6 @@ class Socio(Base):
     __table_args__ = (
         Index("ix_socios_cnpj_basico", "cnpj_basico"),
         Index("ix_socios_cpf_cnpj_socio", "cpf_cnpj_socio", postgresql_where=text("cpf_cnpj_socio IS NOT NULL")),
-        # Ordenacao de /socios/buscar; `id` (a PK) fecha a ordem total exigida
-        # pelo keyset -- ver app/pagination.py.
-        Index("ix_socios_nome_socio", "nome_socio", "id"),
     )
 
     # Integer e nao BigInteger: sao ~24M linhas, e o TRUNCATE do inicio do
@@ -336,12 +332,6 @@ class Cep(Base):
     """
 
     __tablename__ = "correios_cep"
-    __table_args__ = (
-        # Ordenacao default de /enderecos/buscar, terminada na PK pro keyset
-        # ter ordem total -- ver app/pagination.py.
-        Index("ix_correios_cep_municipio_logradouro", "municipio", "logradouro", "cep"),
-    )
-
     cep: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
     # NULL quando o e-DNE traz um codigo IBGE que nao existe na lista atual
     # (municipio historico/fundido/extinto) -- mesmo tratamento de CEP orfao

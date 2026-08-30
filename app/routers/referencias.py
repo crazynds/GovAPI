@@ -17,7 +17,8 @@ def _search_router(prefix: str, model, tag_name: str) -> APIRouter:
 
     @sub.get("", response_model=list[CodeDescriptionOut])
     def list_all(db: Session = Depends(get_db)):
-        return db.query(model).order_by(model.code).all()
+        # Pela PK, como todo o resto da API.
+        return db.query(model).order_by(model.id).all()
 
     @sub.get("/{code}", response_model=CodeDescriptionOut)
     def by_code(code: str, db: Session = Depends(get_db)):
