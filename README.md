@@ -373,6 +373,33 @@ The one exception is `/enderecos`: passing `lat`+`lon` (and `/enderecos/proximos
 distance, because "nearest first" is the entire point of those. They pay for it, so use them
 only when you want proximity.
 
+### CNAE lookups
+
+A company has one main CNAE and any number of secondary ones, and `?cnae_codes=` matches
+either. That used to be stored as `main_cnae` plus a `secondary_cnaes integer[]` column, which
+made the filter `main_cnae = X OR secondary_cnaes && ARRAY[X]` — an `OR` between a btree and a
+GIN index, which produces no output ordered by `cnpj`. Combined with `ORDER BY cnpj LIMIT n`,
+the planner would walk the primary key filtering row by row, which on a selective slice
+(`?cnae_codes=6202300&uf=RS&only_with_cellphone=true`) means reading all 63M rows — a timeout.
+
+The relation now lives in its own table, `establishment_cnaes`: one row per (company, CNAE),
+with `is_main` marking the main one. The filter becomes plain equality on one column, and an
+index ending in `cnpj` hands back the page already in order, so `LIMIT` stops early instead of
+sorting the whole filtered set. `establishments.main_cnae` stays — it's a dimension of the
+stats aggregate and appears in every response.
+
+That table also carries **copies** of `uf` and a `has_cellphone` flag, and the search pushes
+those two filters into it. Without them the database would find candidates by CNAE and then
+probe the 63M-row table one by one to discover which are in Rio Grande do Sul and have a
+cellphone; with them, filter *and* order come out of a single index. Duplicating a column is
+normally a maintenance liability, but no update is possible here: both tables are rebuilt from
+scratch by the import and swapped in the *same* atomic `RENAME`.
+
+Passing several codes matches companies having **at least one** of them. There used to be a
+`cnae_match=all` ("has all of these") — it's gone: intersection can't be answered by merging
+index ranges, so it needed a `GROUP BY … HAVING count(*) = n` that reads every row of every
+code before the `LIMIT` can cut anything.
+
 ### Precomputed stats
 
 `/establishments/stats` reads `establishments_stats`, an aggregate table keyed by state,
@@ -411,7 +438,7 @@ arbitrary slice.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/establishments` | Search companies. Filters: `cnae_codes` (+ `cnae_match=any\|all`), `uf`, `regiao`, `municipio_codes`, `company_size`, `is_mei`, `is_simples`, `is_headquarters`, `name`, `situacao` (registration status, code or label — includes all statuses unless filtered), `has_phone`, `only_with_cellphone`, `only_with_email`, `opened_after`/`opened_before`; paginated by cursor via `cursor`/`limit` (see [Pagination](#pagination)). Results include CNAE, legal-nature, and deregistration-reason descriptions, plus human-readable labels for company size and registration status. |
+| `GET` | `/establishments` | Search companies. Filters: `cnae_codes` (matches the main CNAE or any secondary one; with several codes, matches companies having at least one of them), `uf`, `regiao`, `municipio_codes`, `company_size`, `is_mei`, `is_simples`, `is_headquarters`, `name`, `situacao` (registration status, code or label — includes all statuses unless filtered), `has_phone`, `only_with_cellphone`, `only_with_email`, `opened_after`/`opened_before`; paginated by cursor via `cursor`/`limit` (see [Pagination](#pagination)). Results include CNAE, legal-nature, and deregistration-reason descriptions, plus human-readable labels for company size and registration status. |
 | `GET` | `/establishments/by-cnpj` | Look up specific companies by CNPJ (`cnpjs=...`, repeatable). Accepts punctuation, a full CNPJ, or just the 8-position root. |
 | `GET` | `/establishments/stats` | Totals and breakdowns over the same filters as `/establishments`. Answered from a precomputed aggregate table rebuilt by the import, so it doesn't scan the 70M-row table at request time. Filters the aggregate doesn't carry (`name`, `opened_after`/`opened_before`, `municipio_codes`, `cnae_codes`, `only_with_cellphone`/`only_with_email`, `has_phone`) fall back to the full table and can be slow — for those, `include_breakdowns=true` is what makes it expensive. |
 | `GET` | `/cnaes/search-by-description` | Search CNAE codes by description (`words=...`, repeatable). |

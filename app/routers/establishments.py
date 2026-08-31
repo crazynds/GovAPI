@@ -9,7 +9,7 @@ na entrada. O contrato da API e o mesmo de quando as colunas eram texto.
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, func, or_
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Query as ORMQuery, Session
 
 from sqlalchemy import text
@@ -20,6 +20,7 @@ from app.db import get_db
 from app.models import (
     Cnae,
     Establishment,
+    EstablishmentCnae,
     EstablishmentCnaeStats as C,
     EstablishmentStats as S,
     Motivo,
@@ -155,8 +156,35 @@ def _code_descriptions(db: Session, model, codes: set[int], width: int) -> dict[
     return {as_text[code]: description for code, description in rows if code in as_text}
 
 
+def _secondary_cnaes(db: Session, cnpjs: set[int]) -> dict[int, list[int]]:
+    """Os CNAEs secundarios das empresas da pagina, numa query so.
+
+    Era uma coluna `integer[]` em `establishments`; virou linha em
+    `establishment_cnaes` pra busca poder indexar (ver models.EstablishmentCnae).
+    A leitura ficou uma query a mais por pagina, resolvida pelo prefixo `cnpj`
+    da PK da tabela N:N sobre as ~25 empresas da resposta.
+    """
+    if not cnpjs:
+        return {}
+
+    rows = (
+        db.query(EstablishmentCnae.cnpj, EstablishmentCnae.cnae)
+        .filter(EstablishmentCnae.cnpj.in_(cnpjs), EstablishmentCnae.is_main.is_(False))
+        .all()
+    )
+    grouped: dict[int, list[int]] = {}
+    for cnpj, cnae in rows:
+        grouped.setdefault(cnpj, []).append(cnae)
+    # Ordem estavel na resposta: a tabela nao garante nenhuma, e o array antigo
+    # saia na ordem do arquivo da Receita.
+    for codes in grouped.values():
+        codes.sort()
+    return grouped
+
+
 def _serialize(
     e: Establishment,
+    secondary: list[int] | None = None,
     cnae_map: dict[int, str] | None = None,
     natureza_map: dict[int, str] | None = None,
     motivo_map: dict[int, str] | None = None,
@@ -165,7 +193,7 @@ def _serialize(
     cnae_map = cnae_map or {}
     natureza_map = natureza_map or {}
     motivo_map = motivo_map or {}
-    secondary = e.secondary_cnaes or []
+    secondary = secondary or []
     cnae_width = CODE_WIDTHS["cnae"]
 
     return EstablishmentOut(
@@ -206,13 +234,15 @@ def _e164(national: int | None) -> str | None:
 
 
 def _serialize_many(db: Session, items: list[Establishment]) -> list[EstablishmentOut]:
+    secondary = _secondary_cnaes(db, {e.cnpj for e in items})
+
     cnae_codes: set[int] = set()
     natureza_codes: set[int] = set()
     motivo_codes: set[int] = set()
     for e in items:
         if e.main_cnae is not None:
             cnae_codes.add(e.main_cnae)
-        cnae_codes.update(e.secondary_cnaes or [])
+        cnae_codes.update(secondary.get(e.cnpj, ()))
         if e.natureza_juridica is not None:
             natureza_codes.add(e.natureza_juridica)
         if e.motivo_situacao_cadastral is not None:
@@ -222,14 +252,16 @@ def _serialize_many(db: Session, items: list[Establishment]) -> list[Establishme
     natureza_map = _code_descriptions(db, NaturezaJuridica, natureza_codes, CODE_WIDTHS["natureza"])
     motivo_map = _code_descriptions(db, Motivo, motivo_codes, CODE_WIDTHS["motivo"])
     correios = _ceps_from_correios(db, {e.cep for e in items if e.cep})
-    return [_serialize(e, cnae_map, natureza_map, motivo_map, correios) for e in items]
+    return [
+        _serialize(e, secondary.get(e.cnpj), cnae_map, natureza_map, motivo_map, correios)
+        for e in items
+    ]
 
 
 def _apply_filters(
     query: ORMQuery,
     *,
     cnae_codes: list[str] | None,
-    cnae_match: str,
     uf: list[str] | None,
     regiao: str | None,
     municipio_codes: list[str] | None,
@@ -245,29 +277,48 @@ def _apply_filters(
     opened_after: date | None,
     opened_before: date | None,
 ) -> ORMQuery:
-    if cnae_codes:
-        # `overlap` (o operador && do Postgres) sobre INTEGER[] usa o indice
-        # GIN de secondary_cnaes; a versao anterior castava um JSON pra JSONB
-        # linha a linha, o que nao usava indice nenhum e varria a tabela.
-        codes = _cnae_codes_to_int(cnae_codes)
-        per_code = [
-            or_(Establishment.main_cnae == code, Establishment.secondary_cnaes.overlap([code]))
-            for code in codes
-        ]
-        query = query.filter(and_(*per_code) if cnae_match == "all" else or_(*per_code))
-
+    # UF antes do CNAE porque o filtro de CNAE reaproveita os codigos: eles vao
+    # empurrados pra DENTRO da subquery da tabela N:N (ver abaixo).
     ufs = set(uf or [])
     if regiao:
         regiao_ufs = ufs_for_regiao(regiao)
         if not regiao_ufs:
             raise HTTPException(422, f"Região desconhecida: {regiao!r} (use norte/nordeste/centro-oeste/sudeste/sul)")
         ufs |= set(regiao_ufs)
+    uf_codes: list[int] = []
     if ufs:
-        codes = [uf_code(u) for u in ufs]
-        unknown = [u for u, c in zip(ufs, codes) if c is None]
+        uf_codes = [uf_code(u) for u in ufs]
+        unknown = [u for u, c in zip(ufs, uf_codes) if c is None]
         if unknown:
             raise HTTPException(422, f"UF desconhecida: {sorted(unknown)}")
-        query = query.filter(Establishment.uf.in_(codes))
+        query = query.filter(Establishment.uf.in_(uf_codes))
+
+    if cnae_codes:
+        # Semi-join na tabela N:N: "as empresas que tem algum destes CNAEs".
+        # Antes era `main_cnae = X OR secondary_cnaes && [X]`, um OR entre btree
+        # e GIN que nao produz saida ordenada por `cnpj` -- e com `ORDER BY cnpj
+        # LIMIT n` o planner acabava varrendo a PK filtrando linha a linha, as
+        # 63M. Aqui e igualdade numa coluna so.
+        #
+        # `uf` e `has_cellphone` sao REPETIDOS dentro da subquery, mesmo ja
+        # estando no WHERE de fora. E o ponto todo de a tabela N:N carregar
+        # essas duas colunas: com elas aqui, o indice
+        # (cnae, uf, cnpj) WHERE has_cellphone devolve os candidatos ja
+        # filtrados e em ordem de `cnpj`; sem elas, o banco traria todos os
+        # candidatos do CNAE no pais inteiro pra descobrir na tabela grande,
+        # um por um, quais sao do RS e tem celular.
+        codes = _cnae_codes_to_int(cnae_codes)
+        matching = select(EstablishmentCnae.cnpj).where(EstablishmentCnae.cnae.in_(codes))
+        if uf_codes:
+            matching = matching.where(EstablishmentCnae.uf.in_(uf_codes))
+        if only_with_cellphone:
+            # A coluna crua, sem `== True`/`IS TRUE`: e a forma que casa
+            # LITERALMENTE com o predicado do indice parcial
+            # (`... WHERE has_cellphone`). O Postgres so usa um indice parcial
+            # se conseguir provar o predicado a partir do WHERE, e escrever
+            # isso de outro jeito e apostar nessa prova sem precisar.
+            matching = matching.where(EstablishmentCnae.has_cellphone)
+        query = query.filter(Establishment.cnpj.in_(matching))
 
     if municipio_codes:
         codes = [int(c) for c in municipio_codes if str(c).strip().isdigit()]
@@ -319,8 +370,11 @@ def _apply_filters(
 
 @router.get("", response_model=EstablishmentPage)
 def search(
-    cnae_codes: list[str] | None = Query(None, description="Códigos CNAE (principal ou secundário)"),
-    cnae_match: str = Query("any", pattern="^(any|all)$", description="'any': tem ao menos um dos CNAEs; 'all': tem todos"),
+    cnae_codes: list[str] | None = Query(
+        None,
+        description="Códigos CNAE (principal ou secundário). Com vários, casa quem tem "
+                    "ao menos um deles.",
+    ),
     uf: list[str] | None = Query(None, description="Uma ou mais UFs, ex: ?uf=SP&uf=RJ"),
     regiao: str | None = Query(None, description="norte/nordeste/centro-oeste/sudeste/sul, combina com uf"),
     municipio_codes: list[str] | None = Query(None),
@@ -357,7 +411,6 @@ def search(
     query = _apply_filters(
         db.query(Establishment),
         cnae_codes=cnae_codes,
-        cnae_match=cnae_match,
         uf=uf,
         regiao=regiao,
         municipio_codes=municipio_codes,
@@ -387,7 +440,7 @@ def search(
     items, next_cursor = paginate(
         query, keys, cursor, limit,
         make_fingerprint(
-            cnae_codes=cnae_codes, cnae_match=cnae_match, uf=uf, regiao=regiao,
+            cnae_codes=cnae_codes, uf=uf, regiao=regiao,
             municipio_codes=municipio_codes, company_size=company_size, is_mei=is_mei,
             is_simples=is_simples, is_headquarters=is_headquarters, name=name,
             situacao=situacao, only_with_cellphone=only_with_cellphone,
@@ -481,7 +534,6 @@ def _rollup_query(
 @router.get("/stats", response_model=EstablishmentStatsOut)
 def stats(
     cnae_codes: list[str] | None = Query(None),
-    cnae_match: str = Query("any", pattern="^(any|all)$"),
     uf: list[str] | None = Query(None),
     regiao: str | None = Query(None),
     municipio_codes: list[str] | None = Query(None),
@@ -512,7 +564,6 @@ def stats(
     base = _apply_filters(
         db.query(Establishment),
         cnae_codes=cnae_codes,
-        cnae_match=cnae_match,
         uf=uf,
         regiao=regiao,
         municipio_codes=municipio_codes,
@@ -540,8 +591,7 @@ def stats(
 
     # Um unico CNAE tem resposta exata no agregado por CNAE. Varios nao: uma
     # empresa que tenha dois deles esta em dois baldes e a soma a contaria duas
-    # vezes -- ver models.EstablishmentCnaeStats. `cnae_match` nao importa com
-    # um codigo so ("qualquer um" e "todos" sao a mesma coisa).
+    # vezes -- ver models.EstablishmentCnaeStats.
     single_cnae = None
     if cnae_codes:
         codes = _cnae_codes_to_int(cnae_codes)

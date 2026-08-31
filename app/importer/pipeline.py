@@ -830,7 +830,6 @@ DEFERRED_INDEXES = [
     # ix_establishments_uf, que era parcial em `situacao_cadastral = 2`.
     ("ix_establishments_uf_confidence", "(uf, cellphone_confidence DESC, cnpj DESC)", None, None),
     ("ix_establishments_main_cnae", "(main_cnae)", None, None),
-    ("ix_establishments_secondary_cnaes", "(secondary_cnaes)", "secondary_cnaes IS NOT NULL", "gin"),
     ("ix_establishments_situacao_cadastral", "(situacao_cadastral)", None, None),
     ("ix_establishments_cep", "(cep)", "cep IS NOT NULL", None),
     # Busca por nome (`?name=`) e `ILIKE '%x%'`, que um btree nao consegue
@@ -840,6 +839,18 @@ DEFERRED_INDEXES = [
     # parcial; `company_name` e NOT NULL e nao tem o que podar.
     ("ix_establishments_company_name_trgm", "(company_name gin_trgm_ops)", None, "gin"),
     ("ix_establishments_trade_name_trgm", "(trade_name gin_trgm_ops)", "trade_name IS NOT NULL", "gin"),
+]
+
+# Indices da relacao N:N empresa-CNAE (ver models.EstablishmentCnae). Mesma
+# logica de adiar: a tabela e maior que `establishments` (uma linha por CNAE da
+# empresa, nao por empresa) e cria os indices depois do bulk load.
+CNAES_DEFERRED_INDEXES = [
+    ("ix_establishment_cnaes_cnae_uf_cnpj", "(cnae, uf, cnpj)", None, None),
+    # Parcial pra `only_with_cellphone=true`, que e o default da API. Aqui o
+    # predicado parcial e seguro (ao contrario do caso de `situacao_cadastral`
+    # comentado acima): quando o cliente manda `false`, o filtro sai do WHERE,
+    # o Postgres descarta este indice e cai no de cima, que cobre tudo.
+    ("ix_establishment_cnaes_cellphone", "(cnae, uf, cnpj)", "has_cellphone", None),
 ]
 
 SOCIOS_DEFERRED_INDEXES = [
@@ -909,6 +920,58 @@ def _finalize_socios(db: Session, progress: Session, display: ProgressDisplay) -
     db.commit()
 
     _set_step(progress, "build", group="build", status="success", message="socios trocado atomicamente")
+
+
+def _build_cnaes_table(db: Session, display: ProgressDisplay, slot: int) -> None:
+    """Monta `establishment_cnaes_new` -- uma linha por (empresa, CNAE).
+
+    Sai do staging, nao de `establishments_new`: o staging tem tudo que a tabela
+    precisa (cnpj, principal, array de secundarios, uf, cellphone) e a relacao e
+    1:1 com o que acabou de ser inserido, entao nao ha join a fazer.
+
+    O LATERAL abre a empresa em uma linha por CNAE: o principal, mais os
+    secundarios. `array_remove` tira o principal da lista de secundarios --
+    a Receita as vezes repete, e sem isso a PK (cnpj, cnae) quebraria no fim;
+    `DISTINCT` cobre repeticao dentro do proprio array. `coalesce` porque o
+    array e NULL (nao vazio) quando nao ha secundario nenhum, e `main_cnae`
+    NULL cai no WHERE.
+
+    UNLOGGED e sem indice nenhum durante o load, igual `establishments_new`:
+    PK e indices vem depois, em `_finalize_cnaes`.
+    """
+    display.set(slot, "  build: INSERT establishment_cnaes_new ...")
+    t0 = time.monotonic()
+    db.execute(text("DROP TABLE IF EXISTS establishment_cnaes_new"))
+    db.execute(text("""
+        CREATE UNLOGGED TABLE establishment_cnaes_new (
+            cnpj bigint NOT NULL,
+            cnae integer NOT NULL,
+            uf smallint,
+            is_main boolean NOT NULL,
+            has_cellphone boolean NOT NULL
+        )
+    """))
+    db.execute(text("ALTER TABLE establishment_cnaes_new SET (fillfactor = 100)"))
+    db.commit()
+
+    inserted = db.execute(text("""
+        INSERT INTO establishment_cnaes_new (cnpj, cnae, uf, is_main, has_cellphone)
+        SELECT s.cnpj, c.cnae, s.uf, c.is_main, s.cellphone IS NOT NULL
+        FROM estabelecimentos_staging s
+        CROSS JOIN LATERAL (
+            SELECT s.cnae_fiscal_principal AS cnae, true AS is_main
+            UNION ALL
+            SELECT DISTINCT unnest(array_remove(
+                coalesce(s.cnae_fiscal_secundaria, '{}'::integer[]),
+                s.cnae_fiscal_principal
+            )), false
+        ) c
+        WHERE c.cnae IS NOT NULL
+    """))
+    db.commit()
+    logger.info(
+        "establishment_cnaes_new: %d linhas em %.1fs", inserted.rowcount, time.monotonic() - t0
+    )
 
 
 def _build_final_table(db: Session, progress: Session, period: str, display: ProgressDisplay) -> None:
@@ -1019,7 +1082,7 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
         INSERT INTO establishments_new
             (cnpj, phone, cellphone, main_cnae, municipio_id, cep, opened_at, uf, company_size,
              situacao_cadastral, natureza_juridica, motivo_situacao_cadastral, cellphone_confidence,
-             is_headquarters, is_mei, is_simples, secondary_cnaes, company_name, trade_name, email,
+             is_headquarters, is_mei, is_simples, company_name, trade_name, email,
              address_number, address_complement, street, district, address)
         SELECT
             e.cnpj,
@@ -1038,7 +1101,6 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
             e.is_headquarters,
             coalesce(s.opcao_mei, false),
             coalesce(s.opcao_simples, false),
-            e.cnae_fiscal_secundaria,
             coalesce(emp.razao_social, e.nome_fantasia, ''),
             e.nome_fantasia,
             e.correio_eletronico,
@@ -1092,6 +1154,11 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
             cov["resolvidos"], localidade,
         )
 
+    # Relacao N:N empresa-CNAE, o caminho de busca de `?cnae_codes=`
+    # (ver models.EstablishmentCnae). Aqui, com o staging ainda carregado.
+    _set_step(progress, "build", period=period, group="build", status="running", message="tabela de CNAEs")
+    _build_cnaes_table(db, display, slot)
+
     # `Municipios.zip` da Receita so tem codigo+nome, sem UF -- pega o UF de
     # qualquer estabelecimento daquele municipio (sao 1:1) enquanto o staging
     # ainda existe. Sem isso Municipio.uf fica sempre NULL, o filtro por UF de
@@ -1133,19 +1200,37 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
     db.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
     db.commit()
 
-    for name, cols, where, using in DEFERRED_INDEXES:
-        _set_step(progress, "build", period=period, group="build", status="running", message=f"índice {name}")
-        display.set(slot, f"  build: criando índice {name}")
-        using_sql = f" USING {using}" if using else ""
-        where_sql = f" WHERE {where}" if where else ""
-        db.execute(text(f'CREATE INDEX "{name}_new" ON establishments_new{using_sql} {cols}{where_sql}'))
-        db.commit()
+    for table, indexes in (
+        ("establishments_new", DEFERRED_INDEXES),
+        ("establishment_cnaes_new", CNAES_DEFERRED_INDEXES),
+    ):
+        for name, cols, where, using in indexes:
+            _set_step(progress, "build", period=period, group="build", status="running", message=f"índice {name}")
+            display.set(slot, f"  build: criando índice {name}")
+            using_sql = f" USING {using}" if using else ""
+            where_sql = f" WHERE {where}" if where else ""
+            db.execute(text(f'CREATE INDEX "{name}_new" ON {table}{using_sql} {cols}{where_sql}'))
+            db.commit()
+
+    # A PK da tabela N:N tambem e adiada: ela nao serve pro load (nao ha ON
+    # CONFLICT ali, o LATERAL ja garante unicidade) e sim pra leitura por
+    # pagina. Criar depois e ordens de magnitude mais rapido -- e e aqui que um
+    # CNAE repetido que tenha escapado do `array_remove`/`DISTINCT` apareceria,
+    # como erro, em vez de virar linha duplicada calada.
+    _set_step(progress, "build", period=period, group="build", status="running", message="PK de establishment_cnaes")
+    display.set(slot, "  build: PK de establishment_cnaes_new")
+    db.execute(text(
+        "ALTER TABLE establishment_cnaes_new "
+        "ADD CONSTRAINT establishment_cnaes_new_pkey PRIMARY KEY (cnpj, cnae)"
+    ))
+    db.commit()
 
     # Grava a tabela inteira no WAL de uma vez -- unico ponto em que o bulk
     # load paga esse custo, em vez de a cada linha/indice.
     _set_step(progress, "build", period=period, group="build", status="running", message="tornando establishments_new durável (SET LOGGED)")
     display.set(slot, "  build: SET LOGGED (grava no WAL)")
     db.execute(text("ALTER TABLE establishments_new SET LOGGED"))
+    db.execute(text("ALTER TABLE establishment_cnaes_new SET LOGGED"))
     db.commit()
 
     # Agregado de /establishments/stats, montado do MESMO snapshot e trocado no
@@ -1161,13 +1246,15 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
     db.commit()
 
     # Segundo agregado, por CNAE principal-ou-secundario. Passada separada
-    # porque o LATERAL abre cada empresa em uma linha por CNAE -- nao da pra
-    # sair do mesmo GROUP BY do agregado acima.
+    # porque o grao e uma linha por (empresa, CNAE) -- nao da pra sair do mesmo
+    # GROUP BY do agregado acima. Sai do join com a tabela N:N.
     _set_step(progress, "build", period=period, group="build", status="running", message="agregado de stats por CNAE")
     display.set(slot, "  build: agregado de stats por CNAE")
     db.execute(text(f"DROP TABLE IF EXISTS {stats_rollup.CNAE_TABLE}_new"))
     db.execute(text(stats_rollup.cnae_create_sql(f"{stats_rollup.CNAE_TABLE}_new")))
-    db.execute(text(stats_rollup.cnae_build_sql(f"{stats_rollup.CNAE_TABLE}_new", "establishments_new")))
+    db.execute(text(stats_rollup.cnae_build_sql(
+        f"{stats_rollup.CNAE_TABLE}_new", "establishments_new", "establishment_cnaes_new",
+    )))
     for statement in stats_rollup.cnae_index_sql(f"{stats_rollup.CNAE_TABLE}_new", "_new"):
         db.execute(text(statement))
     db.commit()
@@ -1181,6 +1268,21 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
     for name, _cols, _where, _using in DEFERRED_INDEXES:
         db.execute(text(f'ALTER INDEX "{name}_new" RENAME TO "{name}"'))
     db.execute(text("ALTER INDEX establishments_new_pkey RENAME TO establishments_pkey"))
+
+    # A tabela N:N troca no MESMO swap -- e disso que depende ela nunca
+    # discordar de `establishments` (ver models.EstablishmentCnae: as colunas
+    # `uf`/`has_cellphone` sao copias, e o que as mantem corretas e as duas
+    # sairem do mesmo snapshot e virarem visiveis juntas). `IF EXISTS` porque
+    # no primeiro import a tabela canonica ainda nao existe.
+    db.execute(text("DROP TABLE IF EXISTS establishment_cnaes_old"))
+    db.execute(text("ALTER TABLE IF EXISTS establishment_cnaes RENAME TO establishment_cnaes_old"))
+    db.execute(text("ALTER TABLE establishment_cnaes_new RENAME TO establishment_cnaes"))
+    db.execute(text("DROP TABLE IF EXISTS establishment_cnaes_old"))
+    for name, _cols, _where, _using in CNAES_DEFERRED_INDEXES:
+        db.execute(text(f'ALTER INDEX "{name}_new" RENAME TO "{name}"'))
+    db.execute(text(
+        "ALTER INDEX establishment_cnaes_new_pkey RENAME TO establishment_cnaes_pkey"
+    ))
 
     # O agregado entra no mesmo RENAME: as duas tabelas viram visiveis juntas,
     # entao nao existe instante em que /stats responda sobre um snapshot e
@@ -1209,6 +1311,7 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
     display.set(slot, "  build: ANALYZE na tabela final")
     _set_step(progress, "build", period=period, group="build", status="running", message="ANALYZE establishments")
     db.execute(text("ANALYZE establishments"))
+    db.execute(text("ANALYZE establishment_cnaes"))
     db.execute(text(f"ANALYZE {stats_rollup.TABLE}"))
     db.execute(text(f"ANALYZE {stats_rollup.CNAE_TABLE}"))
     db.commit()

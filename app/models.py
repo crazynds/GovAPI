@@ -133,12 +133,6 @@ class Establishment(Base):
         # indice so pra encurtar nao paga.
         Index("ix_establishments_uf_confidence", "uf", text("cellphone_confidence DESC"), text("cnpj DESC")),
         Index("ix_establishments_main_cnae", "main_cnae"),
-        Index(
-            "ix_establishments_secondary_cnaes",
-            "secondary_cnaes",
-            postgresql_using="gin",
-            postgresql_where=text("secondary_cnaes IS NOT NULL"),
-        ),
         Index("ix_establishments_situacao_cadastral", "situacao_cadastral"),
         Index("ix_establishments_cep", "cep", postgresql_where=text("cep IS NOT NULL")),
         # `?name=` e ILIKE '%x%', que btree nenhum avalia -- so um GIN de
@@ -184,7 +178,6 @@ class Establishment(Base):
     is_simples: Mapped[bool] = mapped_column(Boolean, default=False)
     # NULL quando nao ha nenhum, nao array vazio -- um '{}' custa 24 bytes por
     # linha, e a maioria das empresas nao tem CNAE secundario.
-    secondary_cnaes: Mapped[list[int] | None] = mapped_column(ARRAY(Integer), nullable=True)
     company_name: Mapped[str] = mapped_column(Text)
     trade_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     email: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -205,6 +198,70 @@ class Establishment(Base):
     address: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     municipio: Mapped[Municipio | None] = relationship()
+
+
+class EstablishmentCnae(Base):
+    """Relacao N:N entre estabelecimento e CNAE -- uma linha por (empresa, CNAE).
+
+    Substitui o par `main_cnae` + `secondary_cnaes` (array) como CAMINHO DE
+    BUSCA. `establishments.main_cnae` continua existindo, porque e dimensao do
+    agregado de /stats e sai em toda resposta; o array de secundarios saiu, e o
+    conteudo dele agora vive aqui, uma linha por codigo, com `is_main`
+    distinguindo o principal.
+
+    Motivo: o filtro `?cnae_codes=` era `main_cnae = X OR secondary_cnaes && [X]`,
+    um OR entre um btree e um GIN que nao produz saida ordenada por `cnpj`.
+    Com `ORDER BY cnpj LIMIT n` o planner ou ordenava o conjunto filtrado
+    inteiro, ou (o que ele escolhia) varria a PK linha a linha filtrando --
+    a tabela toda, ~63M linhas, e timeout. Aqui o mesmo filtro e igualdade
+    numa coluna so, e um indice terminado em `cnpj` entrega a pagina em ordem
+    sem ordenar nada.
+
+    `uf` e `has_cellphone` sao COPIAS de `establishments` -- de proposito. Sem
+    elas o banco acha os candidatos por CNAE aqui e precisa sondar a PK da
+    tabela grande um por um pra descobrir quem e do RS e tem celular; num
+    recorte seletivo isso e o gargalo de volta. Com elas, filtro e ordem saem
+    de um indice unico, sem tocar em `establishments`. Duplicar coluna
+    normalmente e divida de manutencao, mas aqui nao ha update possivel: as
+    duas tabelas sao reconstruidas do zero a cada import e trocadas no MESMO
+    RENAME atomico (ver _build_final_table). Sao os dois filtros copiados
+    porque sao os dois que aparecem em praticamente toda busca -- os outros
+    (porte, situacao, MEI, data) continuam sendo resolvidos no join.
+
+    Sem FOREIGN KEY pra `establishments`: as duas trocam de nome no mesmo swap,
+    e uma FK entre elas so criaria ordem obrigatoria no RENAME em troca de
+    garantia nenhuma (ambas saem do mesmo INSERT, do mesmo snapshot).
+
+    Ordem das colunas pelo mesmo motivo de `Establishment`: largura fixa
+    decrescente, 16 bytes de parte fixa sem padding.
+    """
+
+    __tablename__ = "establishment_cnaes"
+    __table_args__ = (
+        # O indice da busca. `cnae` primeiro porque e sempre igualdade e e o
+        # que define a consulta; `uf` em seguida porque e o filtro mais comum
+        # depois dele; `cnpj` no fim pra saida ja sair na ordem do ORDER BY --
+        # e isso que faz o LIMIT parar cedo em vez de ordenar o conjunto todo.
+        Index("ix_establishment_cnaes_cnae_uf_cnpj", "cnae", "uf", "cnpj"),
+        # Mesma coisa, podado pra quem tem celular -- o default da API e
+        # `only_with_cellphone=true`. Parcial e seguro aqui (ao contrario do
+        # que aconteceu com `situacao_cadastral = 2`, ver DEFERRED_INDEXES):
+        # quando o cliente manda `only_with_cellphone=false` o predicado sai do
+        # WHERE, o Postgres descarta este indice e usa o de cima, que cobre
+        # todas as linhas.
+        Index("ix_establishment_cnaes_cellphone", "cnae", "uf", "cnpj",
+              postgresql_where=text("has_cellphone")),
+    )
+
+    # (cnpj, cnae) e a chave natural e serve as duas coisas: garante que nao ha
+    # linha repetida (o principal as vezes repete na lista de secundarios) e
+    # responde a leitura por pagina -- os CNAEs das ~25 empresas da resposta,
+    # que e como a serializacao remonta o que era o array.
+    cnpj: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    cnae: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    uf: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    is_main: Mapped[bool] = mapped_column(Boolean)
+    has_cellphone: Mapped[bool] = mapped_column(Boolean)
 
 
 # UNLOGGED em todas as tabelas de staging: elas sao inteiramente
@@ -231,9 +288,10 @@ class EstablishmentStats(Base):
 
     NAO cobre todo filtro do endpoint: `name` (ILIKE), `opened_at`,
     `municipio_codes` e CNAE secundario ficam de fora -- os tres primeiros por
-    cardinalidade, o ultimo porque `secondary_cnaes` e array e desnormalizar
-    contaria a mesma empresa mais de uma vez. Pedido que use qualquer um deles
-    cai na tabela grande; quem decide e `_stats_from_rollup` no router.
+    cardinalidade, o ultimo porque uma empresa tem varios CNAEs e desnormalizar
+    contaria ela mais de uma vez (e o que `EstablishmentCnaeStats` resolve, pra
+    um codigo por consulta). Pedido que use qualquer um deles cai na tabela
+    grande; quem decide e `uncovered` no router.
     """
 
     __tablename__ = "establishments_stats"
@@ -271,7 +329,7 @@ class EstablishmentCnaeStats(Base):
     """Agregado por CNAE, contando o codigo como principal OU secundario.
 
     Existe separado de `EstablishmentStats` porque o filtro `?cnae_codes=` casa
-    os dois, e `secondary_cnaes` e um array: nao da pra ter CNAE principal e
+    os dois, e uma empresa tem varios CNAEs: nao da pra ter principal e
     secundario como uma dimensao so sem desnormalizar. Medido em producao --
     CNAE 4781400 em PR: 240.771 como principal, 397.369 contando secundarios.
     Ignorar o secundario subnotificaria 39,4%.

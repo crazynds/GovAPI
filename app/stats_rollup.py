@@ -25,13 +25,20 @@ DIMENSIONS = (
 # `with_email` passar a significar "tem os dois". Ver _measure_columns no router.
 MEASURES = ("total", "with_cellphone", "with_email", "with_phone", "with_cellphone_and_email")
 
-_MEASURE_SQL = """
+def _measure_sql(prefix: str = "") -> str:
+    """As medidas do agregado. `prefix` e o alias da tabela de estabelecimentos
+    quando a query tem join (`e.`) -- sem ele o SQL sai como sempre foi."""
+    p = prefix
+    return f"""
                count(*),
-               count(*) FILTER (WHERE cellphone IS NOT NULL),
-               count(*) FILTER (WHERE email IS NOT NULL),
-               count(*) FILTER (WHERE phone IS NOT NULL),
-               count(*) FILTER (WHERE cellphone IS NOT NULL AND email IS NOT NULL)
+               count(*) FILTER (WHERE {p}cellphone IS NOT NULL),
+               count(*) FILTER (WHERE {p}email IS NOT NULL),
+               count(*) FILTER (WHERE {p}phone IS NOT NULL),
+               count(*) FILTER (WHERE {p}cellphone IS NOT NULL AND {p}email IS NOT NULL)
 """
+
+
+_MEASURE_SQL = _measure_sql()
 
 _MEASURE_DDL = """
             total bigint NOT NULL,
@@ -44,11 +51,11 @@ _MEASURE_DDL = """
 # --- Agregado por CNAE -------------------------------------------------------
 #
 # Tabela separada porque o filtro `?cnae_codes=` casa CNAE principal OU
-# secundario, e `secondary_cnaes` e um array. Medido em producao: pro CNAE
+# secundario, e uma empresa tem varios. Medido em producao: pro CNAE
 # 4781400 em PR, o secundario acrescenta 39,4% das empresas -- responder so
 # pelo principal subnotificaria quase metade do alvo.
 #
-# O preco de desnormalizar o array e que as linhas NAO podem ser somadas entre
+# O preco de abrir uma linha por CNAE e que elas NAO podem ser somadas entre
 # CNAEs diferentes: uma empresa com dois CNAEs aparece em dois baldes e seria
 # contada duas vezes. Por isso o router so usa esta tabela pra UM codigo por
 # vez -- dentro de um unico `cnae`, cada empresa aparece uma vez so, e ai a
@@ -83,29 +90,32 @@ def build_sql(target: str, source: str) -> str:
     """
 
 
-def cnae_build_sql(target: str, source: str) -> str:
-    """INSERT do agregado por CNAE.
+def cnae_build_sql(target: str, source: str, cnaes: str) -> str:
+    """INSERT do agregado por CNAE, a partir da tabela N:N.
 
-    O LATERAL abre cada empresa em uma linha por CNAE distinto dela --
-    principal e secundarios juntos. `DISTINCT` porque o principal as vezes
-    tambem aparece na lista de secundarios, e sem ele a empresa seria contada
-    duas vezes dentro do MESMO balde. `coalesce` porque `secondary_cnaes` e
-    NULL (nao array vazio) quando nao ha nenhum, e `NULL || x` seria NULL.
-    `main_cnae` NULL vira um elemento NULL no array, descartado pelo WHERE.
+    `cnaes` e a relacao empresa-CNAE (models.EstablishmentCnae), que ja tem uma
+    linha por CNAE distinto da empresa -- principal e secundarios juntos, sem
+    repetir quando o principal tambem aparece como secundario (a PK
+    (cnpj, cnae) impede). Era um LATERAL que abria o array `secondary_cnaes`;
+    com o array fora de `establishments`, a abertura ja esta materializada e o
+    que sobra e o join.
+
+    O join traz as dimensoes que so existem em `establishments` (situacao,
+    porte, MEI/Simples, matriz). `uf` tambem vem daqui, e nao da copia em
+    `cnaes`, pra manter uma fonte so pro agregado.
     """
     dims = ", ".join(CNAE_DIMENSIONS)
+    # `cnae` e a unica dimensao que vem da tabela N:N; o resto vem do join.
+    select_dims = ", ".join(
+        f"ec.{d}" if d == "cnae" else f"e.{d}" for d in CNAE_DIMENSIONS
+    )
     return f"""
         INSERT INTO {target} ({dims}, {', '.join(MEASURES)})
-        SELECT {dims},
-{_MEASURE_SQL}
-        FROM {source} e
-        CROSS JOIN LATERAL (
-            SELECT DISTINCT unnest(
-                coalesce(e.secondary_cnaes, '{{}}'::integer[]) || e.main_cnae
-            ) AS cnae
-        ) codes
-        WHERE codes.cnae IS NOT NULL
-        GROUP BY {dims}
+        SELECT {select_dims},
+{_measure_sql("e.")}
+        FROM {cnaes} ec
+        JOIN {source} e ON e.cnpj = ec.cnpj
+        GROUP BY {select_dims}
     """
 
 
