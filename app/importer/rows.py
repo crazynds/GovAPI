@@ -114,7 +114,7 @@ def _phone(ddd: str | None, number: str | None) -> tuple[int | None, int | None,
     return national, None, 0
 
 
-def _documento(identificador: str | None, raw: str | None) -> int | None:
+def _tax_id(identificador: str | None, raw: str | None) -> int | None:
     """CPF/CNPJ de socio como inteiro.
 
     A Receita entrega o CPF mascarado por LGPD (`***123456**`): so os 6 digitos
@@ -122,12 +122,12 @@ def _documento(identificador: str | None, raw: str | None) -> int | None:
     completo, que vai em base 36 como qualquer outro CNPJ nosso.
 
     Pra socio PJ o valor guardado *tem* que ser base 36, porque a saida
-    (`routers/socios._documento`) decodifica em base 36 sempre que
-    `identificador_socio == 1`. Entao aqui a decisao e pelo identificador, e
+    (`routers/partners._tax_id`) decodifica em base 36 sempre que
+    `partner_type == 1`. Entao aqui a decisao e pelo identificador, e
     nao pelo tamanho: parte dos registros vem so com a raiz de 8 posicoes
     (`cnpj_codec.parse` completa com a ordem da matriz, 0001), e quando eles
     caiam no `int(cleaned)` decimal a API devolvia um documento inventado --
-    e o registro ficava inalcancavel por `?documento=`. O que nem assim da um
+    e o registro ficava inalcancavel por `?tax_id=`. O que nem assim da um
     CNPJ valido vira NULL: qualquer inteiro fora da base 36 sairia corrompido
     na leitura de qualquer forma.
     """
@@ -152,7 +152,7 @@ def _cep(value: str | None) -> int | None:
 
     A Receita traz CEP com e sem pontuacao, e as vezes lixo ("00000000",
     zeros, tamanho errado) -- nesses casos NULL, senao o vinculo com
-    `correios_cep` aponta pra um CEP que nao existe.
+    `postal_codes` aponta pra um CEP que nao existe.
     """
     if not value:
         return None
@@ -162,9 +162,9 @@ def _cep(value: str | None) -> int | None:
     return int(digits) or None
 
 
-def _logradouro(tipo: str | None, nome: str | None) -> str | None:
+def _street(street_type: str | None, name: str | None) -> str | None:
     """"RUA" + "DAS FLORES" -> "RUA DAS FLORES" (a Receita separa os dois)."""
-    parts = [p for p in (_text(tipo), _text(nome)) if p]
+    parts = [p for p in (_text(street_type), _text(name)) if p]
     return " ".join(parts) or None
 
 
@@ -177,7 +177,7 @@ def _cpf(raw: str | None) -> int | None:
 
 
 def _transform_simples(row: dict, counters: Counters) -> list | None:
-    simples, mei = _bool(row.get("opcao_simples")), _bool(row.get("opcao_mei"))
+    simples, mei = _bool(row.get("simples_option")), _bool(row.get("mei_option"))
     if not simples and not mei:
         # Linha que diz "nao e Simples nem MEI" nao carrega informacao: o build
         # faz LEFT JOIN com `coalesce(..., false)`, entao a ausencia da linha da
@@ -186,22 +186,22 @@ def _transform_simples(row: dict, counters: Counters) -> list | None:
         counters.skipped += 1
         return None
 
-    return [cnpj_codec.basico_to_int(row["cnpj_basico"] or ""), simples, mei]
+    return [cnpj_codec.root_to_int(row["cnpj_root"] or ""), simples, mei]
 
 
-def _transform_empresas(row: dict, _counters: Counters) -> list | None:
+def _transform_companies(row: dict, _counters: Counters) -> list | None:
     return [
-        cnpj_codec.basico_to_int(row["cnpj_basico"] or ""),
-        _int(row.get("porte_empresa")),
-        _int(row.get("natureza_juridica")),
-        _text(row.get("razao_social")),
+        cnpj_codec.root_to_int(row["cnpj_root"] or ""),
+        _int(row.get("company_size")),
+        _int(row.get("legal_nature")),
+        _text(row.get("company_name")),
     ]
 
 
-def _transform_estabelecimentos(row: dict, counters: Counters) -> list | None:
-    basico = f"{row['cnpj_basico'] or '':0>8}"
-    ordem = f"{row['cnpj_ordem'] or '':0>4}"
-    body = (basico + ordem).upper()
+def _transform_establishments(row: dict, counters: Counters) -> list | None:
+    root = f"{row['cnpj_root'] or '':0>8}"
+    branch = f"{row['cnpj_branch'] or '':0>4}"
+    body = (root + branch).upper()
     value = cnpj_codec.to_int(body)
 
     # O DV nao e guardado (e derivado do corpo), mas confere-se com o da fonte
@@ -215,113 +215,113 @@ def _transform_estabelecimentos(row: dict, counters: Counters) -> list | None:
     if uf_raw and uf is None:
         counters.bad_uf += 1
 
-    phone, cellphone, confidence = _phone(row.get("ddd_1"), row.get("telefone_1"))
+    phone, cellphone, confidence = _phone(row.get("ddd_1"), row.get("phone_1"))
 
     return [
         value,
         phone,
         cellphone,
-        _int(row.get("cnae_fiscal_principal")),
-        _int(row.get("municipio_codigo")),
+        _int(row.get("main_cnae")),
+        _int(row.get("municipality_code")),
         _cep(row.get("cep")),
-        _date(row.get("data_inicio_atividade")),
+        _date(row.get("activity_start_date")),
         uf,
-        _int(row.get("situacao_cadastral")),
-        _int(row.get("motivo_situacao_cadastral")),
+        _int(row.get("registration_status")),
+        _int(row.get("registration_status_reason")),
         confidence,
-        (row.get("identificador_matriz_filial") or "").strip() == "1",
-        _int_array(row.get("cnae_fiscal_secundaria")),
-        _text(row.get("nome_fantasia")),
-        _text(row.get("correio_eletronico")),
-        _logradouro(row.get("tipo_logradouro"), row.get("logradouro")),
-        _text(row.get("numero")),
-        _text(row.get("complemento")),
-        _text(row.get("bairro")),
+        (row.get("headquarters_indicator") or "").strip() == "1",
+        _int_array(row.get("secondary_cnaes")),
+        _text(row.get("trade_name")),
+        _text(row.get("email")),
+        _street(row.get("street_type"), row.get("street")),
+        _text(row.get("number")),
+        _text(row.get("complement")),
+        _text(row.get("district")),
     ]
 
 
-def _transform_socios(row: dict, counters: Counters) -> list | None:
-    nome = _text(row.get("nome_socio"))
-    if not nome:
-        # nome_socio e NOT NULL na tabela; sem ele a linha nao diz nada.
+def _transform_partners(row: dict, counters: Counters) -> list | None:
+    name = _text(row.get("partner_name"))
+    if not name:
+        # partner_name e NOT NULL na tabela; sem ele a linha nao diz nada.
         counters.skipped += 1
         return None
 
     return [
-        cnpj_codec.basico_to_int(row["cnpj_basico"] or ""),
-        _documento(row.get("identificador_socio"), row.get("cpf_cnpj_socio")),
-        _cpf(row.get("representante_legal")),
-        _date(row.get("data_entrada_sociedade")),
-        _int(row.get("identificador_socio")),
-        _int(row.get("qualificacao_socio")),
-        _int(row.get("qualificacao_representante_legal")),
-        _int(row.get("pais")),
-        # faixa_etaria 0 = "nao se aplica", que e informacao -- por isso `int`
+        cnpj_codec.root_to_int(row["cnpj_root"] or ""),
+        _tax_id(row.get("partner_type"), row.get("partner_tax_id")),
+        _cpf(row.get("legal_rep")),
+        _date(row.get("partnership_start_date")),
+        _int(row.get("partner_type")),
+        _int(row.get("partner_qualification")),
+        _int(row.get("legal_rep_qualification")),
+        _int(row.get("country")),
+        # age_range 0 = "nao se aplica", que e informacao -- por isso `int`
         # direto em vez do `_int`, que trata 0 como ausente.
-        int(row["faixa_etaria"]) if (row.get("faixa_etaria") or "").strip().isdigit() else None,
-        nome,
-        _text(row.get("nome_representante")),
+        int(row["age_range"]) if (row.get("age_range") or "").strip().isdigit() else None,
+        name,
+        _text(row.get("legal_rep_name")),
     ]
 
 
 GROUP_SPECS: dict[str, GroupSpec] = {
     "simples": GroupSpec(
         csv_columns=[
-            "cnpj_basico", "opcao_simples", "data_opcao_simples", "data_exclusao_simples",
-            "opcao_mei", "data_opcao_mei", "data_exclusao_mei",
+            "cnpj_root", "simples_option", "simples_option_date", "simples_exclusion_date",
+            "mei_option", "mei_option_date", "mei_exclusion_date",
         ],
         table="simples_staging",
-        columns=["cnpj_basico", "opcao_simples", "opcao_mei"],
-        key=["cnpj_basico"],
+        columns=["cnpj_root", "simples_option", "mei_option"],
+        key=["cnpj_root"],
         transform=_transform_simples,
     ),
-    "empresas": GroupSpec(
+    "companies": GroupSpec(
         csv_columns=[
-            "cnpj_basico", "razao_social", "natureza_juridica", "qualificacao_responsavel",
-            "capital_social", "porte_empresa", "ente_federativo",
+            "cnpj_root", "company_name", "legal_nature", "responsible_qualification",
+            "capital_social", "company_size", "ente_federativo",
         ],
-        table="empresas_staging",
-        columns=["cnpj_basico", "porte_empresa", "natureza_juridica", "razao_social"],
-        key=["cnpj_basico"],
-        transform=_transform_empresas,
+        table="companies_staging",
+        columns=["cnpj_root", "company_size", "legal_nature", "company_name"],
+        key=["cnpj_root"],
+        transform=_transform_companies,
     ),
-    "estabelecimentos": GroupSpec(
+    "establishments": GroupSpec(
         csv_columns=[
-            "cnpj_basico", "cnpj_ordem", "cnpj_dv", "identificador_matriz_filial", "nome_fantasia",
-            "situacao_cadastral", "data_situacao_cadastral", "motivo_situacao_cadastral",
-            "nome_cidade_exterior", "pais", "data_inicio_atividade", "cnae_fiscal_principal",
-            "cnae_fiscal_secundaria", "tipo_logradouro", "logradouro", "numero", "complemento",
-            "bairro", "cep", "uf", "municipio_codigo", "ddd_1", "telefone_1", "ddd_2", "telefone_2",
-            "ddd_fax", "fax", "correio_eletronico", "situacao_especial", "data_situacao_especial",
+            "cnpj_root", "cnpj_branch", "cnpj_dv", "headquarters_indicator", "trade_name",
+            "registration_status", "registration_status_date", "registration_status_reason",
+            "foreign_city_name", "country", "activity_start_date", "main_cnae",
+            "secondary_cnaes", "street_type", "street", "number", "complement",
+            "district", "cep", "uf", "municipality_code", "ddd_1", "phone_1", "ddd_2", "phone_2",
+            "ddd_fax", "fax", "email", "special_status", "special_status_date",
         ],
-        table="estabelecimentos_staging",
+        table="establishments_staging",
         columns=[
-            "cnpj", "phone", "cellphone", "cnae_fiscal_principal", "municipio_codigo",
-            "cep", "data_inicio_atividade", "uf", "situacao_cadastral", "motivo_situacao_cadastral",
-            "cellphone_confidence", "is_headquarters", "cnae_fiscal_secundaria", "nome_fantasia",
-            "correio_eletronico", "logradouro", "numero", "complemento", "bairro",
+            "cnpj", "phone", "cellphone", "main_cnae", "municipality_code",
+            "cep", "activity_start_date", "uf", "registration_status", "registration_status_reason",
+            "cellphone_confidence", "is_headquarters", "secondary_cnaes", "trade_name",
+            "email", "street", "number", "complement", "district",
         ],
         key=["cnpj"],
-        transform=_transform_estabelecimentos,
+        transform=_transform_establishments,
     ),
-    "socios": GroupSpec(
+    "partners": GroupSpec(
         csv_columns=[
-            "cnpj_basico", "identificador_socio", "nome_socio", "cpf_cnpj_socio",
-            "qualificacao_socio", "data_entrada_sociedade", "pais", "representante_legal",
-            "nome_representante", "qualificacao_representante_legal", "faixa_etaria",
+            "cnpj_root", "partner_type", "partner_name", "partner_tax_id",
+            "partner_qualification", "partnership_start_date", "country", "legal_rep",
+            "legal_rep_name", "legal_rep_qualification", "age_range",
         ],
-        # `socios_new`, nao `socios`: carrega numa tabela-sombra que so vira
-        # `socios` no fim de todo o grupo, via swap atomico -- ver
-        # app.importer.pipeline._create_socios_shadow/_finalize_socios.
-        table="socios_new",
+        # `partners_new`, nao `partners`: carrega numa tabela-sombra que so vira
+        # `partners` no fim de todo o grupo, via swap atomico -- ver
+        # app.importer.pipeline._create_partners_shadow/_finalize_partners.
+        table="partners_new",
         # Sem chave natural: cada Socios<N>.zip cobre uma faixa disjunta de
-        # cnpj_basico, nao tem o que dar merge entre arquivos.
+        # cnpj_root, nao tem o que dar merge entre arquivos.
         columns=[
-            "cnpj_basico", "cpf_cnpj_socio", "representante_legal", "data_entrada_sociedade",
-            "identificador_socio", "qualificacao_socio", "qualificacao_representante_legal",
-            "pais", "faixa_etaria", "nome_socio", "nome_representante",
+            "cnpj_root", "partner_tax_id", "legal_rep", "partnership_start_date",
+            "partner_type", "partner_qualification", "legal_rep_qualification",
+            "country", "age_range", "partner_name", "legal_rep_name",
         ],
         key=None,
-        transform=_transform_socios,
+        transform=_transform_partners,
     ),
 }

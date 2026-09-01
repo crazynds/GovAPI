@@ -40,11 +40,11 @@ from sqlalchemy import text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from app.cnpj import ORDEM_SPAN
+from app.cnpj import BRANCH_SPAN
 from app.config import settings
-from app.db import SessionLocal
+from app.db import Base, SessionLocal
 from app.importer import client
-from app.importer import municipios as municipios_bootstrap
+from app.importer import municipalities as municipalities_bootstrap
 from app.importer.csv_reader import read_csv
 from app import stats_rollup
 from app.importer.progress import ProgressDisplay, human_bytes, log_through
@@ -52,36 +52,43 @@ from app.importer.rows import GROUP_SPECS, Counters
 from app.regions import CODE_TO_UF
 from app.models import (
     Cnae,
-    ImportLog,
-    ImportProgress,
+    CompanyStaging,
+    Country,
+    EstablishmentStaging,
+    ImportFile,
     ImportRun,
-    Motivo,
-    Municipio,
-    NaturezaJuridica,
-    Pais,
-    Qualificacao,
+    ImportStep,
+    LegalNature,
+    Municipality,
+    Qualification,
+    RegistrationStatusReason,
+    SimplesStaging,
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("importer")
 
-GROUPS = ["reference", "simples", "empresas", "estabelecimentos", "socios"]
+GROUPS = ["reference", "simples", "companies", "establishments", "partners"]
 
+# Prefixo do nome do arquivo NA RECEITA -- e o nome dela, nao o nosso, entao
+# fica em portugues (`Municipios0.zip`, `Socios1.zip`). `files_for_group` casa
+# por `startswith`, e um prefixo traduzido aqui nao casa com arquivo nenhum: o
+# grupo simplesmente importaria zero arquivos, sem erro.
 STEP_PREFIXES = {
     "reference": ["Cnaes", "Municipios", "Motivos", "Naturezas", "Paises", "Qualificacoes"],
     "simples": ["Simples"],
-    "empresas": ["Empresas"],
-    "estabelecimentos": ["Estabelecimentos"],
-    "socios": ["Socios"],
+    "companies": ["Empresas"],
+    "establishments": ["Estabelecimentos"],
+    "partners": ["Socios"],
 }
 
 REFERENCE_SPECS = {
     "Cnaes.zip": (["code", "description"], Cnae, "code"),
-    "Municipios.zip": (["receita_code", "name"], Municipio, "receita_code"),
-    "Motivos.zip": (["code", "description"], Motivo, "code"),
-    "Naturezas.zip": (["code", "description"], NaturezaJuridica, "code"),
-    "Paises.zip": (["code", "description"], Pais, "code"),
-    "Qualificacoes.zip": (["code", "description"], Qualificacao, "code"),
+    "Municipios.zip": (["receita_code", "name"], Municipality, "receita_code"),
+    "Motivos.zip": (["code", "description"], RegistrationStatusReason, "code"),
+    "Naturezas.zip": (["code", "description"], LegalNature, "code"),
+    "Paises.zip": (["code", "description"], Country, "code"),
+    "Qualificacoes.zip": (["code", "description"], Qualification, "code"),
 }
 
 MAX_ATTEMPTS_PER_STAGE = 3
@@ -94,6 +101,34 @@ CSV_EXPANSION_FACTOR = 5
 STEPS = ("download", "extract", "import")
 
 DB_PROGRESS_INTERVAL = 1.0  # grava no banco no maximo 1x/s -- a barra na tela cobre o resto.
+
+
+# As tres tabelas de staging, na ordem em que o build as le. Dropadas no fim
+# do `import-all` (ver app.cli) e recriadas por `ensure_staging_tables` no
+# inicio do proximo import: sao ~63M linhas de scratch UNLOGGED que nao
+# servem pra nada depois do swap, e deixa-las pra tras so ocupava disco --
+# elas nasciam na migration e ninguem nunca as removia.
+STAGING_MODELS = (EstablishmentStaging, CompanyStaging, SimplesStaging)
+STAGING_TABLES = tuple(model.__tablename__ for model in STAGING_MODELS)
+
+
+def ensure_staging_tables(db: Session) -> None:
+    """Cria as tabelas de staging que estiverem faltando.
+
+    O import nao pode depender de elas terem sobrado do run anterior: o
+    `import-all` as dropa no fim, de proposito. `create_all` com
+    `checkfirst=True` (default) e no-op quando ja existem, e sai com o
+    `UNLOGGED` e os indices que os models declaram -- e por isso que a DDL
+    vive nos models e nao num CREATE TABLE escrito a mao aqui.
+    """
+    Base.metadata.create_all(db.get_bind(), tables=[m.__table__ for m in STAGING_MODELS])
+
+
+def drop_staging_tables(db: Session) -> None:
+    """Dropa as tabelas de staging. Chamado no fim do `import-all`, quando o
+    swap ja aconteceu e o conteudo delas nao serve mais pra nada."""
+    db.execute(text(f"DROP TABLE IF EXISTS {', '.join(STAGING_TABLES)}"))
+    db.commit()
 
 
 def files_for_group(files: list[str], group: str) -> list[str]:
@@ -250,6 +285,11 @@ class ImportPipeline:
         _set_run(progress, period=self.period, status="running", message="iniciando")
         _reset_steps(progress, self.period)
 
+        # O `import-all` dropa o staging no fim (ver app.cli.import_all), entao
+        # ele pode simplesmente nao existir aqui -- inclusive num `import-cnpj`
+        # avulso, muito depois do ultimo import-all.
+        ensure_staging_tables(main_db)
+
         jobs = self._plan(main_db)
         logger.info("%d arquivo(s) a processar em %s", len(jobs), self.period)
 
@@ -270,12 +310,12 @@ class ImportPipeline:
             raise self.error
 
         # Independente de `run_build` (que so governa o build de
-        # establishments): o swap de socios acontece sempre que o grupo
-        # "socios" fez parte deste run, nao so quando "build" foi pedido
-        # explicitamente -- socios nao depende de establishments em nada.
-        # `_finalize_socios` e um no-op seguro se socios_new nao existir
+        # establishments): o swap de partners acontece sempre que o grupo
+        # "partners" fez parte deste run, nao so quando "build" foi pedido
+        # explicitamente -- partners nao depende de establishments em nada.
+        # `_finalize_partners` e um no-op seguro se partners_new nao existir
         # (grupo nao fez parte deste `--only`).
-        _finalize_socios(main_db, progress, self.display)
+        _finalize_partners(main_db, progress, self.display)
 
         if self.run_build:
             _build_final_table(main_db, progress, self.period, self.display)
@@ -293,20 +333,20 @@ class ImportPipeline:
             pending = [f for f in group_files if not _already_imported(db, self.period, f)]
             logger.info("Grupo %s: %d arquivo(s), %d pendente(s)", group, len(group_files), len(pending))
 
-            if group == "socios" and group_files and len(pending) == len(group_files):
-                # socios nao tem merge entre arquivos (cada Socios<N>.zip
-                # cobre uma faixa disjunta de cnpj_basico) -- so carregar. Mas
-                # carrega numa tabela-SOMBRA (socios_new), nao na `socios` ao
-                # vivo: truncar a tabela viva deixaria /socios/* respondendo
+            if group == "partners" and group_files and len(pending) == len(group_files):
+                # partners nao tem merge entre arquivos (cada Socios<N>.zip
+                # cobre uma faixa disjunta de cnpj_root) -- so carregar. Mas
+                # carrega numa tabela-SOMBRA (partners_new), nao na `partners` ao
+                # vivo: truncar a tabela viva deixaria /partners/* respondendo
                 # vazio pelos minutos que o import leva, e cada INSERT direto
                 # nela pagaria WAL linha a linha (ela e LOGGED, a API depende
-                # de durabilidade). socios_new e UNLOGGED ate o swap no fim
-                # (ver _finalize_socios) -- mesmo padrao de establishments_new.
+                # de durabilidade). partners_new e UNLOGGED ate o swap no fim
+                # (ver _finalize_partners) -- mesmo padrao de establishments_new.
                 #
                 # So cria a sombra numa run NOVA (nenhum arquivo do grupo
-                # ainda marcado em ImportLog); numa RETOMADA, socios_new ja
+                # ainda marcado em ImportFile); numa RETOMADA, partners_new ja
                 # existe com o que foi carregado antes de parar.
-                _create_socios_shadow(db)
+                _create_partners_shadow(db)
                 db.commit()
 
             for file in pending:
@@ -383,7 +423,7 @@ class ImportPipeline:
         bar_slot = STEPS.index("import")
         db = self.session()
         # Staging e inteiramente reconstruivel (UPSERT idempotente, refeito do
-        # zero em caso de falha -- ver ImportLog), entao esperar o WAL
+        # zero em caso de falha -- ver ImportFile), entao esperar o WAL
         # sincronizar a cada commit nao compra nada aqui alem de lentidao.
         db.execute(text("SET synchronous_commit = OFF"))
         db.commit()
@@ -617,7 +657,7 @@ def _import_group(db: Session, progress: Session, job: Job, display: ProgressDis
     # `AS SELECT ... WITH NO DATA` e nao `LIKE`: da exatamente as colunas que o
     # COPY manda, com os tipos do destino, e sem constraint nenhuma. Um `LIKE`
     # traria tambem as colunas que nao carregamos -- inclusive o `id` de
-    # socios, que vem NOT NULL mas sem o default da sequence (LIKE nao copia
+    # partners, que vem NOT NULL mas sem o default da sequence (LIKE nao copia
     # default), e o COPY morria com NotNullViolation.
     # ON COMMIT DROP: some sozinha no commit e no rollback, entao uma tentativa
     # que falhou no meio nao deixa lixo pra proxima.
@@ -694,7 +734,7 @@ def _import_group(db: Session, progress: Session, job: Job, display: ProgressDis
                 -- arquivo (visto na pratica: Empresas2.zip) -- um unico INSERT
                 -- ... ON CONFLICT DO UPDATE nao aceita conflitar duas vezes
                 -- com a mesma linha, entao dedup primeiro, ficando com a
-                -- ocorrencia mais recente pela ordem fisica de carga.
+                -- ocorrencia mais recente pela branch fisica de carga.
                 SELECT DISTINCT ON ({key_cols}) *
                 FROM {tmp_table}
                 ORDER BY {key_cols}, ctid DESC
@@ -725,7 +765,7 @@ def _import_reference(db: Session, progress: Session, job: Job, display: Progres
 
     rows = read_csv(job.csv_path, columns, on_progress=on_progress)
     if job.file == "Municipios.zip":
-        count = _merge_municipios_receita(db, rows)
+        count = _merge_municipalities_receita(db, rows)
     else:
         count = _upsert_reference_rows(db, model.__table__, key, rows)
 
@@ -750,10 +790,10 @@ def _upsert_reference_rows(db: Session, table, key: str, rows) -> int:
     return count
 
 
-def _merge_municipios_receita(db: Session, rows) -> int:
+def _merge_municipalities_receita(db: Session, rows) -> int:
     """`Municipios.zip` da Receita so traz codigo+nome -- sem UF, sem codigo
-    IBGE. Ate aqui, `municipios` ja foi bootstrapada pela API do IBGE (ver
-    app.importer.municipios.import_municipios, que roda ANTES de tudo), com
+    IBGE. Ate aqui, `municipalities` ja foi bootstrapada pela API do IBGE (ver
+    app.importer.municipalities.import_municipalities, que roda ANTES de tudo), com
     ibge_code/uf exatos. Este passo so precisa achar, pra cada linha da
     Receita, a linha correspondente ja existente -- por nome normalizado,
     unica chave em comum entre as duas fontes -- e completar `receita_code`
@@ -762,13 +802,13 @@ def _merge_municipios_receita(db: Session, rows) -> int:
     Nome duplicado entre estados (a Receita nao manda UF pra desempatar) e o
     unico jeito de isso falhar: nesse caso a linha nova entra so com
     receita_code+nome, sem ibge_code/uf, igual ao caso de "nome sem
-    correspondencia" -- ambos ficam pra tras do FK com `correios_cep` ate
+    correspondencia" -- ambos ficam pra tras do FK com `postal_codes` ate
     alguem resolver a ambiguidade a mao, mas nao travam o import.
     """
-    existing = db.query(Municipio.id, Municipio.name).all()
+    existing = db.query(Municipality.id, Municipality.name).all()
     by_name: dict[str, list[int]] = {}
-    for municipio_id, name in existing:
-        by_name.setdefault(municipios_bootstrap.normalize_name(name), []).append(municipio_id)
+    for municipality_id, name in existing:
+        by_name.setdefault(municipalities_bootstrap.normalize_name(name), []).append(municipality_id)
 
     count = matched = ambiguous = unmatched = 0
     for row in rows:
@@ -779,11 +819,11 @@ def _merge_municipios_receita(db: Session, rows) -> int:
         name = (row.get("name") or "").strip()
         count += 1
 
-        candidates = by_name.get(municipios_bootstrap.normalize_name(name), [])
+        candidates = by_name.get(municipalities_bootstrap.normalize_name(name), [])
         if len(candidates) == 1:
             db.execute(
-                update(Municipio.__table__)
-                .where(Municipio.id == candidates[0])
+                update(Municipality.__table__)
+                .where(Municipality.id == candidates[0])
                 .values(receita_code=receita_code, name=name)
             )
             matched += 1
@@ -792,13 +832,13 @@ def _merge_municipios_receita(db: Session, rows) -> int:
                 ambiguous += 1
             else:
                 unmatched += 1
-            stmt = pg_insert(Municipio.__table__).values(receita_code=receita_code, name=name)
+            stmt = pg_insert(Municipality.__table__).values(receita_code=receita_code, name=name)
             stmt = stmt.on_conflict_do_update(index_elements=["receita_code"], set_={"name": stmt.excluded.name})
             db.execute(stmt)
 
     db.commit()
     logger.info(
-        "Municípios (Receita): %d casados com o IBGE por nome, %d nome ambíguo (repete em >1 UF), "
+        "Municípios (Receita): %d casados com o IBGE por name, %d name ambíguo (repete em >1 UF), "
         "%d sem correspondência -- esses %d ficam sem ibge_code/uf até alguém resolver a mão.",
         matched, ambiguous, unmatched, ambiguous + unmatched,
     )
@@ -815,22 +855,22 @@ def _merge_municipios_receita(db: Session, rows) -> int:
 # magnitude mais rapido. Parciais: as consultas da API sao quase sempre sobre
 # empresas ativas e/ou com contato, e indexar as ~41M linhas que ninguem le
 # custaria vários GB.
-# NAO usar predicado parcial em `situacao_cadastral = 2` aqui de novo. Custou
+# NAO usar predicado parcial em `registration_status = 2` aqui de novo. Custou
 # caro: os indices de uf/main_cnae eram parciais assim, mas a busca so filtra
-# situacao quando o cliente pede (`?situacao=`), e o default e "todas as
-# situacoes". Sem `situacao_cadastral = 2` no WHERE o Postgres nao consegue
+# situacao quando o cliente pede (`?status=`), e o default e "todas as
+# situacoes". Sem `registration_status = 2` no WHERE o Postgres nao consegue
 # provar o predicado e descarta o indice inteiro -- `?uf=RR` (a menor UF do
-# pais) ia a seq scan e batia timeout, enquanto `?uf=RR&situacao=ativa`
+# pais) ia a seq scan e batia timeout, enquanto `?uf=RR&status=ativa`
 # respondia em 0,35s. Indice parcial so vale quando o predicado dele esta
 # SEMPRE no WHERE da query, o que aqui nao acontece.
 DEFERRED_INDEXES = [
     ("ix_establishments_cellphone", "(cellphone)", "cellphone IS NOT NULL", None),
     # Filtro por UF. O sufixo de ordenacao e vestigial -- a API ordena sempre
     # pela PK --, mas o prefixo `(uf)` e o que a busca usa. Substitui o antigo
-    # ix_establishments_uf, que era parcial em `situacao_cadastral = 2`.
+    # ix_establishments_uf, que era parcial em `registration_status = 2`.
     ("ix_establishments_uf_confidence", "(uf, cellphone_confidence DESC, cnpj DESC)", None, None),
     ("ix_establishments_main_cnae", "(main_cnae)", None, None),
-    ("ix_establishments_situacao_cadastral", "(situacao_cadastral)", None, None),
+    ("ix_establishments_registration_status", "(registration_status)", None, None),
     ("ix_establishments_cep", "(cep)", "cep IS NOT NULL", None),
     # Busca por nome (`?name=`) e `ILIKE '%x%'`, que um btree nao consegue
     # avaliar de jeito nenhum -- e a unica estrutura que serve e um GIN de
@@ -847,79 +887,79 @@ DEFERRED_INDEXES = [
 CNAES_DEFERRED_INDEXES = [
     ("ix_establishment_cnaes_cnae_uf_cnpj", "(cnae, uf, cnpj)", None, None),
     # Parcial pra `only_with_cellphone=true`, que e o default da API. Aqui o
-    # predicado parcial e seguro (ao contrario do caso de `situacao_cadastral`
+    # predicado parcial e seguro (ao contrario do caso de `registration_status`
     # comentado acima): quando o cliente manda `false`, o filtro sai do WHERE,
     # o Postgres descarta este indice e cai no de cima, que cobre tudo.
     ("ix_establishment_cnaes_cellphone", "(cnae, uf, cnpj)", "has_cellphone", None),
 ]
 
-SOCIOS_DEFERRED_INDEXES = [
-    ("ix_socios_cnpj_basico", "(cnpj_basico)", None, None),
-    ("ix_socios_cpf_cnpj_socio", "(cpf_cnpj_socio)", "cpf_cnpj_socio IS NOT NULL", None),
-    # `?nome=` e ILIKE '%x%' -- ver o comentario em DEFERRED_INDEXES.
-    ("ix_socios_nome_socio_trgm", "(nome_socio gin_trgm_ops)", None, "gin"),
+PARTNERS_DEFERRED_INDEXES = [
+    ("ix_partners_cnpj_root", "(cnpj_root)", None, None),
+    ("ix_partners_partner_tax_id", "(partner_tax_id)", "partner_tax_id IS NOT NULL", None),
+    # `?name=` e ILIKE '%x%' -- ver o comentario em DEFERRED_INDEXES.
+    ("ix_partners_partner_name_trgm", "(partner_name gin_trgm_ops)", None, "gin"),
 ]
 
 
-def _create_socios_shadow(db: Session) -> None:
-    """Cria `socios_new` -- UNLOGGED, sem indices secundarios (adiados pro
-    fim, ver `_finalize_socios`) -- pra receber o INSERT direto de cada
-    Socios<N>.zip (ver GROUP_SPECS['socios'].table)."""
-    db.execute(text("DROP TABLE IF EXISTS socios_new"))
-    db.execute(text("CREATE UNLOGGED TABLE socios_new (LIKE socios INCLUDING DEFAULTS)"))
+def _create_partners_shadow(db: Session) -> None:
+    """Cria `partners_new` -- UNLOGGED, sem indices secundarios (adiados pro
+    fim, ver `_finalize_partners`) -- pra receber o INSERT direto de cada
+    Socios<N>.zip (ver GROUP_SPECS['partners'].table)."""
+    db.execute(text("DROP TABLE IF EXISTS partners_new"))
+    db.execute(text("CREATE UNLOGGED TABLE partners_new (LIKE partners INCLUDING DEFAULTS)"))
     # LIKE...INCLUDING DEFAULTS copia o DEFAULT nextval(...) literal -- ficaria
-    # preso a sequence da tabela ANTIGA, e o DROP TABLE socios_old do swap
-    # (que apaga a sequence dona de socios_old.id) quebraria o default de
-    # socios_new. Sequence propria antes de qualquer INSERT usar o default.
-    db.execute(text("CREATE SEQUENCE IF NOT EXISTS socios_new_id_seq OWNED BY socios_new.id"))
-    db.execute(text("ALTER TABLE socios_new ALTER COLUMN id SET DEFAULT nextval('socios_new_id_seq')"))
-    db.execute(text("ALTER TABLE socios_new ADD CONSTRAINT socios_new_pkey PRIMARY KEY (id)"))
+    # preso a sequence da tabela ANTIGA, e o DROP TABLE partners_old do swap
+    # (que apaga a sequence dona de partners_old.id) quebraria o default de
+    # partners_new. Sequence propria antes de qualquer INSERT usar o default.
+    db.execute(text("CREATE SEQUENCE IF NOT EXISTS partners_new_id_seq OWNED BY partners_new.id"))
+    db.execute(text("ALTER TABLE partners_new ALTER COLUMN id SET DEFAULT nextval('partners_new_id_seq')"))
+    db.execute(text("ALTER TABLE partners_new ADD CONSTRAINT partners_new_pkey PRIMARY KEY (id)"))
 
 
-def _finalize_socios(db: Session, progress: Session, display: ProgressDisplay) -> None:
-    """Indices + SET LOGGED + swap atomico de socios_new -> socios.
+def _finalize_partners(db: Session, progress: Session, display: ProgressDisplay) -> None:
+    """Indices + SET LOGGED + swap atomico de partners_new -> partners.
 
-    No-op se `socios_new` nao existir -- acontece quando o grupo "socios" nao
-    fez parte deste run (`--only` sem "socios").
+    No-op se `partners_new` nao existir -- acontece quando o grupo "partners" nao
+    fez parte deste run (`--only` sem "partners").
     """
     slot = STEPS.index("import")
-    if db.execute(text("SELECT to_regclass('socios_new')")).scalar() is None:
+    if db.execute(text("SELECT to_regclass('partners_new')")).scalar() is None:
         return
 
-    _set_step(progress, "build", group="build", status="running", message="índices de socios")
-    for name, cols, where, using in SOCIOS_DEFERRED_INDEXES:
+    _set_step(progress, "build", group="build", status="running", message="índices de partners")
+    for name, cols, where, using in PARTNERS_DEFERRED_INDEXES:
         display.set(slot, f"  build: criando índice {name}")
         using_sql = f" USING {using}" if using else ""
         where_sql = f" WHERE {where}" if where else ""
-        db.execute(text(f'CREATE INDEX "{name}_new" ON socios_new{using_sql} {cols}{where_sql}'))
+        db.execute(text(f'CREATE INDEX "{name}_new" ON partners_new{using_sql} {cols}{where_sql}'))
         db.commit()
 
     # Mesmo motivo do establishments_new: grava a tabela inteira no WAL de uma
     # vez, em vez de a cada linha/indice durante o bulk load.
-    _set_step(progress, "build", group="build", status="running", message="tornando socios durável (SET LOGGED)")
-    display.set(slot, "  build: SET LOGGED em socios_new")
-    db.execute(text("ALTER TABLE socios_new SET LOGGED"))
+    _set_step(progress, "build", group="build", status="running", message="tornando partners durável (SET LOGGED)")
+    display.set(slot, "  build: SET LOGGED em partners_new")
+    db.execute(text("ALTER TABLE partners_new SET LOGGED"))
     db.commit()
 
-    display.set(slot, "  build: swap atômico de socios")
-    db.execute(text("ALTER TABLE socios RENAME TO socios_old"))
-    db.execute(text("ALTER TABLE socios_new RENAME TO socios"))
-    # So depois de dropar a tabela antiga (e a sequence dona de socios_old.id
+    display.set(slot, "  build: swap atômico de partners")
+    db.execute(text("ALTER TABLE partners RENAME TO partners_old"))
+    db.execute(text("ALTER TABLE partners_new RENAME TO partners"))
+    # So depois de dropar a tabela antiga (e a sequence dona de partners_old.id
     # junto) pra liberar os nomes canonicos sem colisao.
-    db.execute(text("DROP TABLE socios_old"))
-    for name, _cols, _where, _using in SOCIOS_DEFERRED_INDEXES:
+    db.execute(text("DROP TABLE partners_old"))
+    for name, _cols, _where, _using in PARTNERS_DEFERRED_INDEXES:
         db.execute(text(f'ALTER INDEX "{name}_new" RENAME TO "{name}"'))
-    db.execute(text("ALTER INDEX socios_new_pkey RENAME TO socios_pkey"))
-    db.execute(text("ALTER SEQUENCE socios_new_id_seq RENAME TO socios_id_seq"))
+    db.execute(text("ALTER INDEX partners_new_pkey RENAME TO partners_pkey"))
+    db.execute(text("ALTER SEQUENCE partners_new_id_seq RENAME TO partners_id_seq"))
     db.commit()
 
     # Mesmo motivo do ANALYZE em establishments: o swap deixa a tabela sem
     # estatistica pro planner.
-    display.set(slot, "  build: ANALYZE em socios")
-    db.execute(text("ANALYZE socios"))
+    display.set(slot, "  build: ANALYZE em partners")
+    db.execute(text("ANALYZE partners"))
     db.commit()
 
-    _set_step(progress, "build", group="build", status="success", message="socios trocado atomicamente")
+    _set_step(progress, "build", group="build", status="success", message="partners trocado atomicamente")
 
 
 def _build_cnaes_table(db: Session, display: ProgressDisplay, slot: int) -> None:
@@ -957,13 +997,13 @@ def _build_cnaes_table(db: Session, display: ProgressDisplay, slot: int) -> None
     inserted = db.execute(text("""
         INSERT INTO establishment_cnaes_new (cnpj, cnae, uf, is_main, has_cellphone)
         SELECT s.cnpj, c.cnae, s.uf, c.is_main, s.cellphone IS NOT NULL
-        FROM estabelecimentos_staging s
+        FROM establishments_staging s
         CROSS JOIN LATERAL (
-            SELECT s.cnae_fiscal_principal AS cnae, true AS is_main
+            SELECT s.main_cnae AS cnae, true AS is_main
             UNION ALL
             SELECT DISTINCT unnest(array_remove(
-                coalesce(s.cnae_fiscal_secundaria, '{}'::integer[]),
-                s.cnae_fiscal_principal
+                coalesce(s.secondary_cnaes, '{}'::integer[]),
+                s.main_cnae
             )), false
         ) c
         WHERE c.cnae IS NOT NULL
@@ -1018,7 +1058,7 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
     # que roda logo em seguida do bulk load.
     _set_step(progress, "build", period=period, group="build", status="running", message="analisando staging")
     display.set(slot, "  build: ANALYZE nas tabelas de staging")
-    for table in ("estabelecimentos_staging", "empresas_staging", "simples_staging"):
+    for table in ("establishments_staging", "companies_staging", "simples_staging"):
         db.execute(text(f"ANALYZE {table}"))
     db.commit()
 
@@ -1028,11 +1068,11 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
     # `import-ceps` rodar -- e ai nenhum estabelecimento casaria, o que jogaria
     # as ~63M linhas pro JSON de excecao. Por isso o teste e "tem CEP", nao
     # "tem tabela".
-    has_ceps = db.execute(text("SELECT EXISTS (SELECT 1 FROM correios_cep)")).scalar()
+    has_ceps = db.execute(text("SELECT EXISTS (SELECT 1 FROM postal_codes)")).scalar()
     if has_ceps:
-        logger.info("Vinculando endereços a correios_cep")
+        logger.info("Vinculando endereços a postal_codes")
         # Os dois lados sao INTEGER agora -- join direto, sem cast nenhum.
-        cep_join = "LEFT JOIN correios_cep c ON c.cep = e.cep"
+        cep_join = "LEFT JOIN postal_codes c ON c.cep = e.cep"
         # Ou o estabelecimento esta vinculado a um CEP -- e ai o endereco vive
         # nas colunas, com logradouro/bairro vindo do join -- ou nao esta, e ai
         # o registro bruto da Receita vai inteiro pro JSON. Nunca os dois.
@@ -1041,81 +1081,81 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
         # Receita, e CEP que nao existe na base dos Correios (digitado errado,
         # extinto, endereco no exterior). Guardar o CEP orfao na coluna nao
         # serviria pra nada -- nao resolve endereco nenhum -- e impediria uma
-        # FOREIGN KEY pra correios_cep.
+        # FOREIGN KEY pra postal_codes.
         linked = "c.cep IS NOT NULL"
         cep_sql = f"CASE WHEN {linked} THEN e.cep END"
-        street_sql = f"CASE WHEN {linked} AND c.logradouro IS NULL THEN e.logradouro END"
-        district_sql = f"CASE WHEN {linked} AND c.bairro IS NULL THEN e.bairro END"
-        number_sql = f"CASE WHEN {linked} THEN e.numero END"
-        complement_sql = f"CASE WHEN {linked} THEN e.complemento END"
+        street_sql = f"CASE WHEN {linked} AND c.street IS NULL THEN e.street END"
+        district_sql = f"CASE WHEN {linked} AND c.district IS NULL THEN e.district END"
+        number_sql = f"CASE WHEN {linked} THEN e.number END"
+        complement_sql = f"CASE WHEN {linked} THEN e.complement END"
         # `strip_nulls` pra nao gravar chave com null: sao poucas linhas, mas
         # um objeto so com o que existe e menor e mais facil de ler.
         address_sql = f"""
             CASE WHEN NOT ({linked}) AND (
-                e.cep IS NOT NULL OR e.logradouro IS NOT NULL OR e.numero IS NOT NULL
-                OR e.complemento IS NOT NULL OR e.bairro IS NOT NULL
+                e.cep IS NOT NULL OR e.street IS NOT NULL OR e.number IS NOT NULL
+                OR e.complement IS NOT NULL OR e.district IS NOT NULL
             ) THEN jsonb_strip_nulls(jsonb_build_object(
                 'cep', lpad(e.cep::text, 8, '0'),
-                'logradouro', e.logradouro,
-                'numero', e.numero,
-                'complemento', e.complemento,
-                'bairro', e.bairro
+                'street', e.street,
+                'number', e.number,
+                'complement', e.complement,
+                'district', e.district
             )) END
         """
     else:
         logger.warning(
             "Base de CEP vazia -- rode `import-ceps` antes pra vincular os endereços "
-            "(sem ela, logradouro/bairro ficam duplicados e não há FK de cep)."
+            "(sem ela, street/district ficam duplicados e não há FK de cep)."
         )
         # Sem a tabela de CEP nao da pra saber quem casa: mantem tudo nas
         # colunas, como veio da Receita. Jogar as ~63M linhas no JSON seria o
         # oposto do que essa coluna existe pra fazer.
         cep_join = ""
         cep_sql = "e.cep"
-        street_sql = "e.logradouro"
-        district_sql = "e.bairro"
-        number_sql = "e.numero"
-        complement_sql = "e.complemento"
+        street_sql = "e.street"
+        district_sql = "e.district"
+        number_sql = "e.number"
+        complement_sql = "e.complement"
         address_sql = "NULL::jsonb"
 
     imported = db.execute(text(f"""
         INSERT INTO establishments_new
-            (cnpj, phone, cellphone, main_cnae, municipio_id, cep, opened_at, uf, company_size,
-             situacao_cadastral, natureza_juridica, motivo_situacao_cadastral, cellphone_confidence,
+            (cnpj, phone, cellphone, main_cnae, municipality_id, cep, opened_at, uf, company_size,
+             registration_status, legal_nature, registration_status_reason, cellphone_confidence,
              is_headquarters, is_mei, is_simples, company_name, trade_name, email,
              address_number, address_complement, street, district, address)
         SELECT
             e.cnpj,
             e.phone,
             e.cellphone,
-            e.cnae_fiscal_principal,
+            e.main_cnae,
             m.id,
             {cep_sql},
-            e.data_inicio_atividade,
+            e.activity_start_date,
             e.uf,
-            emp.porte_empresa,
-            e.situacao_cadastral,
-            emp.natureza_juridica,
-            e.motivo_situacao_cadastral,
+            emp.company_size,
+            e.registration_status,
+            emp.legal_nature,
+            e.registration_status_reason,
             e.cellphone_confidence,
             e.is_headquarters,
-            coalesce(s.opcao_mei, false),
-            coalesce(s.opcao_simples, false),
-            coalesce(emp.razao_social, e.nome_fantasia, ''),
-            e.nome_fantasia,
-            e.correio_eletronico,
+            coalesce(s.mei_option, false),
+            coalesce(s.simples_option, false),
+            coalesce(emp.company_name, e.trade_name, ''),
+            e.trade_name,
+            e.email,
             {number_sql},
             {complement_sql},
             {street_sql},
             {district_sql},
             {address_sql}
-        FROM estabelecimentos_staging e
-        -- `e.cnpj / {ORDEM_SPAN}` e a raiz do CNPJ: em base 36, tirar as 4
+        FROM establishments_staging e
+        -- `e.cnpj / {BRANCH_SPAN}` e a raiz do CNPJ: em base 36, tirar as 4
         -- ultimas posicoes e uma divisao inteira. Assim o staging nao precisa
-        -- guardar uma coluna `cnpj_basico` repetindo 8 bytes por linha.
-        LEFT JOIN empresas_staging emp ON emp.cnpj_basico = e.cnpj / {ORDEM_SPAN}
-        LEFT JOIN simples_staging s ON s.cnpj_basico = e.cnpj / {ORDEM_SPAN}
-        LEFT JOIN municipios m ON m.receita_code = e.municipio_codigo
+        -- guardar uma coluna `cnpj_root` repetindo 8 bytes por linha.
+        LEFT JOIN companies_staging emp ON emp.cnpj_root = e.cnpj / {BRANCH_SPAN}
+        LEFT JOIN simples_staging s ON s.cnpj_root = e.cnpj / {BRANCH_SPAN}
+        LEFT JOIN municipalities m ON m.receita_code = e.municipality_code
         {cep_join}
         ON CONFLICT (cnpj) DO NOTHING
     """))
@@ -1124,7 +1164,7 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
 
     if has_ceps:
         # Cobertura do vinculo por CEP. E o numero que decide se uma FOREIGN
-        # KEY de establishments.cep -> correios_cep.cep e possivel: ela so pode
+        # KEY de establishments.cep -> postal_codes.cep e possivel: ela so pode
         # existir se este "orfaos" for zero, porque a Receita tambem publica CEP
         # com digitacao errada, extinto, ou de endereco no exterior.
         # Agora que o CEP orfao vira NULL, a contagem sai direto das colunas:
@@ -1145,13 +1185,13 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
         # tem cep, so que sem precisar do endereco da Receita) -- por isso o
         # log explicita "dos quais" em vez de listar como se fossem 3 grupos
         # que iam somar o total. So `vinculados + sem_vinculo` fecha o total.
-        localidade = cov["vinculados"] - cov["resolvidos"]
+        locality = cov["vinculados"] - cov["resolvidos"]
         logger.info(
             "CEP: %d vinculados + %d sem vínculo (endereço em address) = %d no total. "
             "Dos vinculados: %d com logradouro resolvido pelos Correios, %d de CEP de localidade "
             "(sem rua cadastrada -- usam o endereço da Receita mesmo com CEP vinculado).",
             cov["vinculados"], cov["sem_vinculo"], cov["vinculados"] + cov["sem_vinculo"],
-            cov["resolvidos"], localidade,
+            cov["resolvidos"], locality,
         )
 
     # Relacao N:N empresa-CNAE, o caminho de busca de `?cnae_codes=`
@@ -1161,23 +1201,23 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
 
     # `Municipios.zip` da Receita so tem codigo+nome, sem UF -- pega o UF de
     # qualquer estabelecimento daquele municipio (sao 1:1) enquanto o staging
-    # ainda existe. Sem isso Municipio.uf fica sempre NULL, o filtro por UF de
-    # /municipios/search devolve vazio e o import-ibge (que casa por nome+UF)
+    # ainda existe. Sem isso Municipality.uf fica sempre NULL, o filtro por UF de
+    # /municipalities/search devolve vazio e o import-ibge (que casa por nome+UF)
     # nao casa nada.
     _set_step(progress, "build", period=period, group="build", status="running", message="preenchendo UF dos municípios")
     display.set(slot, "  build: preenchendo UF dos municípios")
-    # `municipios.uf` continua em texto (e a sigla que a API expoe, e a tabela
+    # `municipalities.uf` continua em texto (e a sigla que a API expoe, e a tabela
     # tem ~5,5k linhas), enquanto o staging guarda o codigo numerico -- dai o
     # join contra a lista de codigos, montada do mapa de app/regions.py pra nao
     # duplicar a tabela de siglas em SQL.
-    uf_values = ", ".join(f"({code}, '{sigla}')" for code, sigla in sorted(CODE_TO_UF.items()))
+    uf_values = ", ".join(f"({code}, '{abbr}')" for code, abbr in sorted(CODE_TO_UF.items()))
     db.execute(text(f"""
-        UPDATE municipios m SET uf = codes.sigla
-        FROM (SELECT DISTINCT ON (municipio_codigo) municipio_codigo, uf
-              FROM estabelecimentos_staging
-              WHERE municipio_codigo IS NOT NULL AND uf IS NOT NULL) v
-        JOIN (VALUES {uf_values}) AS codes(code, sigla) ON codes.code = v.uf
-        WHERE v.municipio_codigo = m.receita_code AND m.uf IS DISTINCT FROM codes.sigla
+        UPDATE municipalities m SET uf = codes.abbr
+        FROM (SELECT DISTINCT ON (municipality_code) municipality_code, uf
+              FROM establishments_staging
+              WHERE municipality_code IS NOT NULL AND uf IS NOT NULL) v
+        JOIN (VALUES {uf_values}) AS codes(code, abbr) ON codes.code = v.uf
+        WHERE v.municipality_code = m.receita_code AND m.uf IS DISTINCT FROM codes.abbr
     """))
     db.commit()
 
@@ -1191,7 +1231,7 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
         db.execute(text("""
             ALTER TABLE establishments_new
             ADD CONSTRAINT establishments_cep_fkey
-            FOREIGN KEY (cep) REFERENCES correios_cep (cep)
+            FOREIGN KEY (cep) REFERENCES postal_codes (cep)
         """))
         db.commit()
 
@@ -1299,8 +1339,8 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
             db.execute(text(f'ALTER INDEX "{name}_new" RENAME TO "{name}"'))
         db.execute(text(f"ALTER INDEX {table}_new_pkey RENAME TO {table}_pkey"))
 
-    db.execute(text("TRUNCATE TABLE empresas_staging, simples_staging, estabelecimentos_staging"))
-    db.execute(text("DELETE FROM import_log WHERE period = :period"), {"period": period})
+    db.execute(text("TRUNCATE TABLE companies_staging, simples_staging, establishments_staging"))
+    db.execute(text("DELETE FROM import_files WHERE period = :period"), {"period": period})
     db.commit()
 
     # O RENAME nao carrega estatistica nenhuma: pro planner, `establishments`
@@ -1329,11 +1369,11 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
 
 
 def _already_imported(db: Session, period: str, filename: str) -> bool:
-    return db.query(ImportLog).filter_by(period=period, filename=filename).first() is not None
+    return db.query(ImportFile).filter_by(period=period, filename=filename).first() is not None
 
 
 def _mark_imported(db: Session, period: str, filename: str, rows: int) -> None:
-    stmt = pg_insert(ImportLog.__table__).values(
+    stmt = pg_insert(ImportFile.__table__).values(
         period=period, filename=filename, rows_imported=rows, imported_at=datetime.now(timezone.utc),
     )
     stmt = stmt.on_conflict_do_update(
@@ -1348,7 +1388,7 @@ def _finish_steps(db: Session) -> None:
     """Fecha as linhas de estagio no fim do run -- sem isso `/import/status`
     mostraria os tres estagios como `running` pra sempre depois de terminar."""
     for step in STEPS:
-        existing = db.get(ImportProgress, step)
+        existing = db.get(ImportStep, step)
         if existing and existing.status == "running":
             _set_step(db, step, status="success", current_file=None)
 
@@ -1365,29 +1405,48 @@ def _set_step(db: Session, step: str, **fields) -> None:
     now = datetime.now(timezone.utc)
     fields["updated_at"] = now
     if fields.get("status") == "running":
-        existing = db.get(ImportProgress, step)
+        existing = db.get(ImportStep, step)
         if not existing or existing.status != "running":
             fields["started_at"] = now
 
-    stmt = pg_insert(ImportProgress.__table__).values(step=step, **fields)
+    stmt = pg_insert(ImportStep.__table__).values(step=step, **fields)
     stmt = stmt.on_conflict_do_update(index_elements=["step"], set_={c: stmt.excluded[c] for c in fields})
     db.execute(stmt)
     db.commit()
 
 
 def _set_run(db: Session, **fields) -> None:
-    message = fields.get("message")
+    """Escreve o estado da FASE de CNPJ na linha unica de `import_runs`.
+
+    Traduz o vocabulario do pipeline (period/status/message) pras colunas
+    `cnpj*` da tabela fundida: o `status` que chega aqui e o da fase, nao o
+    geral do `import-all` -- esse e escrito por app.cli._set_import_all, e
+    sobrescreve-lo daqui apagaria o progresso das outras cinco fases.
+    """
+    message = fields.pop("message", None)
     if message:
         logger.info("%s", message)
 
-    now = datetime.now(timezone.utc)
-    fields["updated_at"] = now
-    if fields.get("status") == "running":
-        existing = db.get(ImportRun, 1)
-        if not existing or existing.status != "running":
-            fields["started_at"] = now
+    status = fields.pop("status", None)
+    period = fields.pop("period", None)
+    assert not fields, f"campo nao mapeado pra import_runs: {sorted(fields)}"
 
-    stmt = pg_insert(ImportRun.__table__).values(id=1, **fields)
-    stmt = stmt.on_conflict_do_update(index_elements=["id"], set_={c: stmt.excluded[c] for c in fields})
+    now = datetime.now(timezone.utc)
+    # `updated_at` e NOT NULL e esta linha pode nascer aqui (import-cnpj
+    # rodando sozinho, sem import-all antes) -- por isso sempre vai no INSERT.
+    values = {"cnpj_updated_at": now, "updated_at": now}
+    if period is not None:
+        values["cnpj_period"] = period
+    if message is not None:
+        values["cnpj_message"] = message
+    if status is not None:
+        values["cnpj"] = status
+        if status == "running":
+            existing = db.get(ImportRun, 1)
+            if not existing or existing.cnpj != "running":
+                values["cnpj_started_at"] = now
+
+    stmt = pg_insert(ImportRun.__table__).values(id=1, **values)
+    stmt = stmt.on_conflict_do_update(index_elements=["id"], set_={c: stmt.excluded[c] for c in values})
     db.execute(stmt)
     db.commit()

@@ -17,7 +17,7 @@ class AddressOut(BaseModel):
     number: str | None
     complement: str | None
     district: str | None
-    municipio: str | None
+    municipality: str | None
     uf: str | None
     # De onde vieram logradouro/bairro: "correios" (pelo CEP) ou "receita"
     # (o CEP não resolve, então valeu o dado da Receita).
@@ -33,23 +33,23 @@ class EstablishmentOut(BaseModel):
     is_simples: bool
     company_size: str | None
     company_size_label: str | None
-    natureza_juridica_code: str | None
-    natureza_juridica_description: str | None
+    legal_nature_code: str | None
+    legal_nature_description: str | None
     main_cnae_code: str | None
     main_cnae_description: str | None
     secondary_cnae_codes: list[str]
     secondary_cnae_descriptions: list[str]
-    municipio_name: str | None
+    municipality_name: str | None
     uf: str | None
     email: str | None
     phone: str | None
     cellphone: str | None
     cellphone_confidence: int
     opened_at: date | None
-    situacao_cadastral: str | None
-    situacao_cadastral_label: str | None
-    motivo_situacao_cadastral_code: str | None
-    motivo_situacao_cadastral_description: str | None
+    registration_status: str | None
+    registration_status_label: str | None
+    registration_status_reason_code: str | None
+    registration_status_reason_description: str | None
     address: AddressOut
 
     model_config = {"from_attributes": True}
@@ -62,22 +62,22 @@ class CodeDescriptionOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class SocioOut(BaseModel):
-    cnpj_basico: str
-    identificador_socio: str | None
-    identificador_socio_label: str | None
-    nome_socio: str
-    cpf_cnpj_socio: str | None
-    qualificacao_socio_code: str | None
-    qualificacao_socio_description: str | None
-    data_entrada_sociedade: date | None
-    pais_code: str | None
-    pais_description: str | None
-    representante_legal: str | None
-    nome_representante: str | None
-    qualificacao_representante_code: str | None
-    qualificacao_representante_description: str | None
-    faixa_etaria_label: str | None
+class PartnerOut(BaseModel):
+    cnpj_root: str
+    partner_type: str | None
+    partner_type_label: str | None
+    partner_name: str
+    partner_tax_id: str | None
+    partner_qualification_code: str | None
+    partner_qualification_description: str | None
+    partnership_start_date: date | None
+    country_code: str | None
+    country_description: str | None
+    legal_rep: str | None
+    legal_rep_name: str | None
+    legal_rep_qualification_code: str | None
+    legal_rep_qualification_description: str | None
+    age_range_label: str | None
     company_name: str | None
 
 
@@ -97,17 +97,17 @@ class CursorPage(BaseModel):
     limit: int
 
 
-class SocioPageOut(CursorPage):
-    data: list[SocioOut]
+class PartnerPageOut(CursorPage):
+    data: list[PartnerOut]
 
 
 class EstablishmentPage(CursorPage):
     data: list[EstablishmentOut]
 
 
-class EnderecoPageOut(CursorPage):
-    # Linhas de `correios_cep` montadas em SQL direto (ver
-    # app/routers/enderecos.py), com `exata`/`distancia_km` a mais quando a
+class AddressPageOut(CursorPage):
+    # Linhas de `postal_codes` montadas em SQL direto (ver
+    # app/routers/addresses.py), com `exact`/`distance_km` a mais quando a
     # busca e por proximidade -- por isso dict e nao um model fixo.
     data: list[dict]
 
@@ -120,10 +120,10 @@ class CnaeCountOut(BaseModel):
 class EstablishmentStatsOut(BaseModel):
     """Agregações de /establishments/stats.
 
-    `by_uf`, `by_regiao`, `by_company_size` e `top_cnaes` vêm vazios a menos que
+    `by_uf`, `by_region`, `by_company_size` e `top_cnaes` vêm vazios a menos que
     `include_breakdowns=true`: cada um é um GROUP BY que varre todas as linhas
     do filtro, e num recorte grande isso não termina em tempo de request.
-    A exceção é `by_uf`/`by_regiao` quando se filtra por uma única UF -- aí a
+    A exceção é `by_uf`/`by_region` quando se filtra por uma única UF -- aí a
     resposta é o próprio total, sem consultar nada.
     """
 
@@ -131,7 +131,7 @@ class EstablishmentStatsOut(BaseModel):
     with_cellphone: int
     with_email: int
     by_uf: dict[str, int]
-    by_regiao: dict[str, int]
+    by_region: dict[str, int]
     by_company_size: dict[str, int]
     top_cnaes: list[CnaeCountOut]
 
@@ -143,40 +143,40 @@ class CnaeOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class AnexoOut(BaseModel):
-    anexo: str
-    descricao: str
+class AnnexOut(BaseModel):
+    annex: str
+    description: str
 
 
-class FaixaOut(BaseModel):
-    faixa: int
+class BracketOut(BaseModel):
+    bracket: int
     rbt12_ate: float
-    aliquota_nominal: float
-    valor_a_deduzir: float
+    nominal_rate: float
+    deduction_amount: float
 
 
-class AnexoTabelaOut(BaseModel):
-    anexo: str
-    descricao: str
-    faixas: list[FaixaOut]
+class AnnexTableOut(BaseModel):
+    annex: str
+    description: str
+    brackets: list[BracketOut]
 
 
-class CalculoSimplesOut(BaseModel):
-    anexo: str
+class SimplesCalculationOut(BaseModel):
+    annex: str
     rbt12: float
-    faixa: int
-    aliquota_nominal: float
-    valor_a_deduzir: float
-    aliquota_efetiva: float
-    receita_mes: float
-    valor_imposto: float
+    bracket: int
+    nominal_rate: float
+    deduction_amount: float
+    effective_rate: float
+    monthly_revenue: float
+    tax_amount: float
 
 
-class FatorROut(BaseModel):
-    fator_r: float
-    limite: float
-    elegivel_anexo_iii: bool
-    anexo_sugerido: str
+class FactorROut(BaseModel):
+    factor_r: float
+    limit: float
+    elegivel_annex_iii: bool
+    annex_sugerido: str
 
 
 class ImportStepOut(BaseModel):

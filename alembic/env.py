@@ -28,18 +28,44 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 # `correios_cep` era excluída daqui, quando o edne-correios-loader era dono do
-# esquema dela. Hoje é um model nosso (models.CorreiosCep): a lib só popula uma
+# esquema dela. Hoje é um model nosso (models.PostalCode): a lib só popula uma
 # tabela de scratch e nós fazemos o upsert, então o Alembic gerencia a tabela
 # como qualquer outra -- e é isso que permite a FK de establishments.cep.
 
-# `correios_cep_import` é a tabela de scratch daquele import: criada e
-# destruída dentro de `import-ceps`, nunca deve aparecer num autogenerate.
-TABLES_NOT_MANAGED_BY_ALEMBIC = {"correios_cep_import"}
+# `postal_codes_import` é a tabela de scratch daquele import: criada e
+# destruída dentro de `import-ceps` (ver `app.ceps.SCRATCH_TABLE`), nunca deve
+# aparecer num autogenerate.
+#
+# As três de staging (`*_staging`) estão aqui por um motivo diferente: elas SÃO
+# models nossos, mas o ciclo de vida delas é do import, não do schema. São
+# scratch UNLOGGED de ~63M linhas que só existe entre o COPY e o swap do build
+# -- o `import-all` as dropa no fim e o pipeline as recria no início do próximo
+# (`ensure_staging_tables`, em app/importer/pipeline.py). Sem excluí-las daqui,
+# todo autogenerate as detectaria como "added table" e a próxima migration as
+# devolveria ao schema, desfazendo isso silenciosamente.
+TABLES_NOT_MANAGED_BY_ALEMBIC = {
+    "postal_codes_import",
+    "companies_staging",
+    "establishments_staging",
+    "simples_staging",
+}
+
+# As tabelas-SOMBRA do swap atômico do build (`establishments_new`,
+# `partners_old`, ...). Também não são schema: o build monta `<tabela>_new`,
+# renomeia a viva pra `<tabela>_old` e dropa. Um autogenerate rodado enquanto
+# uma delas existe — durante um import, ou depois de um que morreu no meio —
+# as veria no banco e não no metadata, e geraria uma migration com `drop_table`
+# pra cada uma. Aplicá-la no meio de um build apagaria a tabela que o import
+# está montando.
+TRANSIENT_TABLE_SUFFIXES = ("_new", "_old")
 
 
 def include_object(object, name, type_, reflected, compare_to):
-    if type_ == "table" and name in TABLES_NOT_MANAGED_BY_ALEMBIC:
-        return False
+    if type_ == "table":
+        if name in TABLES_NOT_MANAGED_BY_ALEMBIC:
+            return False
+        if name.endswith(TRANSIENT_TABLE_SUFFIXES):
+            return False
     return True
 
 # other values from the config, defined by the needs of env.py,

@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.importer.pipeline import run_import
-from app.models import ImportProgress, ImportRun
+from app.models import ImportRun, ImportStep
 from app.schemas import ImportStatusOut, ImportStepOut
 
 router = APIRouter(prefix="/import", tags=["import"])
@@ -18,15 +18,17 @@ def status(db: Session = Depends(get_db)):
     do pipeline. Os estágios rodam em paralelo, então num run ativo há três
     arquivos diferentes em `stages` ao mesmo tempo."""
     run = db.get(ImportRun, 1)
-    steps = db.query(ImportProgress).all()
+    steps = db.query(ImportStep).all()
     by_step = {step.step: step for step in steps}
 
     return ImportStatusOut(
-        period=run.period if run else None,
-        status=run.status if run else "idle",
-        message=run.message if run else None,
-        started_at=_iso(run.started_at) if run else None,
-        updated_at=_iso(run.updated_at) if run else None,
+        period=run.cnpj_period if run else None,
+        # A fase nasce "pending" na tabela; a API sempre falou "idle" pra
+        # "nunca rodou", e o contrato nao muda por causa da fusao.
+        status=(run.cnpj if run.cnpj != "pending" else "idle") if run else "idle",
+        message=run.cnpj_message if run else None,
+        started_at=_iso(run.cnpj_started_at) if run else None,
+        updated_at=_iso(run.cnpj_updated_at) if run else None,
         stages=[_serialize_step(name, by_step.get(name)) for name in STAGE_ORDER],
     )
 
@@ -35,7 +37,7 @@ def _iso(value) -> str | None:
     return value.isoformat() if value else None
 
 
-def _serialize_step(name: str, step: ImportProgress | None) -> ImportStepOut:
+def _serialize_step(name: str, step: ImportStep | None) -> ImportStepOut:
     if step is None:
         return ImportStepOut(
             step=name, status="idle", group=None, current_file=None, processed_rows=0,

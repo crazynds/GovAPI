@@ -1,12 +1,12 @@
-"""Bootstrap de `municipios` a partir da API de Localidades do IBGE (sem
+"""Bootstrap de `municipalities` a partir da API de Localidades do IBGE (sem
 chave, uma request só) -- ibge_code + nome + UF exatos, direto da fonte,
 sem fuzzy match nenhum.
 
-Roda ANTES de tudo (CEPs, CNPJ): é o que dá a `correios_cep` uma FOREIGN KEY
-de verdade pra `municipios` (por ibge_code), fechando a cadeia
-`establishments.cep -> correios_cep.municipio_cod_ibge -> municipios.ibge_code`.
+Roda ANTES de tudo (CEPs, CNPJ): é o que dá a `postal_codes` uma FOREIGN KEY
+de verdade pra `municipalities` (por ibge_code), fechando a cadeia
+`establishments.cep -> postal_codes.municipality_ibge_code -> municipalities.ibge_code`.
 
-O código de município da própria Receita (`municipios.receita_code`) continua
+O código de município da própria Receita (`municipalities.receita_code`) continua
 vindo do `Municipios.zip` dela (grupo "reference" do import-cnpj, que roda
 DEPOIS) -- esse arquivo não traz UF nem código IBGE, só código+nome, então
 aquele import casa por nome contra as linhas que este módulo já criou (ver
@@ -20,7 +20,7 @@ import httpx
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from app.models import Municipio
+from app.models import Municipality
 
 logger = logging.getLogger("importer")
 
@@ -34,16 +34,16 @@ def normalize_name(name: str) -> str:
 
 
 def _extract_uf(item: dict) -> str:
-    """A maioria dos municípios tem `microrregiao.mesorregiao.UF`, mas
+    """A maioria dos municípios tem `microrregion.mesorregion.UF`, mas
     distritos estaduais sem microrregião (ex: Fernando de Noronha/PE) só
     trazem `regiao-imediata.regiao-intermediaria.UF`."""
-    microrregiao = item.get("microrregiao")
-    if microrregiao:
-        return microrregiao["mesorregiao"]["UF"]["sigla"]
+    microrregion = item.get("microrregiao")
+    if microrregion:
+        return microrregion["mesorregiao"]["UF"]["sigla"]
     return item["regiao-imediata"]["regiao-intermediaria"]["UF"]["sigla"]
 
 
-def import_municipios(db: Session) -> int:
+def import_municipalities(db: Session) -> int:
     """Busca todos os municípios do IBGE de uma vez e faz upsert por
     `ibge_code` -- chave exata, sem ambiguidade (ao contrário do nome, que se
     repete entre estados). Retorna quantos foram processados."""
@@ -58,7 +58,7 @@ def import_municipios(db: Session) -> int:
         # Nome em maiuscula, pra bater com a convencao que o Municipios.zip da
         # Receita ja usa (esse import roda depois e sobrescreve `name` de
         # qualquer forma quando casa, mas ate la o nome fica no mesmo padrao).
-        stmt = pg_insert(Municipio.__table__).values(ibge_code=item["id"], name=item["nome"].upper(), uf=uf)
+        stmt = pg_insert(Municipality.__table__).values(ibge_code=item["id"], name=item["nome"].upper(), uf=uf)
         stmt = stmt.on_conflict_do_update(
             index_elements=["ibge_code"], set_={"name": stmt.excluded.name, "uf": stmt.excluded.uf}
         )

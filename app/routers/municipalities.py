@@ -2,30 +2,30 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.models import Municipio
-from app.regions import UF_TO_REGIAO, ufs_for_regiao
+from app.models import Municipality
+from app.regions import UF_TO_REGION, ufs_for_region
 
-router = APIRouter(prefix="/municipios", tags=["municipios"])
+router = APIRouter(prefix="/municipalities", tags=["municipalities"])
 
 
 # Largura dos codigos de municipio -- as colunas sao Integer no banco (pro
-# JOIN do build casar tipo sem CAST e pra FK de correios_cep funcionar), mas a
+# JOIN do build casar tipo sem CAST e pra FK de postal_codes funcionar), mas a
 # API sempre falou nessa forma de string com zero a esquerda.
 RECEITA_CODE_WIDTH = 4
 IBGE_CODE_WIDTH = 7
 
 
-def _serialize(m: Municipio) -> dict:
+def _serialize(m: Municipality) -> dict:
     return {
         # Nullable agora: uma linha pode existir so pelo lado do IBGE
-        # (bootstrap via `import-municipios`) antes do Municipios.zip da
+        # (bootstrap via `import-municipalities`) antes do Municipios.zip da
         # Receita ter rodado, ou pra sempre no raro caso de nome sem
         # correspondencia exata entre as duas fontes -- ver
-        # app.importer.pipeline._merge_municipios_receita.
+        # app.importer.pipeline._merge_municipalities_receita.
         "receita_code": f"{m.receita_code:0{RECEITA_CODE_WIDTH}d}" if m.receita_code is not None else None,
         "name": m.name,
         "uf": m.uf,
-        "regiao": UF_TO_REGIAO.get(m.uf) if m.uf else None,
+        "region": UF_TO_REGION.get(m.uf) if m.uf else None,
         "ibge_code": f"{m.ibge_code:0{IBGE_CODE_WIDTH}d}" if m.ibge_code is not None else None,
         "population": m.population,
         "area_km2": float(m.area_km2) if m.area_km2 is not None else None,
@@ -36,38 +36,38 @@ def _serialize(m: Municipio) -> dict:
 def search(
     name: str | None = Query(None),
     uf: list[str] | None = Query(None, description="Uma ou mais UFs, ex: ?uf=SP&uf=RJ"),
-    regiao: str | None = Query(None, description="norte/nordeste/centro-oeste/sudeste/sul"),
+    region: str | None = Query(None, description="norte/nordeste/centro-oeste/sudeste/sul"),
     limit: int = Query(10, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
-    query = db.query(Municipio)
+    query = db.query(Municipality)
 
     if name:
-        query = query.filter(Municipio.name.ilike(f"%{name}%"))
+        query = query.filter(Municipality.name.ilike(f"%{name}%"))
 
     ufs = set(uf or [])
-    if regiao:
-        regiao_ufs = ufs_for_regiao(regiao)
-        if not regiao_ufs:
-            raise HTTPException(422, f"Região desconhecida: {regiao!r} (use norte/nordeste/centro-oeste/sudeste/sul)")
-        ufs |= set(regiao_ufs)
+    if region:
+        region_ufs = ufs_for_region(region)
+        if not region_ufs:
+            raise HTTPException(422, f"Região desconhecida: {region!r} (use norte/nordeste/centro-oeste/sudeste/sul)")
+        ufs |= set(region_ufs)
     if ufs:
-        query = query.filter(Municipio.uf.in_(ufs))
+        query = query.filter(Municipality.uf.in_(ufs))
 
     # Ordena pela PK, como todo o resto da API -- ordenar por `name` faria o
     # banco ordenar o resultado filtrado antes de cortar o `limit`.
-    results = query.order_by(Municipio.id).limit(limit).all()
+    results = query.order_by(Municipality.id).limit(limit).all()
     return [_serialize(m) for m in results]
 
 
 @router.get("/by-code/{code}")
 def by_code(code: str, db: Session = Depends(get_db)):
-    """Municipio por codigo da Receita (4 digitos) ou do IBGE (7).
+    """Municipality por codigo da Receita (4 digitos) ou do IBGE (7).
 
     As duas larguras nao colidem, e as duas colunas sao unique e indexadas,
     entao qual delas consultar sai do proprio tamanho do codigo -- sem
     parametro extra. Aceitar so o da Receita era uma armadilha: o codigo IBGE
-    e o que aparece em todo lugar (inclusive no `municipio_cod_ibge` dos
+    e o que aparece em todo lugar (inclusive no `municipality_ibge_code` dos
     enderecos daqui), e `4106902` dava 404 em silencio.
     """
     cleaned = code.strip()
@@ -76,9 +76,9 @@ def by_code(code: str, db: Session = Depends(get_db)):
 
     value = int(cleaned)
     if len(cleaned) <= RECEITA_CODE_WIDTH:
-        column = Municipio.receita_code
+        column = Municipality.receita_code
     elif len(cleaned) == IBGE_CODE_WIDTH:
-        column = Municipio.ibge_code
+        column = Municipality.ibge_code
     else:
         raise HTTPException(
             422,
@@ -86,7 +86,7 @@ def by_code(code: str, db: Session = Depends(get_db)):
             f"ou {IBGE_CODE_WIDTH} (IBGE), veio {len(cleaned)}: {code!r}",
         )
 
-    m = db.query(Municipio).filter(column == value).first()
+    m = db.query(Municipality).filter(column == value).first()
     if not m:
         raise HTTPException(404, "Município não encontrado")
     return _serialize(m)

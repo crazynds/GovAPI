@@ -8,25 +8,25 @@ checksum mod-11 deterministico sobre as 12, recalculado na saida.
 
 A codificacao preserva a ordem (string de largura fixa com zero a esquerda ->
 o inteiro ordena igual), entao "CNPJs que comecam com a raiz X" e uma faixa
-continua de inteiros -- ver `basico_range`.
+continua de inteiros -- ver `root_range`.
 """
 
 _ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 _BASE = 36
 
-BASICO_LEN = 8
-ORDEM_LEN = 4
-BODY_LEN = BASICO_LEN + ORDEM_LEN  # 12 posicoes alfanumericas
+ROOT_LEN = 8
+BRANCH_LEN = 4
+BODY_LEN = ROOT_LEN + BRANCH_LEN  # 12 posicoes alfanumericas
 
 # Quantos inteiros distintos uma unica raiz cobre (todas as ordens possiveis).
-ORDEM_SPAN = _BASE**ORDEM_LEN
+BRANCH_SPAN = _BASE**BRANCH_LEN
 
 MAX_VALUE = _BASE**BODY_LEN - 1
 
 
-def encode(basico: str, ordem: str) -> int:
+def encode(root: str, branch: str) -> int:
     """Junta raiz + ordem (do CSV da Receita) num inteiro."""
-    return to_int(f"{basico:0>{BASICO_LEN}}{ordem:0>{ORDEM_LEN}}")
+    return to_int(f"{root:0>{ROOT_LEN}}{branch:0>{BRANCH_LEN}}")
 
 
 def to_int(body: str) -> int:
@@ -105,7 +105,7 @@ def parse(text: str) -> int:
 
     if len(cleaned) == BODY_LEN + 2:
         cleaned = cleaned[:BODY_LEN]
-    elif len(cleaned) == BASICO_LEN:
+    elif len(cleaned) == ROOT_LEN:
         # So a raiz: completa com a ordem da matriz (0001), pra quem passa os 8
         # primeiros digitos esperando "a empresa".
         cleaned = cleaned + "0001"
@@ -113,38 +113,38 @@ def parse(text: str) -> int:
     return to_int(cleaned)
 
 
-def basico_to_int(basico: str) -> int:
+def root_to_int(root: str) -> int:
     """So a raiz (8 posicoes) como inteiro -- e assim que as tabelas de staging
-    guardam `cnpj_basico`, e o que o JOIN do build compara.
+    guardam `cnpj_root`, e o que o JOIN do build compara.
 
     Mesmo filtro de `to_int`: descarta qualquer caractere nao-alfanumerico
     antes de completar com zero a esquerda e validar o tamanho.
     """
-    basico = "".join(c for c in basico.upper() if c.isalnum()).rjust(BASICO_LEN, "0")
-    if len(basico) != BASICO_LEN:
-        raise ValueError(f"Raiz de CNPJ deve ter {BASICO_LEN} posições: {basico!r}")
-    return int(basico, _BASE)
+    root = "".join(c for c in root.upper() if c.isalnum()).rjust(ROOT_LEN, "0")
+    if len(root) != ROOT_LEN:
+        raise ValueError(f"Raiz de CNPJ deve ter {ROOT_LEN} posições: {root!r}")
+    return int(root, _BASE)
 
 
-def basico_from_int(basico: int) -> str:
-    """Inverso de `basico_to_int`."""
-    return decode(basico * ORDEM_SPAN)[:BASICO_LEN]
+def root_from_int(root: int) -> str:
+    """Inverso de `root_to_int`."""
+    return decode(root * BRANCH_SPAN)[:ROOT_LEN]
 
 
-def basico_of_value(value: int) -> int:
+def root_of_value(value: int) -> int:
     """A raiz, como inteiro, de um CNPJ completo ja codificado -- e o mesmo que
     "corta as 4 ultimas posicoes", que em base 36 e uma divisao inteira."""
-    return value // ORDEM_SPAN
+    return value // BRANCH_SPAN
 
 
-def basico_range(basico: str) -> tuple[int, int]:
+def root_range(root: str) -> tuple[int, int]:
     """Faixa fechada [lo, hi] que cobre todos os estabelecimentos de uma raiz.
 
     Substitui o `cnpj LIKE '<raiz>%'`, que nenhum indice atende, por um
     `BETWEEN` que a PK resolve -- so funciona porque a base 36 sobre string de
     largura fixa preserva a ordem.
     """
-    lo = basico_to_int(basico) * ORDEM_SPAN
-    return lo, lo + ORDEM_SPAN - 1
+    lo = root_to_int(root) * BRANCH_SPAN
+    return lo, lo + BRANCH_SPAN - 1
 
 

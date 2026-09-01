@@ -178,7 +178,7 @@ def _rows(geojsonseq_path: str, display: ProgressDisplay):
 
 def import_ceps_from_osm(db: Session) -> int:
     """Baixa o extrato, extrai pontos com CEP e carrega em
-    `correios_cep` (só preenche coordenada que ainda não existe). Retorna
+    `postal_codes` (só preenche coordenada que ainda não existe). Retorna
     quantos CEPs ganharam coordenada."""
     work_dir = settings.download_dir
     os.makedirs(work_dir, exist_ok=True)
@@ -226,7 +226,7 @@ def import_ceps_from_osm(db: Session) -> int:
         # que já existe (a da BrasilAPI é precisa; a do OSM só compartilha o
         # CEP).
         result = db.execute(text("""
-            INSERT INTO correios_cep (cep, latitude, longitude, coord_source, coord_updated_at)
+            INSERT INTO postal_codes (cep, latitude, longitude, coord_source, coord_updated_at)
             -- cep é INTEGER na tabela; a temp recebe texto direto do COPY.
             SELECT cep::integer, latitude::numeric, longitude::numeric, 'osm_extract', :now
             FROM tmp_osm_ceps
@@ -235,7 +235,7 @@ def import_ceps_from_osm(db: Session) -> int:
                 longitude = EXCLUDED.longitude,
                 coord_source = EXCLUDED.coord_source,
                 coord_updated_at = EXCLUDED.coord_updated_at
-            WHERE correios_cep.latitude IS NULL
+            WHERE postal_codes.latitude IS NULL
         """), {"now": datetime.now(timezone.utc)})
         inserted = result.rowcount
         db.execute(text("DROP TABLE tmp_osm_ceps"))

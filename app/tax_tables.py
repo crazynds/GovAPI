@@ -6,15 +6,15 @@ Cada anexo tem 6 faixas de RBT12 (receita bruta dos últimos 12 meses), cada
 uma com uma aliquota nominal e um valor a deduzir -- a aliquota EFETIVA (a
 que realmente incide sobre a receita do mês) é:
 
-    aliquota_efetiva = (RBT12 * aliquota_nominal - valor_a_deduzir) / RBT12
+    effective_rate = (RBT12 * nominal_rate - deduction_amount) / RBT12
 
 Fonte: anexos da LC 123/2006 -- confira o texto oficial antes de usar em
 produção fiscal real, isso aqui é uma referência, não parecer tributário.
 """
 
-FAIXA_MAX = 4_800_000.00
+BRACKET_MAX = 4_800_000.00
 
-ANEXO_I = [  # Comércio
+ANNEX_I = [  # Comércio
     (180_000.00, 0.0400, 0.00),
     (360_000.00, 0.0730, 5_940.00),
     (720_000.00, 0.0950, 13_860.00),
@@ -23,7 +23,7 @@ ANEXO_I = [  # Comércio
     (4_800_000.00, 0.1900, 378_000.00),
 ]
 
-ANEXO_II = [  # Indústria
+ANNEX_II = [  # Indústria
     (180_000.00, 0.0450, 0.00),
     (360_000.00, 0.0780, 5_940.00),
     (720_000.00, 0.1000, 13_860.00),
@@ -32,7 +32,7 @@ ANEXO_II = [  # Indústria
     (4_800_000.00, 0.3000, 720_000.00),
 ]
 
-ANEXO_III = [  # Serviços (geral)
+ANNEX_III = [  # Serviços (geral)
     (180_000.00, 0.0600, 0.00),
     (360_000.00, 0.1120, 9_360.00),
     (720_000.00, 0.1350, 17_640.00),
@@ -41,7 +41,7 @@ ANEXO_III = [  # Serviços (geral)
     (4_800_000.00, 0.3300, 648_000.00),
 ]
 
-ANEXO_IV = [  # Serviços (construção, vigilância, advocacia, etc. -- §6º-C)
+ANNEX_IV = [  # Serviços (construção, vigilância, advocacia, etc. -- §6º-C)
     (180_000.00, 0.0450, 0.00),
     (360_000.00, 0.0900, 8_100.00),
     (720_000.00, 0.1020, 12_420.00),
@@ -50,7 +50,7 @@ ANEXO_IV = [  # Serviços (construção, vigilância, advocacia, etc. -- §6º-C
     (4_800_000.00, 0.3300, 828_000.00),
 ]
 
-ANEXO_V = [  # Serviços intelectuais/regulados sujeitos ao Fator R (§5º-D)
+ANNEX_V = [  # Serviços intelectuais/regulados sujeitos ao Fator R (§5º-D)
     (180_000.00, 0.1550, 0.00),
     (360_000.00, 0.1800, 4_500.00),
     (720_000.00, 0.1950, 9_900.00),
@@ -59,9 +59,9 @@ ANEXO_V = [  # Serviços intelectuais/regulados sujeitos ao Fator R (§5º-D)
     (4_800_000.00, 0.3050, 540_000.00),
 ]
 
-ANEXOS = {"I": ANEXO_I, "II": ANEXO_II, "III": ANEXO_III, "IV": ANEXO_IV, "V": ANEXO_V}
+ANNEXES = {"I": ANNEX_I, "II": ANNEX_II, "III": ANNEX_III, "IV": ANNEX_IV, "V": ANNEX_V}
 
-ANEXO_DESCRICOES = {
+ANNEX_DESCRIPTIONS = {
     "I": "Comércio",
     "II": "Indústria",
     "III": "Serviços (geral)",
@@ -69,27 +69,27 @@ ANEXO_DESCRICOES = {
     "V": "Serviços intelectuais/regulados sujeitos ao Fator R (§5º-D)",
 }
 
-FATOR_R_LIMITE = 0.28  # >= 28% de folha/receita -> Anexo III no lugar do V
+FACTOR_R_THRESHOLD = 0.28  # >= 28% de folha/receita -> Anexo III no lugar do V
 
 
-def faixa_da_tabela(anexo: list[tuple[float, float, float]], rbt12: float) -> tuple[int, float, float]:
-    """Retorna (numero_da_faixa (1-6), aliquota_nominal, valor_a_deduzir)
+def bracket_for(annex: list[tuple[float, float, float]], rbt12: float) -> tuple[int, float, float]:
+    """Retorna (numero_da_faixa (1-6), nominal_rate, deduction_amount)
     pra um RBT12 dado. RBT12 acima do limite (4.8M) usa a última faixa --
     empresa nesse caso já está no limite do Simples, alíquota é referencial."""
-    for i, (limite, aliquota, deducao) in enumerate(anexo, start=1):
-        if rbt12 <= limite:
-            return i, aliquota, deducao
-    numero, aliquota, deducao = len(anexo), anexo[-1][1], anexo[-1][2]
-    return numero, aliquota, deducao
+    for i, (limit, rate, deduction) in enumerate(annex, start=1):
+        if rbt12 <= limit:
+            return i, rate, deduction
+    number, rate, deduction = len(annex), annex[-1][1], annex[-1][2]
+    return number, rate, deduction
 
 
-def aliquota_efetiva(rbt12: float, aliquota_nominal: float, valor_a_deduzir: float) -> float:
+def effective_rate(rbt12: float, nominal_rate: float, deduction_amount: float) -> float:
     if rbt12 <= 0:
         return 0.0
-    return max(0.0, (rbt12 * aliquota_nominal - valor_a_deduzir) / rbt12)
+    return max(0.0, (rbt12 * nominal_rate - deduction_amount) / rbt12)
 
 
-def calcular_fator_r(receita_bruta_12m: float, folha_pagamento_12m: float) -> float:
-    if receita_bruta_12m <= 0:
+def calculate_factor_r(gross_revenue_12m: float, payroll_12m: float) -> float:
+    if gross_revenue_12m <= 0:
         return 0.0
-    return folha_pagamento_12m / receita_bruta_12m
+    return payroll_12m / gross_revenue_12m

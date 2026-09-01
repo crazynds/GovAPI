@@ -9,12 +9,12 @@ from app.config import settings
 from app.db import SessionLocal
 from app.importer.pipeline import run_import
 from app.migrate import run_migrations
-from app.models import ImportAllRun
+from app.models import ImportRun
 
 cli = typer.Typer()
 
 # Nome/esquema da tabela de CEP vivem em app/ceps.py -- ver o módulo.
-CORREIOS_CEP_TABLE = ceps.TABLE
+POSTAL_CODES_TABLE = ceps.TABLE
 
 
 @cli.command()
@@ -33,7 +33,7 @@ def reset_db(
     APAGA TODOS OS DADOS: derruba o schema `public` inteiro e reaplica as
     migrations, deixando um banco vazio e no schema mais recente.
 
-    DROP SCHEMA (e não um drop tabela a tabela) porque a tabela `correios_cep`
+    DROP SCHEMA (e não um drop tabela a tabela) porque a tabela `postal_codes`
     é criada pelo edne-correios-loader, fora do metadata do SQLAlchemy -- um
     drop pelos models deixaria ela para trás.
     """
@@ -57,24 +57,24 @@ def reset_db(
     typer.echo("Migrations aplicadas — banco vazio e em dia.")
 
 
-@cli.command("import-municipios")
-def import_municipios_command():
+@cli.command("import-municipalities")
+def import_municipalities_command():
     """
-    Bootstrapa `municipios` a partir da API de Localidades do IBGE (sem
+    Bootstrapa `municipalities` a partir da API de Localidades do IBGE (sem
     chave, uma request só) -- ibge_code + nome + UF exatos, sem fuzzy match.
 
-    Roda ANTES de tudo (CEPs, CNPJ): é o que dá a `correios_cep` uma FOREIGN
-    KEY de verdade pra `municipios`, fechando a cadeia establishments.cep ->
-    correios_cep.municipio_cod_ibge -> municipios.ibge_code. O código de
+    Roda ANTES de tudo (CEPs, CNPJ): é o que dá a `postal_codes` uma FOREIGN
+    KEY de verdade pra `municipalities`, fechando a cadeia establishments.cep ->
+    postal_codes.municipality_ibge_code -> municipalities.ibge_code. O código de
     município da própria Receita (`receita_code`) só chega depois, com o
     `Municipios.zip` dela (dentro de `import-cnpj`), casado por nome contra
     as linhas que este comando já criou.
     """
-    from app.importer.municipios import import_municipios
+    from app.importer.municipalities import import_municipalities
 
     db = SessionLocal()
     try:
-        count = import_municipios(db)
+        count = import_municipalities(db)
         typer.echo(f"Municípios: {count} carregados do IBGE.")
     finally:
         db.close()
@@ -83,7 +83,7 @@ def import_municipios_command():
 @cli.command("import-cnpj")
 def import_cnpj(
     period: str = typer.Option(None, help="Período específico (YYYY-MM-DD). Padrão: descobre o mais recente."),
-    only: list[str] = typer.Option(None, help="Grupos a rodar: reference, simples, empresas, estabelecimentos, build."),
+    only: list[str] = typer.Option(None, help="Grupos a rodar: reference, simples, companies, establishments, build."),
 ):
     """Baixa, descompacta e importa a base pública de CNPJ da Receita Federal."""
     _import_cnpj(period=period, only=only)
@@ -97,11 +97,11 @@ def import_ceps(
     """
     Baixa (dos próprios Correios, sem login) e importa o e-DNE Básico —
     base oficial e gratuita de CEPs do Brasil — numa tabela unificada
-    (`correios_cep`), usando o pacote edne-correios-loader
+    (`postal_codes`), usando o pacote edne-correios-loader
     (https://github.com/cauethenorio/edne-correios-loader).
     """
     _import_ceps(source=source)
-    typer.echo(f"Importação de CEPs concluída — tabela `{CORREIOS_CEP_TABLE}`.")
+    typer.echo(f"Importação de CEPs concluída — tabela `{POSTAL_CODES_TABLE}`.")
 
 
 @cli.command("import-ibge")
@@ -109,8 +109,8 @@ def import_ibge_command():
     """
     Busca população estimada e área territorial de todos os municípios de
     uma vez via API pública do IBGE (SIDRA/Agregados, sem chave) e casa por
-    ibge_code -- exato, sem fuzzy match. Precisa que `import-municipios`
-    já tenha rodado (é ele que preenche `ibge_code` em `municipios`).
+    ibge_code -- exato, sem fuzzy match. Precisa que `import-municipalities`
+    já tenha rodado (é ele que preenche `ibge_code` em `municipalities`).
     """
     from app.importer.ibge import import_ibge
 
@@ -122,26 +122,26 @@ def import_ibge_command():
         db.close()
 
 
-@cli.command("import-municipios-geo")
-def import_municipios_geo_command():
+@cli.command("import-municipalities-geo")
+def import_municipalities_geo_command():
     """
     Preenche o centroide de cada município (latitude/longitude) a partir de um
     dataset público estático (kelvins/municipios-brasileiros, casado por
     código IBGE exato) -- usado como fallback de baixa precisão em
-    /enderecos/proximos e /enderecos/buscar?lat=&lon= quando um CEP específico
+    /addresses/nearby e /addresses/search?lat=&lon= quando um CEP específico
     ainda não tem coordenada exata cacheada.
 
     Uma request só (~5570 municípios de uma vez), não mais 1 por município via
     Nominatim -- isso era ~1h40 pela política de 1 req/s deles. Precisa que
-    `import-municipios` já tenha rodado (o match é por código IBGE, que é
-    ele quem preenche em `municipios` -- não depende de `import-ibge`, que só
+    `import-municipalities` já tenha rodado (o match é por código IBGE, que é
+    ele quem preenche em `municipalities` -- não depende de `import-ibge`, que só
     cuida de população/área, um enriquecimento à parte).
     """
-    from app.importer.geocoding import geocode_municipios
+    from app.importer.geocoding import geocode_municipalities
 
     db = SessionLocal()
     try:
-        geocoded, total = geocode_municipios(db)
+        geocoded, total = geocode_municipalities(db)
         typer.echo(f"Geocodificação: {geocoded} município(s) atualizado(s) (dataset tem {total}).")
     finally:
         db.close()
@@ -152,7 +152,7 @@ def import_ceps_osm_command():
     """
     Baixa o extrato do Brasil do OpenStreetMap (Geofabrik, ~2GB, sem
     limite de taxa) e carrega em massa os CEPs com coordenada nele em
-    `correios_cep` -- só preenche CEP que ainda não tem coordenada (nunca
+    `postal_codes` -- só preenche CEP que ainda não tem coordenada (nunca
     sobrescreve uma coordenada exata já cacheada via BrasilAPI).
 
     Rode depois do `import-ceps`: assim preenche a coordenada dos CEPs que já
@@ -175,8 +175,8 @@ def import_ceps_osm_command():
 
 
 # Ordem das 6 fases de `import_all` -- a mesma ordem em que elas rodam, e a
-# mesma dos nomes das colunas de ImportAllRun.
-IMPORT_ALL_PHASES = ["municipios", "ceps", "ceps_osm", "cnpj", "ibge", "municipios_geo"]
+# mesma dos nomes das colunas de ImportRun.
+IMPORT_ALL_PHASES = ["municipalities", "ceps", "ceps_osm", "cnpj", "ibge", "municipalities_geo"]
 
 
 @cli.command("import-all")
@@ -187,9 +187,9 @@ def import_all():
     A ordem não é preferência, é dependência:
 
       1. Municípios (API de Localidades do IBGE) -- tem que vir primeiro de
-         todos. É o que dá a `correios_cep` uma FOREIGN KEY de verdade pra
-         `municipios` (por ibge_code), fechando establishments.cep ->
-         correios_cep.municipio_cod_ibge -> municipios.ibge_code.
+         todos. É o que dá a `postal_codes` uma FOREIGN KEY de verdade pra
+         `municipalities` (por ibge_code), fechando establishments.cep ->
+         postal_codes.municipality_ibge_code -> municipalities.ibge_code.
       2. CEPs dos Correios (e-DNE) -- o build do CNPJ liga cada
          estabelecimento ao seu CEP e, quando o CEP já resolve o endereço,
          deixa de guardar logradouro/bairro. Sem a base de CEP no lugar, esse
@@ -221,7 +221,7 @@ def import_all():
     """
     db = SessionLocal()
     try:
-        run = db.get(ImportAllRun, 1)
+        run = db.get(ImportRun, 1)
         resuming = run is not None and run.status != "success"
 
         if not resuming:
@@ -240,17 +240,17 @@ def import_all():
 
         # required=False só na 3/6: coordenadas do OSM são um enriquecimento
         # (fallback de baixa precisão via centroide do município já cobre a
-        # busca por proximidade sem elas -- ver import-municipios-geo), não
+        # busca por proximidade sem elas -- ver import-municipalities-geo), não
         # uma dependência de nada depois dela no pipeline. Um mirror externo
         # fora do ar (visto na prática: 503 do Geofabrik) não devia travar
         # CNPJ/IBGE/geocodificação, que não dependem dela em nada.
         steps = [
-            ("municipios", "1/6 Municípios (API de Localidades do IBGE)", _run_municipios, True),
+            ("municipalities", "1/6 Municípios (API de Localidades do IBGE)", _run_municipalities, True),
             ("ceps", "2/6 CEPs (Correios / e-DNE)", lambda: _import_ceps(source=None), True),
             ("ceps_osm", "3/6 Coordenadas de CEP (extrato do OpenStreetMap)", _run_ceps_osm, False),
             ("cnpj", "4/6 CNPJ (Receita Federal)", lambda: _import_cnpj(period=None, only=None), True),
             ("ibge", "5/6 População e área dos municípios (IBGE)", _run_ibge, True),
-            ("municipios_geo", "6/6 Centroide dos municípios (dataset estático)", _run_municipios_geo, True),
+            ("municipalities_geo", "6/6 Centroide dos municípios (dataset estático)", _run_municipalities_geo, True),
         ]
 
         # Estado final de cada fase, pra decidir o status GERAL no fim -- não dá
@@ -288,6 +288,22 @@ def import_all():
             _set_import_all(db, **{key: "success"})
             final_status[key] = "success"
 
+        # Staging fora. Ele e scratch UNLOGGED de ~63M linhas que existe pra
+        # alimentar o build, e depois do swap nao serve mais pra nada -- ficava
+        # pra tras ocupando disco porque nascia na migration e ninguem nunca o
+        # removia.
+        #
+        # Condicionado a fase de CNPJ ter chegado a "success", nao ao fim do
+        # loop: numa retomada, os arquivos ja marcados em `import_files` NAO
+        # sao recarregados, entao o conteudo do staging e insumo de uma fase de
+        # CNPJ interrompida. Dropa-lo ali faria o build seguinte montar
+        # `establishments` a partir de um staging pela metade -- silenciosamente.
+        if final_status.get("cnpj") == "success":
+            from app.importer.pipeline import drop_staging_tables
+
+            drop_staging_tables(db)
+            typer.echo("Tabelas de staging removidas (recriadas no próximo import).")
+
         # "success" geral exige TODAS as fases resolvidas (success ou skipped
         # de propósito) -- não só "o loop terminou sem lançar". Senão a
         # próxima chamada veria status="success" e trataria como refresh
@@ -305,12 +321,12 @@ def import_all():
         db.close()
 
 
-def _run_municipios() -> None:
-    from app.importer.municipios import import_municipios
+def _run_municipalities() -> None:
+    from app.importer.municipalities import import_municipalities
 
     db = SessionLocal()
     try:
-        count = import_municipios(db)
+        count = import_municipalities(db)
         typer.echo(f"Municípios: {count} carregados do IBGE.")
     finally:
         db.close()
@@ -337,12 +353,12 @@ def _run_ibge() -> None:
         db.close()
 
 
-def _run_municipios_geo() -> None:
-    from app.importer.geocoding import geocode_municipios
+def _run_municipalities_geo() -> None:
+    from app.importer.geocoding import geocode_municipalities
 
     db = SessionLocal()
     try:
-        geocoded, total = geocode_municipios(db)
+        geocoded, total = geocode_municipalities(db)
         typer.echo(f"Geocodificação: {geocoded} município(s) atualizado(s) (dataset tem {total}).")
     finally:
         db.close()
@@ -352,11 +368,11 @@ def _set_import_all(db, **fields) -> None:
     now = datetime.now(timezone.utc)
     fields["updated_at"] = now
     if fields.get("status") == "running":
-        existing = db.get(ImportAllRun, 1)
+        existing = db.get(ImportRun, 1)
         if not existing or existing.status != "running":
             fields["started_at"] = now
 
-    stmt = pg_insert(ImportAllRun.__table__).values(id=1, **fields)
+    stmt = pg_insert(ImportRun.__table__).values(id=1, **fields)
     stmt = stmt.on_conflict_do_update(index_elements=["id"], set_={c: stmt.excluded[c] for c in fields})
     db.execute(stmt)
     db.commit()
@@ -371,12 +387,12 @@ def _import_ceps(source: str | None) -> None:
 
     O `DneLoader.load()` limpa a tabela alvo com um DELETE de todas as linhas
     antes de repovoar. Isso é ruim por dois motivos: qualquer FOREIGN KEY
-    apontando pra `correios_cep` travaria esse DELETE, e durante a importação
+    apontando pra `postal_codes` travaria esse DELETE, e durante a importação
     (que roda numa transação só) a base fica sem CEP nenhum.
 
     Em vez de mexer nas entranhas da lib, usamos o `table_names` que ela já
     expõe: ela monta a base nova numa tabela de scratch, e o merge pra tabela
-    real é um UPSERT nosso. A lib nunca toca em `correios_cep`.
+    real é um UPSERT nosso. A lib nunca toca em `postal_codes`.
     """
     from edne_correios_loader import DneLoader, TableSetEnum
 

@@ -12,7 +12,7 @@ TABLE = "establishments_stats"
 # GROUP BY e o router nao poderem discordar entre si.
 DIMENSIONS = (
     "uf",
-    "situacao_cadastral",
+    "registration_status",
     "company_size",
     "main_cnae",
     "is_mei",
@@ -66,7 +66,7 @@ CNAE_TABLE = "establishments_cnae_stats"
 CNAE_DIMENSIONS = (
     "cnae",
     "uf",
-    "situacao_cadastral",
+    "registration_status",
     "company_size",
     "is_mei",
     "is_simples",
@@ -127,7 +127,7 @@ def create_sql(name: str) -> str:
         CREATE TABLE {name} (
             id bigserial PRIMARY KEY,
             uf smallint,
-            situacao_cadastral smallint,
+            registration_status smallint,
             company_size smallint,
             main_cnae integer,
             is_mei boolean NOT NULL,
@@ -144,7 +144,7 @@ def cnae_create_sql(name: str) -> str:
             id bigserial PRIMARY KEY,
             cnae integer NOT NULL,
             uf smallint,
-            situacao_cadastral smallint,
+            registration_status smallint,
             company_size smallint,
             is_mei boolean NOT NULL,
             is_simples boolean NOT NULL,

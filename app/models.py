@@ -21,12 +21,12 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db import Base
 
 
-class Municipio(Base):
-    """Nasce da API de localidades do IBGE (`import-municipios`, sem chave,
+class Municipality(Base):
+    """Nasce da API de localidades do IBGE (`import-municipalities`, sem chave,
     uma request só) -- ibge_code/name/uf exatos, sem fuzzy match. Roda antes
-    de tudo (CEPs, CNPJ): é o que dá a `correios_cep` uma FK de verdade pra
-    cá, e o que fecha establishments.cep -> correios_cep.municipio_cod_ibge
-    -> municipios.ibge_code.
+    de tudo (CEPs, CNPJ): é o que dá a `postal_codes` uma FK de verdade pra
+    cá, e o que fecha establishments.cep -> postal_codes.municipality_ibge_code
+    -> municipalities.ibge_code.
 
     `receita_code` só chega depois, com o `Municipios.zip` da própria Receita
     (grupo "reference" do import-cnpj) -- esse arquivo não traz UF nem código
@@ -36,22 +36,22 @@ class Municipio(Base):
     correspondência exata -- ver app.importer.pipeline._import_reference).
     """
 
-    __tablename__ = "municipios"
+    __tablename__ = "municipalities"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     receita_code: Mapped[int | None] = mapped_column(Integer, unique=True, index=True, nullable=True)
     name: Mapped[str] = mapped_column(String(120))
     uf: Mapped[str | None] = mapped_column(String(2), nullable=True)
     # Integer (nao String) pra poder ser alvo de FOREIGN KEY de
-    # correios_cep.municipio_cod_ibge, que ja e Integer -- Postgres nao aceita
+    # postal_codes.municipality_ibge_code, que ja e Integer -- Postgres nao aceita
     # FK entre tipos diferentes. unique=True pela mesma razao: FK exige indice
     # unico do lado referenciado.
     ibge_code: Mapped[int | None] = mapped_column(Integer, unique=True, index=True, nullable=True)
     population: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     area_km2: Mapped[float | None] = mapped_column(Numeric(12, 3), nullable=True)
-    # Centroide do municipio (Nominatim/OSM) -- ver `import-municipios-geo`.
+    # Centroide do municipio (Nominatim/OSM) -- ver `import-municipalities-geo`.
     # Usado como fallback de baixa precisao (nivel cidade) quando um CEP
-    # ainda nao tem coordenada exata cacheada em cep_coordenadas.
+    # ainda nao tem coordenada exata cacheada em `postal_codes`.
     latitude: Mapped[float | None] = mapped_column(Numeric(10, 7), nullable=True)
     longitude: Mapped[float | None] = mapped_column(Numeric(10, 7), nullable=True)
 
@@ -64,46 +64,46 @@ class Cnae(Base):
     description: Mapped[str] = mapped_column(String(255))
 
 
-class NaturezaJuridica(Base):
-    __tablename__ = "naturezas_juridicas"
+class LegalNature(Base):
+    __tablename__ = "legal_natures"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     code: Mapped[str] = mapped_column(String(8), unique=True, index=True)
     description: Mapped[str] = mapped_column(String(255))
 
 
-class Qualificacao(Base):
+class Qualification(Base):
     """Qualificação de sócio/responsável (ex: "Administrador",
     "Diretor") -- mesma tabela usada tanto pra sócio quanto pra
     representante legal no arquivo de Sócios."""
 
-    __tablename__ = "qualificacoes"
+    __tablename__ = "qualifications"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     code: Mapped[str] = mapped_column(String(8), unique=True, index=True)
     description: Mapped[str] = mapped_column(String(255))
 
 
-class Pais(Base):
-    __tablename__ = "paises"
+class Country(Base):
+    __tablename__ = "countries"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     code: Mapped[str] = mapped_column(String(8), unique=True, index=True)
     description: Mapped[str] = mapped_column(String(255))
 
 
-class Motivo(Base):
-    """Motivo da situação cadastral (por que a empresa foi baixada,
-    incorporada, etc.) -- ver Establishment.situacao_cadastral."""
+class RegistrationStatusReason(Base):
+    """RegistrationStatusReason da situação cadastral (por que a empresa foi baixada,
+    incorporada, etc.) -- ver Establishment.registration_status."""
 
-    __tablename__ = "motivos_situacao_cadastral"
+    __tablename__ = "registration_status_reasons"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     code: Mapped[str] = mapped_column(String(8), unique=True, index=True)
     description: Mapped[str] = mapped_column(String(255))
 
 
-SITUACAO_ATIVA = 2
+ACTIVE_STATUS = 2
 
 
 class Establishment(Base):
@@ -123,7 +123,7 @@ class Establishment(Base):
     __tablename__ = "establishments"
     __table_args__ = (
         # Parcial so onde o predicado esta SEMPRE no WHERE da query. `uf` e
-        # `main_cnae` ja foram parciais em `situacao_cadastral = 2` e isso
+        # `main_cnae` ja foram parciais em `registration_status = 2` e isso
         # quebrou a busca: o filtro de situacao e opcional na API, e sem ele no
         # WHERE o Postgres descarta o indice e cai em seq scan sobre 72M linhas
         # (ver DEFERRED_INDEXES em app/importer/pipeline.py).
@@ -133,7 +133,7 @@ class Establishment(Base):
         # indice so pra encurtar nao paga.
         Index("ix_establishments_uf_confidence", "uf", text("cellphone_confidence DESC"), text("cnpj DESC")),
         Index("ix_establishments_main_cnae", "main_cnae"),
-        Index("ix_establishments_situacao_cadastral", "situacao_cadastral"),
+        Index("ix_establishments_registration_status", "registration_status"),
         Index("ix_establishments_cep", "cep", postgresql_where=text("cep IS NOT NULL")),
         # `?name=` e ILIKE '%x%', que btree nenhum avalia -- so um GIN de
         # trigramas serve. Sem isso a busca por nome varre a tabela inteira.
@@ -154,8 +154,8 @@ class Establishment(Base):
     phone: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     cellphone: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     main_cnae: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    municipio_id: Mapped[int | None] = mapped_column(ForeignKey("municipios.id"), nullable=True)
-    # Liga o estabelecimento a `correios_cep` (base e-DNE dos Correios), de onde
+    municipality_id: Mapped[int | None] = mapped_column(ForeignKey("municipalities.id"), nullable=True)
+    # Liga o estabelecimento a `postal_codes` (base e-DNE dos Correios), de onde
     # saem logradouro/bairro/municipio/UF na leitura -- por isso essas colunas
     # nao sao duplicadas aqui. INTEGER (4 bytes) e nao os 8 digitos como texto.
     #
@@ -163,15 +163,15 @@ class Establishment(Base):
     # errada, extinto, endereco no exterior). Nesses casos o endereco bruto vai
     # inteiro pra coluna `address` -- ver _build_final_table. E justamente por
     # virar NULL nesses casos que a FOREIGN KEY abaixo e possivel.
-    cep: Mapped[int | None] = mapped_column(ForeignKey("correios_cep.cep"), nullable=True)
+    cep: Mapped[int | None] = mapped_column(ForeignKey("postal_codes.cep"), nullable=True)
     opened_at: Mapped[date | None] = mapped_column(Date, nullable=True)
     uf: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)  # ver app/regions.py
     company_size: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     # 1 nula, 2 ativa, 3 suspensa, 4 inapta, 8 baixada -- todas as empresas
-    # ficam aqui, nao so as ativas (ver SITUACAO_LABELS no router).
-    situacao_cadastral: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
-    natureza_juridica: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
-    motivo_situacao_cadastral: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    # ficam aqui, nao so as ativas (ver STATUS_LABELS no router).
+    registration_status: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    legal_nature: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    registration_status_reason: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     cellphone_confidence: Mapped[int] = mapped_column(SmallInteger, default=0)
     is_headquarters: Mapped[bool] = mapped_column(Boolean, default=False)
     is_mei: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -181,11 +181,11 @@ class Establishment(Base):
     company_name: Mapped[str] = mapped_column(Text)
     trade_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     email: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # Especificos do estabelecimento, nao existem em `correios_cep`.
+    # Especificos do estabelecimento, nao existem em `postal_codes`.
     address_number: Mapped[str | None] = mapped_column(Text, nullable=True)
     address_complement: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Preenchidos SO quando o CEP existe mas nao resolve o logradouro: CEP de
-    # localidade (cidade pequena com um CEP so) nao tem rua em `correios_cep`,
+    # localidade (cidade pequena com um CEP so) nao tem rua em `postal_codes`,
     # e ai o dado da Receita e a unica fonte. Quando o CEP resolve, ficam NULL
     # e a leitura pega do join -- ver _build_final_table.
     street: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -197,7 +197,7 @@ class Establishment(Base):
     # bairro, cep como veio) pra nao perder o endereco de quem nao casou.
     address: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
-    municipio: Mapped[Municipio | None] = relationship()
+    municipality: Mapped[Municipality | None] = relationship()
 
 
 class EstablishmentCnae(Base):
@@ -209,7 +209,7 @@ class EstablishmentCnae(Base):
     conteudo dele agora vive aqui, uma linha por codigo, com `is_main`
     distinguindo o principal.
 
-    Motivo: o filtro `?cnae_codes=` era `main_cnae = X OR secondary_cnaes && [X]`,
+    RegistrationStatusReason: o filtro `?cnae_codes=` era `main_cnae = X OR secondary_cnaes && [X]`,
     um OR entre um btree e um GIN que nao produz saida ordenada por `cnpj`.
     Com `ORDER BY cnpj LIMIT n` o planner ou ordenava o conjunto filtrado
     inteiro, ou (o que ele escolhia) varria a PK linha a linha filtrando --
@@ -245,7 +245,7 @@ class EstablishmentCnae(Base):
         Index("ix_establishment_cnaes_cnae_uf_cnpj", "cnae", "uf", "cnpj"),
         # Mesma coisa, podado pra quem tem celular -- o default da API e
         # `only_with_cellphone=true`. Parcial e seguro aqui (ao contrario do
-        # que aconteceu com `situacao_cadastral = 2`, ver DEFERRED_INDEXES):
+        # que aconteceu com `registration_status = 2`, ver DEFERRED_INDEXES):
         # quando o cliente manda `only_with_cellphone=false` o predicado sai do
         # WHERE, o Postgres descarta este indice e usa o de cima, que cobre
         # todas as linhas.
@@ -287,7 +287,7 @@ class EstablishmentStats(Base):
     vez de `count()` sobre 72M linhas. Reduz de ~72M pra ~1-3M linhas.
 
     NAO cobre todo filtro do endpoint: `name` (ILIKE), `opened_at`,
-    `municipio_codes` e CNAE secundario ficam de fora -- os tres primeiros por
+    `municipality_codes` e CNAE secundario ficam de fora -- os tres primeiros por
     cardinalidade, o ultimo porque uma empresa tem varios CNAEs e desnormalizar
     contaria ela mais de uma vez (e o que `EstablishmentCnaeStats` resolve, pra
     um codigo por consulta). Pedido que use qualquer um deles cai na tabela
@@ -307,7 +307,7 @@ class EstablishmentStats(Base):
     # Dimensoes -- mesmos codigos numericos de `establishments`, todas
     # nullable pelos mesmos motivos que la.
     uf: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
-    situacao_cadastral: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    registration_status: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     company_size: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     main_cnae: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_mei: Mapped[bool] = mapped_column(Boolean)
@@ -355,7 +355,7 @@ class EstablishmentCnaeStats(Base):
 
     cnae: Mapped[int] = mapped_column(Integer)
     uf: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
-    situacao_cadastral: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    registration_status: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     company_size: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     is_mei: Mapped[bool] = mapped_column(Boolean)
     is_simples: Mapped[bool] = mapped_column(Boolean)
@@ -368,29 +368,29 @@ class EstablishmentCnaeStats(Base):
     with_cellphone_and_email: Mapped[int] = mapped_column(BigInteger)
 
 
-class EmpresaStaging(Base):
+class CompanyStaging(Base):
     """CNPJ basico alfanumerico a partir de 2026 (Receita), guardado em base 36
     -- ver app/cnpj.py."""
 
-    __tablename__ = "empresas_staging"
+    __tablename__ = "companies_staging"
     __table_args__ = _staging()
 
-    cnpj_basico: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
-    porte_empresa: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
-    natureza_juridica: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
-    razao_social: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cnpj_root: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    company_size: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    legal_nature: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    company_name: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class SimplesStaging(Base):
     __tablename__ = "simples_staging"
     __table_args__ = _staging()
 
-    cnpj_basico: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
-    opcao_simples: Mapped[bool] = mapped_column(Boolean, default=False)
-    opcao_mei: Mapped[bool] = mapped_column(Boolean, default=False)
+    cnpj_root: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    simples_option: Mapped[bool] = mapped_column(Boolean, default=False)
+    mei_option: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
-class EstabelecimentoStaging(Base):
+class EstablishmentStaging(Base):
     """Espelho do arquivo de Estabelecimentos, ja nos tipos finais -- a
     conversao (base 36, int, telefone parseado) acontece no COPY, entao o build
     da tabela final e um INSERT ... SELECT sem nenhum CAST.
@@ -400,84 +400,84 @@ class EstabelecimentoStaging(Base):
     um dos ~63M UPSERTs que populam a tabela.
     """
 
-    __tablename__ = "estabelecimentos_staging"
+    __tablename__ = "establishments_staging"
     __table_args__ = _staging()
 
     # Corpo do CNPJ (raiz + ordem) em base 36. O DV do CSV nao e guardado: e
     # derivado do corpo, e o import so o usa pra conferir a fonte.
-    # Sem `cnpj_basico`: ele e o proprio cnpj sem as 4 ultimas posicoes, o que
+    # Sem `cnpj_root`: ele e o proprio cnpj sem as 4 ultimas posicoes, o que
     # em base 36 e uma divisao inteira por 36^4. Guardar 8 bytes por linha pra
     # repetir o que ja esta no cnpj custaria ~500MB nas ~63M linhas; o JOIN do
-    # build calcula na hora (ver ORDEM_SPAN em app/cnpj.py).
+    # build calcula na hora (ver BRANCH_SPAN em app/cnpj.py).
     cnpj: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     phone: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     cellphone: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    cnae_fiscal_principal: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    municipio_codigo: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    main_cnae: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    municipality_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cep: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    data_inicio_atividade: Mapped[date | None] = mapped_column(Date, nullable=True)
+    activity_start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     uf: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
-    situacao_cadastral: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
-    motivo_situacao_cadastral: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    registration_status: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    registration_status_reason: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     cellphone_confidence: Mapped[int] = mapped_column(SmallInteger, default=0)
     is_headquarters: Mapped[bool] = mapped_column(Boolean, default=False)
-    cnae_fiscal_secundaria: Mapped[list[int] | None] = mapped_column(ARRAY(Integer), nullable=True)
-    nome_fantasia: Mapped[str | None] = mapped_column(Text, nullable=True)
-    correio_eletronico: Mapped[str | None] = mapped_column(Text, nullable=True)
+    secondary_cnaes: Mapped[list[int] | None] = mapped_column(ARRAY(Integer), nullable=True)
+    trade_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    email: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Logradouro/bairro entram aqui crus e podem virar NULL no build, se o CEP
-    # ja resolver o endereco em `correios_cep`.
-    logradouro: Mapped[str | None] = mapped_column(Text, nullable=True)
-    numero: Mapped[str | None] = mapped_column(Text, nullable=True)
-    complemento: Mapped[str | None] = mapped_column(Text, nullable=True)
-    bairro: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ja resolver o endereco em `postal_codes`.
+    street: Mapped[str | None] = mapped_column(Text, nullable=True)
+    number: Mapped[str | None] = mapped_column(Text, nullable=True)
+    complement: Mapped[str | None] = mapped_column(Text, nullable=True)
+    district: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
-class Socio(Base):
+class Partner(Base):
     """Quadro societario -- um socio (PF/PJ/estrangeiro) por linha, uma
-    empresa (cnpj_basico) pode ter varias. Tabela final direta (sem staging
-    + swap): cada Socios<N>.zip cobre uma faixa disjunta de cnpj_basico
+    empresa (cnpj_root) pode ter varias. Tabela final direta (sem staging
+    + swap): cada Socios<N>.zip cobre uma faixa disjunta de cnpj_root
     (mesmo particionamento de Empresas/Estabelecimentos), entao nao tem o
     que fazer merge entre arquivos -- so carregar. Zerada no inicio do
-    grupo "socios" a cada import completo (ver run_import), pra nao
+    grupo "partners" a cada import completo (ver run_import), pra nao
     acumular duplicado mes a mes.
 
     ~24M linhas, entao vale a mesma compactacao da tabela de estabelecimentos.
     """
 
-    __tablename__ = "socios"
+    __tablename__ = "partners"
     __table_args__ = (
-        Index("ix_socios_cnpj_basico", "cnpj_basico"),
-        Index("ix_socios_cpf_cnpj_socio", "cpf_cnpj_socio", postgresql_where=text("cpf_cnpj_socio IS NOT NULL")),
-        # `?nome=` e ILIKE '%x%' -- ver o comentario em Establishment.
-        Index("ix_socios_nome_socio_trgm", "nome_socio",
-              postgresql_using="gin", postgresql_ops={"nome_socio": "gin_trgm_ops"}),
+        Index("ix_partners_cnpj_root", "cnpj_root"),
+        Index("ix_partners_partner_tax_id", "partner_tax_id", postgresql_where=text("partner_tax_id IS NOT NULL")),
+        # `?name=` e ILIKE '%x%' -- ver o comentario em Establishment.
+        Index("ix_partners_partner_name_trgm", "partner_name",
+              postgresql_using="gin", postgresql_ops={"partner_name": "gin_trgm_ops"}),
     )
 
     # Integer e nao BigInteger: sao ~24M linhas, e o TRUNCATE do inicio do
     # grupo reinicia a sequence (RESTART IDENTITY), entao o contador nao
     # acumula import a import ate estourar os 2,1 bilhoes.
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    cnpj_basico: Mapped[int] = mapped_column(BigInteger)
+    cnpj_root: Mapped[int] = mapped_column(BigInteger)
     # PF: a Receita ja entrega o CPF mascarado (LGPD, "***123456**") -- so os 6
     # digitos do meio variam, e e isso que fica guardado aqui. PJ/estrangeiro:
-    # o CNPJ completo em base 36. `identificador_socio` diz qual dos dois e.
-    cpf_cnpj_socio: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    representante_legal: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    data_entrada_sociedade: Mapped[date | None] = mapped_column(Date, nullable=True)
-    identificador_socio: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)  # 1=PJ 2=PF 3=Estrangeiro
-    qualificacao_socio: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
-    qualificacao_representante_legal: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
-    pais: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
-    faixa_etaria: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
-    nome_socio: Mapped[str] = mapped_column(Text)
-    nome_representante: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # o CNPJ completo em base 36. `partner_type` diz qual dos dois e.
+    partner_tax_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    legal_rep: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    partnership_start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    partner_type: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)  # 1=PJ 2=PF 3=Estrangeiro
+    partner_qualification: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    legal_rep_qualification: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    country: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    age_range: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    partner_name: Mapped[str] = mapped_column(Text)
+    legal_rep_name: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
-class Cep(Base):
+class PostalCode(Base):
     """Tudo que sabemos sobre um CEP: o endereco (base e-DNE dos Correios) e a
     coordenada (extrato do OSM em massa, ou BrasilAPI sob demanda).
 
-    Eram duas tabelas, `correios_cep` e `cep_coordenadas`, com a mesma chave.
+    Eram duas tabelas, `postal_codes` e `cep_coordenadas`, com a mesma chave.
     Ficaram separadas enquanto o edne-correios-loader era dono do esquema e
     reconstruia a tabela a cada import, o que teria destruido uma coluna de
     coordenada colada nela. Hoje a lib so popula uma tabela de scratch e o
@@ -493,12 +493,12 @@ class Cep(Base):
     apagado: o import de CEP e upsert, nao substituicao.
     """
 
-    __tablename__ = "correios_cep"
+    __tablename__ = "postal_codes"
     __table_args__ = tuple(
-        # Os tres filtros de texto de /enderecos/buscar sao ILIKE '%x%'.
-        Index(f"ix_correios_cep_{col}_trgm", col,
+        # Os tres filtros de texto de /addresses/search sao ILIKE '%x%'.
+        Index(f"ix_postal_codes_{col}_trgm", col,
               postgresql_using="gin", postgresql_ops={col: "gin_trgm_ops"})
-        for col in ("logradouro", "bairro", "municipio")
+        for col in ("street", "district", "municipality")
     )
 
     cep: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
@@ -506,7 +506,7 @@ class Cep(Base):
     # (municipio historico/fundido/extinto) -- mesmo tratamento de CEP orfao
     # ja usado em establishments.cep: guardar um codigo que nao bate com nada
     # nao serviria pra nada e impediria a FK. Ver app.ceps.upsert_from.
-    municipio_cod_ibge: Mapped[int | None] = mapped_column(ForeignKey("municipios.ibge_code"), nullable=True)
+    municipality_ibge_code: Mapped[int | None] = mapped_column(ForeignKey("municipalities.ibge_code"), nullable=True)
     latitude: Mapped[float | None] = mapped_column(Numeric(10, 7), nullable=True)
     longitude: Mapped[float | None] = mapped_column(Numeric(10, 7), nullable=True)
     coord_updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -517,23 +517,28 @@ class Cep(Base):
     # import com StringDataRightTruncation). Sem custo em Postgres: TEXT e
     # VARCHAR(n) tem a mesma representacao em disco, e e o mesmo padrao ja
     # usado em Establishment.company_name/trade_name/email.
-    logradouro: Mapped[str | None] = mapped_column(Text, nullable=True)
-    complemento: Mapped[str | None] = mapped_column(Text, nullable=True)
-    bairro: Mapped[str | None] = mapped_column(Text, nullable=True)
-    municipio: Mapped[str | None] = mapped_column(Text, nullable=True)
-    nome: Mapped[str | None] = mapped_column(Text, nullable=True)
+    street: Mapped[str | None] = mapped_column(Text, nullable=True)
+    complement: Mapped[str | None] = mapped_column(Text, nullable=True)
+    district: Mapped[str | None] = mapped_column(Text, nullable=True)
+    municipality: Mapped[str | None] = mapped_column(Text, nullable=True)
+    name: Mapped[str | None] = mapped_column(Text, nullable=True)
     # De onde veio a coordenada: 'osm_extract', 'brasilapi', ou
     # 'brasilapi_sem_coordenada' pra marcar "ja perguntei e nao tem" e nao
     # bater na API de novo pelo mesmo CEP. NULL = nunca foi buscada.
     coord_source: Mapped[str | None] = mapped_column(String(30), nullable=True)
 
 
-class ImportLog(Base):
+class ImportFile(Base):
     """Marca "arquivo X do periodo Y ja foi baixado e carregado com
-    sucesso" -- usado pra retomar de onde parou em vez de refazer tudo."""
+    sucesso" -- usado pra retomar de onde parou em vez de refazer tudo.
 
-    __tablename__ = "import_log"
-    __table_args__ = (UniqueConstraint("period", "filename", name="uq_import_log_period_filename"),)
+    Fica separada de `ImportRun` porque o grao e outro: uma linha por ARQUIVO
+    por periodo (dezenas por import, apagadas no fim de cada periodo), nao o
+    estado unico da execucao.
+    """
+
+    __tablename__ = "import_files"
+    __table_args__ = (UniqueConstraint("period", "filename", name="uq_import_files_period_filename"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     period: Mapped[str] = mapped_column(String(10))
@@ -542,18 +547,19 @@ class ImportLog(Base):
     imported_at: Mapped[datetime] = mapped_column(DateTime)
 
 
-class ImportProgress(Base):
-    """Uma linha por estagio do pipeline (download/extract/import/build) --
-    exposta via GET /import/status pra monitoramento externo.
+class ImportStep(Base):
+    """Uma linha por estagio do pipeline de CNPJ (download/extract/import/
+    build) -- exposta via GET /import/status pra monitoramento externo.
 
     Uma linha por estagio, e nao uma linha global, porque os estagios rodam em
     paralelo (ver app/importer/pipeline.py): num dado instante ha tres arquivos
     diferentes em tres estagios diferentes, e um `current_file` escalar so nao
     representa isso. Cada thread escreve so a sua linha, o que tambem evita
-    contencao entre elas.
+    contencao entre elas -- e e por isso que esta tabela NAO foi fundida em
+    `ImportRun`, que e uma linha unica escrita pela thread principal.
     """
 
-    __tablename__ = "import_progress"
+    __tablename__ = "import_steps"
 
     step: Mapped[str] = mapped_column(String(20), primary_key=True)  # download|extract|import|build
     period: Mapped[str | None] = mapped_column(String(10), nullable=True)
@@ -571,47 +577,51 @@ class ImportProgress(Base):
 
 
 class ImportRun(Base):
-    """Estado global de uma execucao do import -- o que antes era o
-    `status`/`period` da linha unica de import_progress. Uma linha so (id=1),
-    escrita pela thread principal; os estagios ficam em ImportProgress."""
+    """Estado da execucao do import, numa linha so (id=1).
 
-    __tablename__ = "import_run"
+    Funde o que eram `import_run` (estado global do pipeline de CNPJ) e
+    `import_runs` (as 6 fases do comando `import-all`). Eram duas tabelas
+    de UMA linha cada, escritas pela mesma thread principal, descrevendo a
+    mesma execucao -- e a coluna `cnpj` daqui e exatamente o que
+    `import_run.status` guardava: o status da fase de CNPJ. Manter as duas
+    custava um JOIN (ou duas leituras) pra responder "como vai o import" sem
+    ganhar isolamento nenhum.
+
+    `status` e o geral (do `import-all`); as seis colunas de fase levam
+    pending|running|success|failed|skipped, na ordem em que `import-all` as
+    executa. A fase `cnpj` tem colunas `cnpj_*` proprias porque e a unica com
+    um sub-pipeline atras dela (periodo, mensagem e relogio proprios, alem dos
+    estagios em `ImportStep`).
+
+    Existe pra `import-all` retomar de onde parou se for cancelado no meio:
+    uma nova chamada pula toda fase ja 'success' -- MAS so enquanto a
+    tentativa anterior nao tiver terminado com sucesso. Se `status` (o geral)
+    for 'success', a proxima chamada e um refresh periodico de verdade (mes
+    que vem, novo periodo de CNPJ, e-DNE atualizado) e reprocessa as 6 fases
+    do zero -- ver app.cli.import_all, que decide isso comparando o status
+    geral antes de começar.
+    """
+
+    __tablename__ = "import_runs"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    period: Mapped[str | None] = mapped_column(String(10), nullable=True)
+
+    # --- geral (import-all) ---
     status: Mapped[str] = mapped_column(String(20), default="idle")  # idle|running|success|failed
     message: Mapped[str | None] = mapped_column(String(255), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime)
 
-
-class ImportAllRun(Base):
-    """Estado do comando `import-all` em si -- as 6 fases que ele encadeia
-    (municipios, CEPs, coordenadas OSM, CNPJ, IBGE, centroide de municipio),
-    nao o pipeline do CNPJ (que ja tem o proprio ImportRun/ImportProgress).
-    Uma linha so (id=1).
-
-    Existe pra `import-all` retomar de onde parou se for cancelado no meio:
-    cada fase tem seu proprio status, e uma nova chamada pula toda fase ja
-    'success' -- MAS so enquanto a tentativa anterior nao tiver terminado com
-    sucesso. Se `status` (o geral) for 'success', a proxima chamada e um
-    refresh periodico de verdade (mes que vem, novo periodo de CNPJ, e-DNE
-    atualizado) e reprocessa as 6 fases do zero -- ver app.cli.import_all,
-    que decide isso comparando o status geral antes de começar.
-    """
-
-    __tablename__ = "import_all_run"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    status: Mapped[str] = mapped_column(String(20), default="idle")  # idle|running|success|failed
-    # pending|running|success|failed|skipped, uma coluna por fase (na ordem
-    # em que import_all as executa).
-    municipios: Mapped[str] = mapped_column(String(20), default="pending")
+    # --- uma coluna por fase, na ordem de execucao ---
+    municipalities: Mapped[str] = mapped_column(String(20), default="pending")
     ceps: Mapped[str] = mapped_column(String(20), default="pending")
     ceps_osm: Mapped[str] = mapped_column(String(20), default="pending")
     cnpj: Mapped[str] = mapped_column(String(20), default="pending")
     ibge: Mapped[str] = mapped_column(String(20), default="pending")
-    municipios_geo: Mapped[str] = mapped_column(String(20), default="pending")
-    message: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime)
+    municipalities_geo: Mapped[str] = mapped_column(String(20), default="pending")
+
+    # --- detalhe da fase de CNPJ (o ex-`import_run`) ---
+    cnpj_period: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    cnpj_message: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    cnpj_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    cnpj_updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

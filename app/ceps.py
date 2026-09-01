@@ -1,6 +1,6 @@
 """Import e leitura da base unificada de CEP dos Correios (e-DNE).
 
-A tabela `correios_cep` e um model nosso (ver app/models.py). O esquema veio do
+A tabela `postal_codes` e um model nosso (ver app/models.py). O esquema veio do
 edne-correios-loader, mas quem cria e popula somos nos: o `import-ceps` manda a
 lib montar a base nova numa tabela de scratch e daqui sai um UPSERT. A lib
 nunca toca na tabela real -- e isso que permite `establishments.cep` ter uma
@@ -13,11 +13,11 @@ zero a esquerda acontece na leitura -- ver `SELECT_COLUMNS`.
 from sqlalchemy import String, Text, text
 from sqlalchemy.orm import Session
 
-TABLE = "correios_cep"
+TABLE = "postal_codes"
 
 # Tabela onde o edne-correios-loader monta a base nova. Ele a cria com o
 # esquema dele (cep como VARCHAR(8)), e o cast pra INTEGER acontece no upsert.
-SCRATCH_TABLE = "correios_cep_import"
+SCRATCH_TABLE = "postal_codes_import"
 
 # So as colunas de endereco (e-DNE). As de coordenada (latitude/longitude/
 # coord_source/coord_updated_at) vivem na mesma tabela desde a fusao com
@@ -26,14 +26,30 @@ SCRATCH_TABLE = "correios_cep_import"
 # faz a coordenada sobreviver a um `import-ceps`.
 COLUMNS = (
     "cep",
-    "logradouro",
-    "complemento",
-    "bairro",
-    "municipio",
-    "municipio_cod_ibge",
+    "street",
+    "complement",
+    "district",
+    "municipality",
+    "municipality_ibge_code",
     "uf",
-    "nome",
+    "name",
 )
+
+# O MESMO conteudo, com o nome que a coluna tem na tabela de scratch: o esquema
+# dela e do edne-correios-loader, e o da lib esta em portugues. Nossas colunas
+# foram traduzidas; as dela nao podem ser -- e ela quem cria essa tabela.
+# Sem esta traducao, o SELECT do upsert pediria `s.street` numa tabela que so
+# tem `s.logradouro`.
+SOURCE_COLUMNS = {
+    "cep": "cep",
+    "street": "logradouro",
+    "complement": "complemento",
+    "district": "bairro",
+    "municipality": "municipio",
+    "municipality_ibge_code": "municipio_cod_ibge",
+    "uf": "uf",
+    "name": "nome",
+}
 
 CEP_WIDTH = 8
 
@@ -62,7 +78,7 @@ def reset_source_tables(db: Session, metadata) -> None:
 
     Drop explicito antes de cada run resolve isso de vez: `create_all` sempre
     cria do zero, com o metadata (ja alargado) que valer naquele momento.
-    Seguro porque nenhuma tabela aqui e `correios_cep` -- a real fica de fora
+    Seguro porque nenhuma tabela aqui e `postal_codes` -- a real fica de fora
     do metadata da lib, so a de scratch (renomeada via `table_names`) entra.
     """
     for table in reversed(metadata.sorted_tables):
@@ -77,9 +93,10 @@ def widen_free_text_columns(metadata) -> None:
     edne-correios-loader declara pro schema dele -- visto na pratica:
     `log_bairro.bai_no_abrev` e VARCHAR(36) e um bairro real tem abreviacao
     maior, `StringDataRightTruncation` no INSERT. E nao e so essa coluna: a
-    `logradouro` da tabela unificada e montada concatenando `tlo_tx` (36) +
-    `log_no` (100) numa coluna que so tem 100 de largura -- o mesmo estouro
-    pode acontecer ali tambem, so que mais raro (por isso nao apareceu antes).
+    `logradouro` da tabela unificada da lib e montada concatenando `tlo_tx`
+    (36) + `log_no` (100) numa coluna que so tem 100 de largura -- o mesmo
+    estouro pode acontecer ali tambem, so que mais raro (por isso nao apareceu
+    antes).
 
     Chamado sobre `DneLoader.metadata` ANTES de `.load()`: como as tabelas
     (inclusive a de scratch que vira `cep_unificado`) sao criadas dentro do
@@ -123,7 +140,7 @@ def select_columns(prefix: str = "") -> str:
 
 
 def upsert_from(db: Session, source_table: str) -> tuple[int, int, int]:
-    """Mescla `source_table` em `correios_cep`. Devolve (novos, atualizados, stale).
+    """Mescla `source_table` em `postal_codes`. Devolve (novos, atualizados, stale).
 
     UPSERT e nao DELETE + INSERT: nada some debaixo de quem referencia a tabela
     (a FK de establishments.cep depende disso), e a base nunca fica vazia no
@@ -133,21 +150,24 @@ def upsert_from(db: Session, source_table: str) -> tuple[int, int, int]:
     cols = ", ".join(COLUMNS)
     updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in COLUMNS if c != "cep")
     # A scratch vem da lib com `cep` VARCHAR -- cast aqui, filtrando a 8 digitos
-    # pro cast nunca estourar numa linha estranha. `municipio_cod_ibge` vira
-    # NULL quando nao bate com nenhum `municipios.ibge_code` (municipio
+    # pro cast nunca estourar numa linha estranha. `municipality_ibge_code` vira
+    # NULL quando nao bate com nenhum `municipalities.ibge_code` (municipio
     # extinto/fundido, fora da lista atual do IBGE) -- mesmo tratamento que
     # `establishments.cep` ja da a CEP orfao, e pelo mesmo motivo: um codigo
     # que nao resolve nada so serviria pra travar a FOREIGN KEY do upsert
     # inteiro.
+    # `AS {c}`: o INSERT lista as colunas na ordem de COLUMNS, entao o alias so
+    # documenta qual coluna nossa cada campo da lib alimenta.
     select_cols = ", ".join(
-        "s.cep::integer" if c == "cep"
-        else "CASE WHEN mu.ibge_code IS NOT NULL THEN s.municipio_cod_ibge END" if c == "municipio_cod_ibge"
-        else f"s.{c}"
+        "s.cep::integer AS cep" if c == "cep"
+        else f"CASE WHEN mu.ibge_code IS NOT NULL THEN s.{SOURCE_COLUMNS[c]} END AS {c}"
+        if c == "municipality_ibge_code"
+        else f"s.{SOURCE_COLUMNS[c]} AS {c}"
         for c in COLUMNS
     )
     incoming = (
         f"SELECT {select_cols} FROM {source_table} s "
-        f"LEFT JOIN municipios mu ON mu.ibge_code = s.municipio_cod_ibge "
+        f"LEFT JOIN municipalities mu ON mu.ibge_code = s.{SOURCE_COLUMNS['municipality_ibge_code']} "
         f"WHERE s.cep ~ '^[0-9]{{8}}$'"
     )
 
@@ -168,12 +188,12 @@ def upsert_from(db: Session, source_table: str) -> tuple[int, int, int]:
     # que permite referenciar a tabela sem levar a linha embaixo do pe -- mas
     # conta-los evita acumular CEP morto sem ninguem perceber.
     #
-    # `municipio IS NOT NULL` filtra as linhas que so tem coordenada (vindas do
+    # `municipality IS NOT NULL` filtra as linhas que so tem coordenada (vindas do
     # `import-ceps-osm`): elas nunca estiveram no e-DNE, entao nao "sumiram"
     # dele -- conta-las como stale seria alarme falso.
     stale = db.execute(text(f"""
         SELECT count(*) FROM {TABLE} c
-        WHERE c.municipio IS NOT NULL
+        WHERE c.municipality IS NOT NULL
           AND NOT EXISTS (SELECT 1 FROM ({incoming}) AS src WHERE src.cep = c.cep)
     """)).scalar() or 0
 

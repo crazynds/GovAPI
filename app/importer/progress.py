@@ -140,7 +140,7 @@ class ProgressDisplay:
         # Sempre ligada a este display -- inclusive quando ele está desligado,
         # e aí `set()` descarta e a barra fica silenciosa. Sem TTY uma barra é
         # só ruído: cada render viraria uma linha nova no log do container, e o
-        # `logger` já reporta arquivo a arquivo (e `import_progress`, 1x/s).
+        # `logger` já reporta arquivo a arquivo (e `import_steps`, 1x/s).
         return ProgressBar(label, total=total, unit=unit, display=self, slot=slot)
 
     def set(self, slot: int, line: str) -> None:

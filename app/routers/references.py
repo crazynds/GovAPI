@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.models import Motivo, NaturezaJuridica, Pais, Qualificacao
+from app.models import Country, LegalNature, Qualification, RegistrationStatusReason
 from app.schemas import CodeDescriptionOut
 
 router = APIRouter()
@@ -30,7 +30,7 @@ def _search_router(prefix: str, model, tag_name: str) -> APIRouter:
     return sub
 
 
-router.include_router(_search_router("/naturezas-juridicas", NaturezaJuridica, "Natureza jurídica"))
-router.include_router(_search_router("/qualificacoes-societarias", Qualificacao, "Qualificação"))
-router.include_router(_search_router("/paises", Pais, "País"))
-router.include_router(_search_router("/motivos-situacao-cadastral", Motivo, "Motivo"))
+router.include_router(_search_router("/legal-natures", LegalNature, "Legal nature"))
+router.include_router(_search_router("/qualifications", Qualification, "Qualification"))
+router.include_router(_search_router("/countries", Country, "Country"))
+router.include_router(_search_router("/registration-status-reasons", RegistrationStatusReason, "Registration status reason"))

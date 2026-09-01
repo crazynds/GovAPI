@@ -23,11 +23,11 @@ from app.models import (
     EstablishmentCnae,
     EstablishmentCnaeStats as C,
     EstablishmentStats as S,
-    Motivo,
-    Municipio,
-    NaturezaJuridica,
+    RegistrationStatusReason,
+    Municipality,
+    LegalNature,
 )
-from app.regions import UF_TO_REGIAO, uf_code, uf_name, ufs_for_regiao
+from app.regions import UF_TO_REGION, uf_code, uf_name, ufs_for_region
 from app.pagination import SortKey, make_fingerprint, paginate
 from app.schemas import AddressOut, EstablishmentOut, EstablishmentPage, EstablishmentStatsOut
 
@@ -38,21 +38,21 @@ router = APIRouter(prefix="/establishments", tags=["establishments"])
 # devolvendo/aceitando a forma "00"/"01"/... de dois digitos.
 COMPANY_SIZE_LABELS = {
     0: "Não informado",
-    1: "Micro empresa",
+    1: "Micro company",
     3: "Empresa de pequeno porte",
     5: "Demais (médio/grande porte)",
 }
 
 # Codigos oficiais de situacao cadastral (Receita) -- ver layout do arquivo
 # Estabelecimentos. Aceito tanto o codigo quanto o label como filtro.
-SITUACAO_LABELS = {
+STATUS_LABELS = {
     1: "nula",
     2: "ativa",
     3: "suspensa",
     4: "inapta",
     8: "baixada",
 }
-SITUACAO_CODES_BY_LABEL = {label: code for code, label in SITUACAO_LABELS.items()}
+STATUS_CODES_BY_LABEL = {label: code for code, label in STATUS_LABELS.items()}
 
 
 def _code(value: int | None, width: int = 2) -> str | None:
@@ -60,13 +60,13 @@ def _code(value: int | None, width: int = 2) -> str | None:
     return f"{value:0{width}d}" if value is not None else None
 
 
-def _resolve_situacao_codes(values: list[str]) -> list[int]:
+def _resolve_status_codes(values: list[str]) -> list[int]:
     """Aceita label ("ativa") ou codigo ("02"/"2"), devolve o inteiro do banco."""
     codes = []
     for raw in values:
         value = raw.strip().lower()
-        if value in SITUACAO_CODES_BY_LABEL:
-            codes.append(SITUACAO_CODES_BY_LABEL[value])
+        if value in STATUS_CODES_BY_LABEL:
+            codes.append(STATUS_CODES_BY_LABEL[value])
         elif value.isdigit():
             codes.append(int(value))
         else:
@@ -89,7 +89,7 @@ def _cnae_codes_to_int(values: list[str]) -> list[int]:
 # publica). Precisamos dela pra reconstruir a string a partir do inteiro
 # guardado em establishments e casar no indice, em vez de castar a coluna (o
 # que descartaria o indice).
-CODE_WIDTHS = {"cnae": 7, "natureza": 4, "motivo": 2}
+CODE_WIDTHS = {"cnae": 7, "legal_nature": 4, "reason": 2}
 
 
 def _ceps_from_correios(db: Session, wanted: set[int]) -> dict[int, dict]:
@@ -100,8 +100,8 @@ def _ceps_from_correios(db: Session, wanted: set[int]) -> dict[int, dict]:
 
     rows = db.execute(
         text(
-            "SELECT cep, logradouro, bairro, municipio, uf "
-            "FROM correios_cep WHERE cep = ANY(:ceps)"
+            "SELECT cep, street, district, municipality, uf "
+            "FROM postal_codes WHERE cep = ANY(:ceps)"
         ),
         {"ceps": list(wanted)},
     ).mappings().all()
@@ -122,11 +122,11 @@ def _address(e: Establishment, correios: dict[int, dict]) -> AddressOut:
         raw = e.address
         return AddressOut(
             cep=raw.get("cep"),
-            street=raw.get("logradouro"),
-            number=raw.get("numero"),
-            complement=raw.get("complemento"),
-            district=raw.get("bairro"),
-            municipio=e.municipio.name if e.municipio else None,
+            street=raw.get("street"),
+            number=raw.get("number"),
+            complement=raw.get("complement"),
+            district=raw.get("district"),
+            municipality=e.municipality.name if e.municipality else None,
             uf=uf_name(e.uf),
             source="receita",
         )
@@ -136,11 +136,11 @@ def _address(e: Establishment, correios: dict[int, dict]) -> AddressOut:
         cep=ceps_codec.to_str(e.cep),
         # street/district só estão gravados quando o CEP não os resolve (CEP de
         # localidade); nos outros casos vêm do join, sem duplicar em ~63M linhas.
-        street=e.street or (cep_row or {}).get("logradouro"),
+        street=e.street or (cep_row or {}).get("street"),
         number=e.address_number,
         complement=e.address_complement,
-        district=e.district or (cep_row or {}).get("bairro"),
-        municipio=(cep_row or {}).get("municipio") or (e.municipio.name if e.municipio else None),
+        district=e.district or (cep_row or {}).get("district"),
+        municipality=(cep_row or {}).get("municipality") or (e.municipality.name if e.municipality else None),
         uf=(cep_row or {}).get("uf") or uf_name(e.uf),
         source="correios" if cep_row and not e.street else ("receita" if e.street or e.district else None),
     )
@@ -186,13 +186,13 @@ def _serialize(
     e: Establishment,
     secondary: list[int] | None = None,
     cnae_map: dict[int, str] | None = None,
-    natureza_map: dict[int, str] | None = None,
-    motivo_map: dict[int, str] | None = None,
+    legal_nature_map: dict[int, str] | None = None,
+    reason_map: dict[int, str] | None = None,
     correios: dict[int, dict] | None = None,
 ) -> EstablishmentOut:
     cnae_map = cnae_map or {}
-    natureza_map = natureza_map or {}
-    motivo_map = motivo_map or {}
+    legal_nature_map = legal_nature_map or {}
+    reason_map = reason_map or {}
     secondary = secondary or []
     cnae_width = CODE_WIDTHS["cnae"]
 
@@ -207,23 +207,23 @@ def _serialize(
         is_simples=e.is_simples,
         company_size=_code(e.company_size),
         company_size_label=COMPANY_SIZE_LABELS.get(e.company_size),
-        natureza_juridica_code=_code(e.natureza_juridica, CODE_WIDTHS["natureza"]),
-        natureza_juridica_description=natureza_map.get(e.natureza_juridica),
+        legal_nature_code=_code(e.legal_nature, CODE_WIDTHS["legal_nature"]),
+        legal_nature_description=legal_nature_map.get(e.legal_nature),
         main_cnae_code=_code(e.main_cnae, cnae_width),
         main_cnae_description=cnae_map.get(e.main_cnae),
         secondary_cnae_codes=[f"{c:0{cnae_width}d}" for c in secondary],
         secondary_cnae_descriptions=[cnae_map[c] for c in secondary if c in cnae_map],
-        municipio_name=e.municipio.name if e.municipio else None,
+        municipality_name=e.municipality.name if e.municipality else None,
         uf=uf_name(e.uf),
         email=e.email,
         phone=_e164(e.phone),
         cellphone=_e164(e.cellphone),
         cellphone_confidence=e.cellphone_confidence,
         opened_at=e.opened_at,
-        situacao_cadastral=_code(e.situacao_cadastral),
-        situacao_cadastral_label=SITUACAO_LABELS.get(e.situacao_cadastral),
-        motivo_situacao_cadastral_code=_code(e.motivo_situacao_cadastral, CODE_WIDTHS["motivo"]),
-        motivo_situacao_cadastral_description=motivo_map.get(e.motivo_situacao_cadastral),
+        registration_status=_code(e.registration_status),
+        registration_status_label=STATUS_LABELS.get(e.registration_status),
+        registration_status_reason_code=_code(e.registration_status_reason, CODE_WIDTHS["reason"]),
+        registration_status_reason_description=reason_map.get(e.registration_status_reason),
         address=_address(e, correios or {}),
     )
 
@@ -237,23 +237,23 @@ def _serialize_many(db: Session, items: list[Establishment]) -> list[Establishme
     secondary = _secondary_cnaes(db, {e.cnpj for e in items})
 
     cnae_codes: set[int] = set()
-    natureza_codes: set[int] = set()
-    motivo_codes: set[int] = set()
+    legal_nature_codes: set[int] = set()
+    reason_codes: set[int] = set()
     for e in items:
         if e.main_cnae is not None:
             cnae_codes.add(e.main_cnae)
         cnae_codes.update(secondary.get(e.cnpj, ()))
-        if e.natureza_juridica is not None:
-            natureza_codes.add(e.natureza_juridica)
-        if e.motivo_situacao_cadastral is not None:
-            motivo_codes.add(e.motivo_situacao_cadastral)
+        if e.legal_nature is not None:
+            legal_nature_codes.add(e.legal_nature)
+        if e.registration_status_reason is not None:
+            reason_codes.add(e.registration_status_reason)
 
     cnae_map = _code_descriptions(db, Cnae, cnae_codes, CODE_WIDTHS["cnae"])
-    natureza_map = _code_descriptions(db, NaturezaJuridica, natureza_codes, CODE_WIDTHS["natureza"])
-    motivo_map = _code_descriptions(db, Motivo, motivo_codes, CODE_WIDTHS["motivo"])
+    legal_nature_map = _code_descriptions(db, LegalNature, legal_nature_codes, CODE_WIDTHS["legal_nature"])
+    reason_map = _code_descriptions(db, RegistrationStatusReason, reason_codes, CODE_WIDTHS["reason"])
     correios = _ceps_from_correios(db, {e.cep for e in items if e.cep})
     return [
-        _serialize(e, secondary.get(e.cnpj), cnae_map, natureza_map, motivo_map, correios)
+        _serialize(e, secondary.get(e.cnpj), cnae_map, legal_nature_map, reason_map, correios)
         for e in items
     ]
 
@@ -263,14 +263,14 @@ def _apply_filters(
     *,
     cnae_codes: list[str] | None,
     uf: list[str] | None,
-    regiao: str | None,
-    municipio_codes: list[str] | None,
+    region: str | None,
+    municipality_codes: list[str] | None,
     company_size: list[str] | None,
     is_mei: bool | None,
     is_simples: bool | None,
     is_headquarters: bool | None,
     name: str | None,
-    situacao: list[str] | None,
+    status: list[str] | None,
     only_with_cellphone: bool,
     only_with_email: bool,
     has_phone: bool | None,
@@ -280,11 +280,11 @@ def _apply_filters(
     # UF antes do CNAE porque o filtro de CNAE reaproveita os codigos: eles vao
     # empurrados pra DENTRO da subquery da tabela N:N (ver abaixo).
     ufs = set(uf or [])
-    if regiao:
-        regiao_ufs = ufs_for_regiao(regiao)
-        if not regiao_ufs:
-            raise HTTPException(422, f"Região desconhecida: {regiao!r} (use norte/nordeste/centro-oeste/sudeste/sul)")
-        ufs |= set(regiao_ufs)
+    if region:
+        region_ufs = ufs_for_region(region)
+        if not region_ufs:
+            raise HTTPException(422, f"Região desconhecida: {region!r} (use norte/nordeste/centro-oeste/sudeste/sul)")
+        ufs |= set(region_ufs)
     uf_codes: list[int] = []
     if ufs:
         uf_codes = [uf_code(u) for u in ufs]
@@ -320,11 +320,11 @@ def _apply_filters(
             matching = matching.where(EstablishmentCnae.has_cellphone)
         query = query.filter(Establishment.cnpj.in_(matching))
 
-    if municipio_codes:
-        codes = [int(c) for c in municipio_codes if str(c).strip().isdigit()]
+    if municipality_codes:
+        codes = [int(c) for c in municipality_codes if str(c).strip().isdigit()]
         if not codes:
-            raise HTTPException(422, f"Código de município inválido: {municipio_codes}")
-        query = query.filter(Establishment.municipio.has(Municipio.receita_code.in_(codes)))
+            raise HTTPException(422, f"Código de município inválido: {municipality_codes}")
+        query = query.filter(Establishment.municipality.has(Municipality.receita_code.in_(codes)))
 
     if company_size:
         sizes = [int(c) for c in company_size if str(c).strip().isdigit()]
@@ -347,8 +347,8 @@ def _apply_filters(
             or_(Establishment.company_name.ilike(pattern), Establishment.trade_name.ilike(pattern))
         )
 
-    if situacao:
-        query = query.filter(Establishment.situacao_cadastral.in_(_resolve_situacao_codes(situacao)))
+    if status:
+        query = query.filter(Establishment.registration_status.in_(_resolve_status_codes(status)))
 
     if only_with_cellphone:
         query = query.filter(Establishment.cellphone.isnot(None))
@@ -376,14 +376,14 @@ def search(
                     "ao menos um deles.",
     ),
     uf: list[str] | None = Query(None, description="Uma ou mais UFs, ex: ?uf=SP&uf=RJ"),
-    regiao: str | None = Query(None, description="norte/nordeste/centro-oeste/sudeste/sul, combina com uf"),
-    municipio_codes: list[str] | None = Query(None),
+    region: str | None = Query(None, description="norte/nordeste/centro-oeste/sudeste/sul, combina com uf"),
+    municipality_codes: list[str] | None = Query(None),
     company_size: list[str] | None = Query(None, description="Códigos de porte (00/01/03/05), aceita múltiplos"),
     is_mei: bool | None = Query(None),
     is_simples: bool | None = Query(None),
     is_headquarters: bool | None = Query(None),
-    name: str | None = Query(None, description="Busca por razão social ou nome fantasia"),
-    situacao: list[str] | None = Query(
+    name: str | None = Query(None, description="Busca por razão social ou name fantasia"),
+    status: list[str] | None = Query(
         None, description="Código (01/02/03/04/08) ou label (nula/ativa/suspensa/inapta/baixada); sem filtro, mostra todas"
     ),
     only_with_cellphone: bool = Query(True),
@@ -412,14 +412,14 @@ def search(
         db.query(Establishment),
         cnae_codes=cnae_codes,
         uf=uf,
-        regiao=regiao,
-        municipio_codes=municipio_codes,
+        region=region,
+        municipality_codes=municipality_codes,
         company_size=company_size,
         is_mei=is_mei,
         is_simples=is_simples,
         is_headquarters=is_headquarters,
         name=name,
-        situacao=situacao,
+        status=status,
         only_with_cellphone=only_with_cellphone,
         only_with_email=only_with_email,
         has_phone=has_phone,
@@ -440,10 +440,10 @@ def search(
     items, next_cursor = paginate(
         query, keys, cursor, limit,
         make_fingerprint(
-            cnae_codes=cnae_codes, uf=uf, regiao=regiao,
-            municipio_codes=municipio_codes, company_size=company_size, is_mei=is_mei,
+            cnae_codes=cnae_codes, uf=uf, region=region,
+            municipality_codes=municipality_codes, company_size=company_size, is_mei=is_mei,
             is_simples=is_simples, is_headquarters=is_headquarters, name=name,
-            situacao=situacao, only_with_cellphone=only_with_cellphone,
+            status=status, only_with_cellphone=only_with_cellphone,
             only_with_email=only_with_email, has_phone=has_phone,
             opened_after=opened_after, opened_before=opened_before,
         ),
@@ -501,7 +501,7 @@ def _rollup_query(
     *,
     uf_codes: list[int],
     company_size: list[str] | None,
-    situacao: list[str] | None,
+    status: list[str] | None,
     is_mei: bool | None,
     is_simples: bool | None,
     is_headquarters: bool | None,
@@ -519,8 +519,8 @@ def _rollup_query(
         query = query.filter(S.uf.in_(uf_codes))
     if company_size:
         query = query.filter(S.company_size.in_([int(c) for c in company_size if str(c).strip().isdigit()]))
-    if situacao:
-        query = query.filter(S.situacao_cadastral.in_(_resolve_situacao_codes(situacao)))
+    if status:
+        query = query.filter(S.registration_status.in_(_resolve_status_codes(status)))
     if is_mei is not None:
         query = query.filter(S.is_mei.is_(is_mei))
     if is_simples is not None:
@@ -535,14 +535,14 @@ def _rollup_query(
 def stats(
     cnae_codes: list[str] | None = Query(None),
     uf: list[str] | None = Query(None),
-    regiao: str | None = Query(None),
-    municipio_codes: list[str] | None = Query(None),
+    region: str | None = Query(None),
+    municipality_codes: list[str] | None = Query(None),
     company_size: list[str] | None = Query(None),
     is_mei: bool | None = Query(None),
     is_simples: bool | None = Query(None),
     is_headquarters: bool | None = Query(None),
     name: str | None = Query(None),
-    situacao: list[str] | None = Query(None),
+    status: list[str] | None = Query(None),
     only_with_cellphone: bool = Query(False),
     only_with_email: bool = Query(False),
     has_phone: bool | None = Query(None),
@@ -565,14 +565,14 @@ def stats(
         db.query(Establishment),
         cnae_codes=cnae_codes,
         uf=uf,
-        regiao=regiao,
-        municipio_codes=municipio_codes,
+        region=region,
+        municipality_codes=municipality_codes,
         company_size=company_size,
         is_mei=is_mei,
         is_simples=is_simples,
         is_headquarters=is_headquarters,
         name=name,
-        situacao=situacao,
+        status=status,
         only_with_cellphone=only_with_cellphone,
         only_with_email=only_with_email,
         has_phone=has_phone,
@@ -580,13 +580,13 @@ def stats(
         opened_before=opened_before,
     )
 
-    # As UFs que sobraram depois de resolver `regiao` -- mesma conta que
+    # As UFs que sobraram depois de resolver `region` -- mesma conta que
     # `_apply_filters` faz. Serve pra saber quando `by_uf` e deduzivel do total
     # em vez de precisar de um GROUP BY. `_apply_filters` ja validou os nomes,
     # entao aqui nao ha UF desconhecida.
     resolved_ufs = set(uf or [])
-    if regiao:
-        resolved_ufs |= set(ufs_for_regiao(regiao))
+    if region:
+        resolved_ufs |= set(ufs_for_region(region))
     uf_codes = [uf_code(u) for u in sorted(resolved_ufs)]
 
     # Um unico CNAE tem resposta exata no agregado por CNAE. Varios nao: uma
@@ -600,7 +600,7 @@ def stats(
 
     # Filtros que agregado nenhum carrega -- ver models.EstablishmentStats.
     uncovered = bool(
-        name or municipio_codes or opened_after or opened_before
+        name or municipality_codes or opened_after or opened_before
         or has_phone is not None
         or (cnae_codes and single_cnae is None)
         # Com filtro de CNAE o `top_cnaes` seria "os CNAEs principais de quem
@@ -619,7 +619,7 @@ def stats(
     else:
         model = C if single_cnae is not None else S
         rollup = _rollup_query(
-            db, model, uf_codes=uf_codes, company_size=company_size, situacao=situacao,
+            db, model, uf_codes=uf_codes, company_size=company_size, status=status,
             is_mei=is_mei, is_simples=is_simples, is_headquarters=is_headquarters,
         )
         if single_cnae is not None:
@@ -680,10 +680,10 @@ def stats(
     # nas poucas dezenas de linhas agregadas, nao nas 63M.
     by_uf = {(uf_name(code) or "desconhecido"): count for code, count in by_uf_rows}
 
-    by_regiao: dict[str, int] = {}
+    by_region: dict[str, int] = {}
     for code, count in by_uf_rows:
-        regiao_key = UF_TO_REGIAO.get(uf_name(code), "desconhecida")
-        by_regiao[regiao_key] = by_regiao.get(regiao_key, 0) + count
+        region_key = UF_TO_REGION.get(uf_name(code), "desconhecida")
+        by_region[region_key] = by_region.get(region_key, 0) + count
 
     cnae_width = CODE_WIDTHS["cnae"]
     return EstablishmentStatsOut(
@@ -691,7 +691,7 @@ def stats(
         with_cellphone=with_cellphone,
         with_email=with_email,
         by_uf=by_uf,
-        by_regiao=by_regiao,
+        by_region=by_region,
         by_company_size={(_code(size) or "desconhecido"): count for size, count in by_company_size_rows},
         top_cnaes=[{"cnae_code": f"{code:0{cnae_width}d}", "total": count} for code, count in by_main_cnae_rows],
     )

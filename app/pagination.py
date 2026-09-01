@@ -1,6 +1,6 @@
 """Paginacao por cursor (keyset) -- substitui o page/offset das buscas.
 
-Motivo da troca: as buscas paginadas montavam a resposta com um `total`, e pra
+RegistrationStatusReason da troca: as buscas paginadas montavam a resposta com um `total`, e pra
 isso rodavam um `count()` sobre o resultado inteiro antes de devolver a pagina.
 Numa tabela de ~72M linhas isso varre tudo mesmo com `per_page=1` -- um
 `/establishments?uf=PR` levava a API a 504 por timeout enquanto contava milhoes

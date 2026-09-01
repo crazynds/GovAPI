@@ -30,6 +30,7 @@ Contributions adding other public data sources (IBGE, tax records, public tender
 - [Configuration](#configuration)
 - [Importing the data](#importing-the-data)
 - [Database migrations](#database-migrations)
+- [How data is stored](#how-data-is-stored)
 - [API reference](#api-reference)
 - [Project structure](#project-structure)
 - [License](#license)
@@ -122,32 +123,32 @@ Or import each source independently:
 
 ```bash
 # Municipalities (IBGE Localidades) -- run first, everything else links to this
-docker compose run --rm app python -m app.cli import-municipios
+docker compose run --rm app python -m app.cli import-municipalities
 
 # CNPJ (Federal Revenue)
 docker compose run --rm app python -m app.cli import-cnpj
 
-# CNPJ — just one stage (reference, simples, empresas, estabelecimentos, build)
-docker compose run --rm app python -m app.cli import-cnpj --only estabelecimentos
+# CNPJ — just one stage (reference, simples, companies, establishments, build)
+docker compose run --rm app python -m app.cli import-cnpj --only establishments
 
 # CEPs (Post Office e-DNE Básico)
 docker compose run --rm app python -m app.cli import-ceps
 
-# Municipality population/area (IBGE/SIDRA) -- run after import-municipios
+# Municipality population/area (IBGE/SIDRA) -- run after import-municipalities
 docker compose run --rm app python -m app.cli import-ibge
 
 # Municipality centroid coordinates -- static public dataset, matched by exact
 # IBGE code, one request. Backs the low-precision fallback in the address geo
 # endpoints.
-docker compose run --rm app python -m app.cli import-municipios-geo
+docker compose run --rm app python -m app.cli import-municipalities-geo
 ```
 
 `import-all` chains all six in dependency order: municipalities, Post Office
 CEPs, bulk coordinates from the OSM extract, the Revenue's CNPJ base, then IBGE
 population and municipality centroids. The order is not a preference:
-`correios_cep.municipio_cod_ibge` has a real foreign key to `municipios.ibge_code`,
+`postal_codes.municipality_ibge_code` has a real foreign key to `municipalities.ibge_code`,
 which only exists once municipalities are loaded first; the CNPJ build links
-addresses to `correios_cep`; and the Revenue's own `Municipios.zip` (code+name,
+addresses to `postal_codes`; and the Revenue's own `Municipalities.zip` (code+name,
 no state, no IBGE code) matches by name against the municipality rows the first
 step already created, filling in `receita_code`. Chaining the individual
 commands means respecting that order yourself. The last step (municipality
@@ -157,13 +158,13 @@ one request and matches by exact IBGE code — no Nominatim, no 1h40 wait, no
 
 If interrupted — Ctrl-C or a genuine failure — the next `import-all` resumes
 from the phase that didn't finish rather than starting over at CEPs. Each
-phase writes its own status to `import_all_run` before and after running, and
+phase writes its own status to `import_runs` before and after running, and
 a phase already `success` is skipped. That only holds while the previous
 attempt didn't fully succeed, though: once all five phases complete, the
 following call treats itself as a real periodic refresh (a new CNPJ period, an
 updated e-DNE) and redoes everything rather than skipping forever.
 
-The OSM coordinates phase (2/5) is best-effort: it enriches `correios_cep`
+The OSM coordinates phase (2/5) is best-effort: it enriches `postal_codes`
 with lat/long, nothing downstream depends on it, and the Geofabrik mirror it
 downloads from does go down (`503`, seen in practice). A failure there logs a
 warning and moves on to CNPJ/IBGE/geocoding rather than blocking the run —
@@ -213,9 +214,11 @@ docker compose run --rm app python -m app.cli reset-db --yes    # unattended
 ```
 
 This drops the whole `public` schema and reapplies the migrations. It drops the
-schema rather than the mapped tables because `correios_cep` is created by
-`edne-correios-loader`, outside SQLAlchemy's metadata, and a table-by-table drop
-would leave it behind.
+schema rather than the mapped tables because not every table in the database is
+under Alembic's control: the staging tables are created and dropped by the
+import (see [Staging tables](#staging-tables)) and `postal_codes_import` is
+scratch belonging to `import-ceps`, so a table-by-table drop would leave them
+behind.
 
 ## How data is stored
 
@@ -225,19 +228,57 @@ a CNPJ costs 8 bytes instead of 15 as text, and the check digits are recomputed
 on output rather than stored. Phone numbers drop the constant `+55`, CNAE/state/
 company-size/registration-status become integers, secondary CNAEs are an
 `INTEGER[]` (`NULL` when empty, with a GIN index), and the staging tables are
-`UNLOGGED`. All formatting — zero padding, `+55`, punctuation — happens at the
+`UNLOGGED` (see [Staging tables](#staging-tables)). All formatting — zero padding, `+55`, punctuation — happens at the
 edges: on import in `app/importer/rows.py`, on output in the routers. The API
 contract is unchanged.
 
 Base-36 also preserves ordering, so "every establishment under root X" is a
 contiguous integer range that the primary key can serve — see
-`app.cnpj.basico_range`.
+`app.cnpj.root_range`.
+
+### Staging tables
+
+`establishments_staging`, `companies_staging`, and `simples_staging` are scratch:
+the import `COPY`s the Revenue's CSVs into them, the build reads them once to
+assemble `establishments`, and the atomic `RENAME` makes that result live. After
+that swap their contents are dead weight — roughly 63M rows of `UNLOGGED` data.
+
+So they are not part of the schema. They used to be created by a migration and
+never removed, which left them sitting in the database after every import. Now
+`import-all` drops them once the CNPJ phase has succeeded, and the pipeline
+recreates them at the start of the next import (`ensure_staging_tables`, from
+the models, so the DDL still lives in one place). They are excluded from
+Alembic's autogenerate in `alembic/env.py` — otherwise the next generated
+migration would put them straight back into the schema.
+
+The drop is conditional on that phase having actually succeeded, not on the run
+finishing. On a resumed import, files already recorded in `import_files` are not
+downloaded again, so a half-loaded staging table is the input a resumed CNPJ
+phase builds on. Dropping it after an interrupted run would make the next build
+assemble `establishments` from partial data, without failing.
+
+### Import state
+
+Three tables, three different grains:
+
+| Table | Rows | Written by |
+| --- | --- | --- |
+| `import_runs` | one (`id = 1`) | the main thread — overall status plus one column per `import-all` phase, and the `cnpj_*` columns for the CNPJ phase's own period/message/clock |
+| `import_steps` | one per pipeline stage (`download`/`extract`/`import`/`build`) | each stage's thread, in parallel |
+| `import_files` | one per file per period | the import stage, as a resume ledger |
+
+`import_runs` is the merge of what were two separate single-row tables,
+`import_run` (the CNPJ pipeline's global state) and `import_all_run` (the
+`import-all` phases). They were written by the same thread and described the same
+execution, and `import_all_run.cnpj` already held exactly what `import_run.status`
+did. `import_steps` stayed separate because its rows are written concurrently by
+different threads, and `import_files` because its grain is a file, not a run.
 
 ### Addresses
 
 An establishment stores only its CEP (as a 4-byte integer), street number, and
 complement. Street, district, municipality, and state come from the Post
-Office's `correios_cep` by CEP, which is that table's primary key — so they are
+Office's `postal_codes` by CEP, which is that table's primary key — so they are
 not duplicated across ~63M rows.
 
 Street and district *are* stored when the CEP cannot resolve them: a small town
@@ -252,14 +293,14 @@ address in the API carries a `source` field saying which way it went.
 of its target table before repopulating, which would leave the CEP base empty
 mid-import and would block on any foreign key pointing at it. So the loader is
 pointed at a scratch table (via the `table_names` option it already exposes) and
-the merge into `correios_cep` is our own `INSERT ... ON CONFLICT DO UPDATE`; the
+the merge into `postal_codes` is our own `INSERT ... ON CONFLICT DO UPDATE`; the
 library never touches the real table. CEPs the Post Office retired are kept
 rather than deleted — that is what makes the table safe to reference — and the
 import reports how many it is holding on to.
 
 An establishment is in exactly one of two states, never both. Either it is
 linked to a CEP — `cep` is set, and street/district/municipality/state come from
-`correios_cep` on read — or it is not, and the Revenue's whole address record
+`postal_codes` on read — or it is not, and the Revenue's whole address record
 sits in an `address` JSONB column. Unlinked covers a missing CEP as well as one
 the Post Office has never heard of (mistyped, retired, foreign): keeping such a
 CEP in the column would resolve no address and would block a foreign key.
@@ -271,21 +312,21 @@ the `CEP: N vinculados ... N sem vínculo` line.
 
 Because an unmatched CEP becomes NULL, and because the CEP import upserts
 instead of deleting, `establishments.cep` carries a real foreign key to
-`correios_cep`. The build adds it after the bulk load rather than before, so
+`postal_codes`. The build adds it after the bulk load rather than before, so
 the check is one pass at the end instead of a per-row cost across the whole
-insert. `correios_cep` is an ordinary model now (`models.Cep`) — the loader only ever
+insert. `postal_codes` is an ordinary model now (`models.Cep`) — the loader only ever
 populates the scratch table — so Alembic manages it like any other.
 
-`correios_cep.municipio_cod_ibge` carries its own foreign key to
-`municipios.ibge_code`, same graceful-degradation rule: a code the current IBGE
+`postal_codes.municipality_ibge_code` carries its own foreign key to
+`municipalities.ibge_code`, same graceful-degradation rule: a code the current IBGE
 list doesn't recognize (a merged or renamed municipality) becomes NULL on
-upsert rather than failing. That FK is only possible because `municipios` is no
-longer sourced from the Revenue's own `Municipios.zip` — that file has no state
+upsert rather than failing. That FK is only possible because `municipalities` is no
+longer sourced from the Revenue's own `Municipalities.zip` — that file has no state
 and no IBGE code, just an internal code and a name, which is why `import-ibge`
 used to match it against SIDRA by name+state (fragile: names repeat across
 states). Municipalities now come from the IBGE Localidades API first
-(`import-municipios`, exact code+name+state, no matching at all), and
-`Municipios.zip` fills in `receita_code` afterward by matching name against
+(`import-municipalities`, exact code+name+state, no matching at all), and
+`Municipalities.zip` fills in `receita_code` afterward by matching name against
 those rows — the one name-based step left, and now checked against the
 authoritative municipality list itself rather than a population dataset's
 labels. `receita_code` is nullable for exactly this: a name with no match, or
@@ -293,7 +334,7 @@ one that collides across states, leaves the row without it rather than
 guessing wrong.
 
 That table also absorbed `cep_coordenadas`. The two were keyed identically and
-only lived apart because a coordinate column glued onto `correios_cep` would
+only lived apart because a coordinate column glued onto `postal_codes` would
 not have survived the loader rebuilding it; that rebuild is gone. Address and
 coordinate are independent halves and either may be missing — there are CEPs
 with an address and no coordinate, and CEPs only the OSM extract knows — so the
@@ -322,7 +363,7 @@ declares for it — a neighborhood name longer than the `VARCHAR(36)` it assigns
 its abbreviation, for one, hit in production. `app.ceps.widen_free_text_columns`
 switches every free-text column (name, address, abbreviation — anything wider
 than 8 chars in the library's own schema) to `TEXT` before `.load()` creates the
-tables, and `correios_cep`'s matching columns are `TEXT` for the same reason,
+tables, and `postal_codes`'s matching columns are `TEXT` for the same reason,
 so a long value survives both the library's own tables and our upsert into it.
 Fixed-width codes (CEP, UF/country sigla, single-char flags) are left alone.
 
@@ -333,7 +374,7 @@ within a release) leaves its tables committed with whatever schema was current
 at the time, on a connection separate from the one the failed INSERT rolled
 back. The next run would silently reuse that narrow table forever. So
 `import-ceps` now drops everything the library is about to (re)create before
-each run, `correios_cep` itself excluded — it's a scratch table under a
+each run, `postal_codes` itself excluded — it's a scratch table under a
 different name, never part of the library's own schema.
 
 ## API reference
@@ -342,7 +383,7 @@ Full interactive docs (Swagger) at `/docs`.
 
 ### Pagination
 
-`/establishments`, `/socios/buscar` and `/enderecos/buscar` paginate by **cursor**, not page number:
+`/establishments`, `/partners/search` and `/addresses/search` paginate by **cursor**, not page number:
 
 ```
 GET /establishments?uf=PR&limit=25
@@ -369,7 +410,7 @@ in Paraná has the highest `cellphone_confidence`, it has to look at every compa
 no `limit` saves you from that. Ordering by the primary key is free: the page comes out of a
 contiguous stretch of an index that already exists.
 
-The one exception is `/enderecos`: passing `lat`+`lon` (and `/enderecos/proximos`) sorts by
+The one exception is `/addresses`: passing `lat`+`lon` (and `/addresses/nearby`) sorts by
 distance, because "nearest first" is the entire point of those. They pay for it, so use them
 only when you want proximity.
 
@@ -420,12 +461,12 @@ has, so buckets can't be summed *across* CNAEs; within a single CNAE the sum is 
 that's the only way it's used — **one CNAE per request**. Several CNAEs at once fall back.
 
 Requests using a filter neither aggregate carries — `name`, `opened_after`/`opened_before`,
-`municipio_codes`, `has_phone`, several CNAEs, or a CNAE together with `include_breakdowns` —
+`municipality_codes`, `has_phone`, several CNAEs, or a CNAE together with `include_breakdowns` —
 fall back to the full table rather than return a fast wrong number, and can be slow.
 
 ### Text search
 
-`?name=`, `?nome=`, `?logradouro=`, `?bairro=` and `?municipio=` are substring matches
+`?name=`, `?name=`, `?street=`, `?district=` and `?municipality=` are substring matches
 (`ILIKE '%term%'`), backed by `pg_trgm` GIN indexes so they don't degenerate into a full scan.
 Trigrams need **at least 3 characters** to be useful — a one- or two-letter term can't use the
 index and falls back to scanning, so keep search terms reasonably long.
@@ -438,13 +479,13 @@ arbitrary slice.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/establishments` | Search companies. Filters: `cnae_codes` (matches the main CNAE or any secondary one; with several codes, matches companies having at least one of them), `uf`, `regiao`, `municipio_codes`, `company_size`, `is_mei`, `is_simples`, `is_headquarters`, `name`, `situacao` (registration status, code or label — includes all statuses unless filtered), `has_phone`, `only_with_cellphone`, `only_with_email`, `opened_after`/`opened_before`; paginated by cursor via `cursor`/`limit` (see [Pagination](#pagination)). Results include CNAE, legal-nature, and deregistration-reason descriptions, plus human-readable labels for company size and registration status. |
+| `GET` | `/establishments` | Search companies. Filters: `cnae_codes` (matches the main CNAE or any secondary one; with several codes, matches companies having at least one of them), `uf`, `region`, `municipality_codes`, `company_size`, `is_mei`, `is_simples`, `is_headquarters`, `name`, `status` (registration status, code or label — includes all statuses unless filtered), `has_phone`, `only_with_cellphone`, `only_with_email`, `opened_after`/`opened_before`; paginated by cursor via `cursor`/`limit` (see [Pagination](#pagination)). Results include CNAE, legal-nature, and deregistration-reason descriptions, plus human-readable labels for company size and registration status. |
 | `GET` | `/establishments/by-cnpj` | Look up specific companies by CNPJ (`cnpjs=...`, repeatable). Accepts punctuation, a full CNPJ, or just the 8-position root. |
-| `GET` | `/establishments/stats` | Totals and breakdowns over the same filters as `/establishments`. Answered from a precomputed aggregate table rebuilt by the import, so it doesn't scan the 70M-row table at request time. Filters the aggregate doesn't carry (`name`, `opened_after`/`opened_before`, `municipio_codes`, `cnae_codes`, `only_with_cellphone`/`only_with_email`, `has_phone`) fall back to the full table and can be slow — for those, `include_breakdowns=true` is what makes it expensive. |
+| `GET` | `/establishments/stats` | Totals and breakdowns over the same filters as `/establishments`. Answered from a precomputed aggregate table rebuilt by the import, so it doesn't scan the 70M-row table at request time. Filters the aggregate doesn't carry (`name`, `opened_after`/`opened_before`, `municipality_codes`, `cnae_codes`, `only_with_cellphone`/`only_with_email`, `has_phone`) fall back to the full table and can be slow — for those, `include_breakdowns=true` is what makes it expensive. |
 | `GET` | `/cnaes/search-by-description` | Search CNAE codes by description (`words=...`, repeatable). |
 | `GET` | `/cnaes/codes` | List all CNAE codes. |
-| `GET` | `/municipios/search` | Search municipalities by `name`, `uf`, and/or `regiao`. Includes `population` and `area_km2` once `import-ibge` has run. |
-| `GET` | `/municipios/by-code/{code}` | Look up a municipality by code — either the Revenue's 4-digit code or the 7-digit IBGE code; the width decides which one is queried. |
+| `GET` | `/municipalities/search` | Search municipalities by `name`, `uf`, and/or `region`. Includes `population` and `area_km2` once `import-ibge` has run. |
+| `GET` | `/municipalities/by-code/{code}` | Look up a municipality by code — either the Revenue's 4-digit code or the 7-digit IBGE code; the width decides which one is queried. |
 | `GET` | `/import/status` | Check import progress — the overall run plus one entry per pipeline stage (`stages`), since download/unzip/load run in parallel on different files. |
 | `POST` | `/import/trigger` | Trigger an import in the background. Unauthenticated. |
 
@@ -452,8 +493,8 @@ arbitrary slice.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/socios/por-empresa/{cnpj}` | List a company's partners/shareholders — accepts a full CNPJ or just the 8-digit root. |
-| `GET` | `/socios/buscar` | Search partners by `nome` and/or `documento` — find every company a person/entity is a partner in. Paginated by cursor (see [Pagination](#pagination)). `documento` is an exact match: for a CPF pass only the visible digits (the Revenue masks it itself, `***123456**` → `123456`); a CNPJ is accepted with or without punctuation. |
+| `GET` | `/partners/by-company/{cnpj}` | List a company's partners/shareholders — accepts a full CNPJ or just the 8-digit root. |
+| `GET` | `/partners/search` | Search partners by `name` and/or `tax_id` — find every company a person/entity is a partner in. Paginated by cursor (see [Pagination](#pagination)). `tax_id` is an exact match: for a CPF pass only the visible digits (the Revenue masks it itself, `***123456**` → `123456`); a CNPJ is accepted with or without punctuation. |
 
 ### Reference tables
 
@@ -461,19 +502,19 @@ Small code/description lookups — same shape as `/cnaes`. Each has `/search?nam
 
 | Prefix | Covers |
 |---|---|
-| `/naturezas-juridicas` | Legal nature (e.g. "Sociedade Empresária Limitada"). |
-| `/qualificacoes-societarias` | Partner/officer role (e.g. "Administrador"). |
-| `/paises` | Country codes, for foreign partners/companies. |
-| `/motivos-situacao-cadastral` | Why a company was deregistered/suspended. |
+| `/legal_natures-juridicas` | Legal nature (e.g. "Sociedade Empresária Limitada"). |
+| `/qualifications-societarias` | Partner/officer role (e.g. "Administrador"). |
+| `/countries` | Country codes, for foreign partners/companies. |
+| `/reasons-status-cadastral` | Why a company was deregistered/suspended. |
 
 ### Address
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/enderecos/cep/{cep}` | Look up an address by ZIP code, including `latitude`/`longitude` when available (fetched from BrasilAPI on first lookup, cached after). |
-| `GET` | `/enderecos/buscar` | Free-text address search — `logradouro` (street), `bairro` (neighborhood), `municipio`, `uf` (repeatable), `regiao`, `municipio_cod_ibge`; paginated by cursor via `cursor`/`limit` (see [Pagination](#pagination)). Pass `lat`+`lon` to sort by distance instead — uses the ZIP code's own cached coordinate when available, otherwise falls back to its municipality's centroid (`import-municipios-geo`); each result's `exata` field says which one was used. |
-| `GET` | `/enderecos/proximos` | ZIP codes within `raio_km` of `lat`+`lon`, nearest first. Same exact-vs-municipality-centroid fallback as above. |
-| `GET` | `/enderecos/estados` | List all states. |
+| `GET` | `/addresses/cep/{cep}` | Look up an address by ZIP code, including `latitude`/`longitude` when available (fetched from BrasilAPI on first lookup, cached after). |
+| `GET` | `/addresses/search` | Free-text address search — `street`, `district`, `municipality`, `uf` (repeatable), `region`, `municipality_ibge_code`; paginated by cursor via `cursor`/`limit` (see [Pagination](#pagination)). Pass `lat`+`lon` to sort by distance instead — uses the ZIP code's own cached coordinate when available, otherwise falls back to its municipality's centroid (`import-municipalities-geo`); each result's `exact` field says which one was used. |
+| `GET` | `/addresses/nearby` | ZIP codes within `raio_km` of `lat`+`lon`, nearest first. Same exact-vs-municipality-centroid fallback as above. |
+| `GET` | `/addresses/states` | List all states. |
 
 ### Taxes (Simples Nacional)
 
@@ -481,10 +522,10 @@ Pure calculation, no database involved — reference tables, not tax advice.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/impostos/simples/anexos` | List the 5 Simples Nacional annexes (I–V) and what each covers. |
-| `GET` | `/impostos/simples/anexos/{anexo}` | Full bracket table (RBT12 ranges, nominal rate, deduction) for one annex. |
-| `GET` | `/impostos/simples/calcular` | Calculate the effective rate and DAS amount — `anexo`, `rbt12` (revenue over the last 12 months), optional `receita_mes` (defaults to `rbt12/12`). |
-| `GET` | `/impostos/fator-r` | Calculate the Fator R (`folha_pagamento_12m / receita_bruta_12m`) and whether it qualifies for Anexo III instead of V (≥ 28%, per §5º-D of LC 123/2006 — applies to intellectual/regulated service activities). |
+| `GET` | `/taxes/simples/annexes` | List the 5 Simples Nacional annexes (I–V) and what each covers. |
+| `GET` | `/taxes/simples/annexes/{annex}` | Full bracket table (RBT12 ranges, nominal rate, deduction) for one annex. |
+| `GET` | `/taxes/simples/calculate` | Calculate the effective rate and DAS amount — `annex`, `rbt12` (revenue over the last 12 months), optional `monthly_revenue` (defaults to `rbt12/12`). |
+| `GET` | `/taxes/fator-r` | Calculate the Fator R (`payroll_12m / gross_revenue_12m`) and whether it qualifies for Anexo III instead of V (≥ 28%, per §5º-D of LC 123/2006 — applies to intellectual/regulated service activities). |
 
 ### Misc
 

@@ -1,8 +1,8 @@
 """Preenche o centroide de cada município (latitude/longitude) a partir de um
 dataset público estático, em vez de geocodificar município a município contra
 o Nominatim -- usado como fallback de baixa precisão (nível cidade) em
-`/enderecos/proximos` e `/enderecos/buscar` quando um CEP específico ainda não
-tem coordenada exata cacheada em `correios_cep`.
+`/addresses/nearby` e `/addresses/search` quando um CEP específico ainda não
+tem coordenada exata cacheada em `postal_codes`.
 
 Geocodificar as ~5570 chamadas contra o Nominatim (mesmo respeitando o limite
 de 1 req/s da política de uso deles) levava ~1h40 -- e cada nova troca de
@@ -13,7 +13,7 @@ então o match aqui é por código, não por nome -- diferente de app/importer/
 ibge.py, que precisa casar por (nome, UF) porque a fonte dele (Receita) não
 tem o código IBGE embutido.
 
-Precisa que `municipios.ibge_code` já esteja preenchido (ver
+Precisa que `municipalities.ibge_code` já esteja preenchido (ver
 app.importer.ibge.import_ibge, que roda antes na ordem de `import-all`).
 """
 
@@ -24,33 +24,33 @@ import logging
 import httpx
 from sqlalchemy.orm import Session
 
-from app.models import Municipio
+from app.models import Municipality
 
 logger = logging.getLogger("importer")
 
 DATASET_URL = "https://raw.githubusercontent.com/kelvins/municipios-brasileiros/main/csv/municipios.csv"
 
 
-def geocode_municipios(db: Session) -> tuple[int, int]:
-    """Baixa o dataset uma vez e faz UPDATE em `municipios` casando por
+def geocode_municipalities(db: Session) -> tuple[int, int]:
+    """Baixa o dataset uma vez e faz UPDATE em `municipalities` casando por
     `ibge_code` exato. Retorna (municípios atualizados, total no dataset)."""
     logger.info("Baixando coordenadas de municípios (dataset estático, ~5570 linhas, uma request só)...")
     response = httpx.get(DATASET_URL, timeout=30)
     response.raise_for_status()
 
     reader = csv.DictReader(io.StringIO(response.text))
-    # int(...): `Municipio.ibge_code` e Integer, mas csv.DictReader so devolve
+    # int(...): `Municipality.ibge_code` e Integer, mas csv.DictReader so devolve
     # str -- comparar str contra int nunca bate, e o lookup abaixo falharia
     # silenciosamente pra TODO municipio (visto na pratica, testando isto).
     coords = {int(row["codigo_ibge"]): (float(row["latitude"]), float(row["longitude"])) for row in reader}
 
     # So os que ja tem ibge_code (import-ibge casa isso por nome+UF antes) --
     # sem ele nao ha como bater com o dataset, que so identifica por codigo.
-    candidatos = db.query(Municipio).filter(Municipio.ibge_code.isnot(None)).all()
-    sem_ibge_code = db.query(Municipio).filter(Municipio.ibge_code.is_(None)).count()
+    candidates = db.query(Municipality).filter(Municipality.ibge_code.isnot(None)).all()
+    without_ibge_code = db.query(Municipality).filter(Municipality.ibge_code.is_(None)).count()
 
     updated = 0
-    for m in candidatos:
+    for m in candidates:
         coord = coords.get(m.ibge_code)
         if coord:
             m.latitude, m.longitude = coord
@@ -60,6 +60,6 @@ def geocode_municipios(db: Session) -> tuple[int, int]:
     logger.info(
         "Coordenadas: %d/%d municípios atualizados (dataset tem %d; %d município(s) sem ibge_code -- "
         "rode `import-ibge` primeiro pra esses casarem).",
-        updated, len(candidatos), len(coords), sem_ibge_code,
+        updated, len(candidates), len(coords), without_ibge_code,
     )
     return updated, len(coords)
