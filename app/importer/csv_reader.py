@@ -49,7 +49,7 @@ def read_csv(path: str, columns: list[str], on_progress: ProgressCallback | None
             yield raw_line
 
     with open(path, encoding="iso-8859-1", newline="") as f:
-        reader = csv.reader(counted_lines(f), delimitr=";", quotechar='"')
+        reader = csv.reader(counted_lines(f), delimiter=";", quotechar='"')
         rows_read = 0
         for fields in reader:
             if not fields or fields == [""]:
