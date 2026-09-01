@@ -293,6 +293,26 @@ def _apply_filters(
             raise HTTPException(422, f"UF desconhecida: {sorted(unknown)}")
         query = query.filter(Establishment.uf.in_(uf_codes))
 
+    # Cidade ANTES do CNAE, como a UF e pelo mesmo motivo: `municipality_id` vai
+    # empurrado pra DENTRO da subquery da tabela N:N.
+    municipality_ids: list[int] = []
+    if municipality_codes:
+        receita_codes = [int(c) for c in municipality_codes if str(c).strip().isdigit()]
+        if not receita_codes:
+            raise HTTPException(422, f"Código de município inválido: {municipality_codes}")
+        # Resolve receita_code -> id AQUI, numa consulta a parte, em vez de
+        # deixar como subquery correlacionada (`.has(...)`). A tabela tem ~5.570
+        # linhas, entao isso e uma consulta de microssegundos; como `.has()`,
+        # virava um EXISTS reavaliado por linha candidata de `establishments` --
+        # sem indice util, filtrar por cidade saia mais caro que nao filtrar.
+        municipality_ids = [
+            row[0] for row in query.session.query(Municipality.id)
+            .filter(Municipality.receita_code.in_(receita_codes)).all()
+        ]
+        if not municipality_ids:
+            raise HTTPException(422, f"Município não encontrado: {municipality_codes}")
+        query = query.filter(Establishment.municipality_id.in_(municipality_ids))
+
     if cnae_codes:
         # Semi-join na tabela N:N: "as empresas que tem algum destes CNAEs".
         # Antes era `main_cnae = X OR secondary_cnaes && [X]`, um OR entre btree
@@ -300,31 +320,52 @@ def _apply_filters(
         # LIMIT n` o planner acabava varrendo a PK filtrando linha a linha, as
         # 63M. Aqui e igualdade numa coluna so.
         #
-        # `uf` e `has_cellphone` sao REPETIDOS dentro da subquery, mesmo ja
+        # Os filtros de recorte sao REPETIDOS dentro da subquery, mesmo ja
         # estando no WHERE de fora. E o ponto todo de a tabela N:N carregar
-        # essas duas colunas: com elas aqui, o indice
-        # (cnae, uf, cnpj) WHERE has_cellphone devolve os candidatos ja
-        # filtrados e em ordem de `cnpj`; sem elas, o banco traria todos os
-        # candidatos do CNAE no pais inteiro pra descobrir na tabela grande,
-        # um por um, quais sao do RS e tem celular.
+        # copias de `uf`, `municipality_id` e `has_cellphone`: com elas aqui, um
+        # indice unico devolve os candidatos ja filtrados e em ordem de `cnpj`;
+        # sem elas, o banco traria todos os candidatos do CNAE no pais inteiro
+        # pra descobrir na tabela grande, um por um, quais servem.
+        #
+        # Um `IN` numa coluna so, e nao um ramo por CNAE unido por UNION ALL.
+        # O UNION ALL foi tentado e MEDIDO (8M linhas sinteticas): o Postgres
+        # nao gera MergeAppend a partir dele -- sai `Append` + `Sort`, ou seja o
+        # mesmo trabalho do `IN` com um no a mais. O `IN` ficou mais rapido
+        # (1.9ms contra 2.7ms) e e mais simples.
+        #
+        # MergeAppend so aparece com `ORDER BY cnpj LIMIT n` DENTRO de cada
+        # ramo (medido: 0.23ms, lendo 27 linhas em vez de 19 mil). Mas isso e
+        # INCORRETO aqui: a subquery nao carrega todos os filtros da busca --
+        # porte, MEI, situacao, nome e data ficam no WHERE de fora. Um ramo que
+        # devolve so as 25 primeiras entrega candidatos que o filtro externo
+        # ainda pode descartar, e a pagina viria curta calada, perdendo linhas.
+        # So daria pra usar se a subquery fosse o filtro inteiro.
+        #
+        # O que sobra do `Sort` aqui e barato porque `municipality_id`/`uf`
+        # podam o conjunto ANTES dele: sao dezenas de milhares de linhas, nao
+        # milhoes. O caso que continua caro e multi-CNAE sem cidade nem UF --
+        # ver o comentario no fim de _apply_filters.
         codes = _cnae_codes_to_int(cnae_codes)
-        matching = select(EstablishmentCnae.cnpj).where(EstablishmentCnae.cnae.in_(codes))
-        if uf_codes:
-            matching = matching.where(EstablishmentCnae.uf.in_(uf_codes))
+        codes_matching = select(EstablishmentCnae.cnpj).where(EstablishmentCnae.cnae.in_(codes))
+        if municipality_ids:
+            # Cidade e mais seletiva que UF e ja a implica, entao aqui vai so
+            # ela -- e o que faz a subquery cair no indice
+            # (cnae, municipality_id, cnpj). Somar a UF junto so daria ao
+            # planner motivo pra hesitar entre os dois indices; o predicado de
+            # UF continua no WHERE de fora, onde custa nada.
+            codes_matching = codes_matching.where(
+                EstablishmentCnae.municipality_id.in_(municipality_ids))
+        elif uf_codes:
+            codes_matching = codes_matching.where(EstablishmentCnae.uf.in_(uf_codes))
         if only_with_cellphone:
             # A coluna crua, sem `== True`/`IS TRUE`: e a forma que casa
             # LITERALMENTE com o predicado do indice parcial
             # (`... WHERE has_cellphone`). O Postgres so usa um indice parcial
-            # se conseguir provar o predicado a partir do WHERE, e escrever
-            # isso de outro jeito e apostar nessa prova sem precisar.
-            matching = matching.where(EstablishmentCnae.has_cellphone)
+            # se conseguir provar o predicado a partir do WHERE, e escrever isso
+            # de outro jeito e apostar nessa prova sem precisar.
+            codes_matching = codes_matching.where(EstablishmentCnae.has_cellphone)
+        matching = codes_matching
         query = query.filter(Establishment.cnpj.in_(matching))
-
-    if municipality_codes:
-        codes = [int(c) for c in municipality_codes if str(c).strip().isdigit()]
-        if not codes:
-            raise HTTPException(422, f"Código de município inválido: {municipality_codes}")
-        query = query.filter(Establishment.municipality.has(Municipality.receita_code.in_(codes)))
 
     if company_size:
         sizes = [int(c) for c in company_size if str(c).strip().isdigit()]

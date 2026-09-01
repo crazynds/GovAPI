@@ -886,6 +886,8 @@ DEFERRED_INDEXES = [
 # empresa, nao por empresa) e cria os indices depois do bulk load.
 CNAES_DEFERRED_INDEXES = [
     ("ix_establishment_cnaes_cnae_uf_cnpj", "(cnae, uf, cnpj)", None, None),
+    # CNAE + cidade num indice so -- ver o comentario em models.EstablishmentCnae.
+    ("ix_establishment_cnaes_cnae_municipality_cnpj", "(cnae, municipality_id, cnpj)", None, None),
     # Parcial pra `only_with_cellphone=true`, que e o default da API. Aqui o
     # predicado parcial e seguro (ao contrario do caso de `registration_status`
     # comentado acima): quando o cliente manda `false`, o filtro sai do WHERE,
@@ -965,9 +967,11 @@ def _finalize_partners(db: Session, progress: Session, display: ProgressDisplay)
 def _build_cnaes_table(db: Session, display: ProgressDisplay, slot: int) -> None:
     """Monta `establishment_cnaes_new` -- uma linha por (empresa, CNAE).
 
-    Sai do staging, nao de `establishments_new`: o staging tem tudo que a tabela
-    precisa (cnpj, principal, array de secundarios, uf, cellphone) e a relacao e
-    1:1 com o que acabou de ser inserido, entao nao ha join a fazer.
+    Sai do staging, nao de `establishments_new`: o staging tem quase tudo que a
+    tabela precisa (cnpj, principal, array de secundarios, uf, cellphone) e a
+    relacao e 1:1 com o que acabou de ser inserido. A unica excecao e
+    `municipality_id`, que so existe depois do join com `municipalities` -- o
+    mesmo que `_build_final_table` faz, repetido aqui pelo mesmo codigo.
 
     O LATERAL abre a empresa em uma linha por CNAE: o principal, mais os
     secundarios. `array_remove` tira o principal da lista de secundarios --
@@ -986,6 +990,7 @@ def _build_cnaes_table(db: Session, display: ProgressDisplay, slot: int) -> None
         CREATE UNLOGGED TABLE establishment_cnaes_new (
             cnpj bigint NOT NULL,
             cnae integer NOT NULL,
+            municipality_id integer,
             uf smallint,
             is_main boolean NOT NULL,
             has_cellphone boolean NOT NULL
@@ -995,9 +1000,15 @@ def _build_cnaes_table(db: Session, display: ProgressDisplay, slot: int) -> None
     db.commit()
 
     inserted = db.execute(text("""
-        INSERT INTO establishment_cnaes_new (cnpj, cnae, uf, is_main, has_cellphone)
-        SELECT s.cnpj, c.cnae, s.uf, c.is_main, s.cellphone IS NOT NULL
+        INSERT INTO establishment_cnaes_new
+            (cnpj, cnae, municipality_id, uf, is_main, has_cellphone)
+        SELECT s.cnpj, c.cnae, m.id, s.uf, c.is_main, s.cellphone IS NOT NULL
         FROM establishments_staging s
+        -- Mesmo join de `_build_final_table`: o staging so tem o codigo da
+        -- Receita, e a copia aqui precisa ser o MESMO `municipality_id` que
+        -- foi pra `establishments`, senao o filtro por cidade divergiria entre
+        -- as duas tabelas. `municipalities` tem ~5.570 linhas -- hash join.
+        LEFT JOIN municipalities m ON m.receita_code = s.municipality_code
         CROSS JOIN LATERAL (
             SELECT s.main_cnae AS cnae, true AS is_main
             UNION ALL

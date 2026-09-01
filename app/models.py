@@ -93,7 +93,7 @@ class Country(Base):
 
 
 class RegistrationStatusReason(Base):
-    """RegistrationStatusReason da situação cadastral (por que a empresa foi baixada,
+    """Motivo da situação cadastral (por que a empresa foi baixada,
     incorporada, etc.) -- ver Establishment.registration_status."""
 
     __tablename__ = "registration_status_reasons"
@@ -217,23 +217,27 @@ class EstablishmentCnae(Base):
     numa coluna so, e um indice terminado em `cnpj` entrega a pagina em ordem
     sem ordenar nada.
 
-    `uf` e `has_cellphone` sao COPIAS de `establishments` -- de proposito. Sem
-    elas o banco acha os candidatos por CNAE aqui e precisa sondar a PK da
-    tabela grande um por um pra descobrir quem e do RS e tem celular; num
-    recorte seletivo isso e o gargalo de volta. Com elas, filtro e ordem saem
-    de um indice unico, sem tocar em `establishments`. Duplicar coluna
-    normalmente e divida de manutencao, mas aqui nao ha update possivel: as
-    duas tabelas sao reconstruidas do zero a cada import e trocadas no MESMO
-    RENAME atomico (ver _build_final_table). Sao os dois filtros copiados
-    porque sao os dois que aparecem em praticamente toda busca -- os outros
-    (porte, situacao, MEI, data) continuam sendo resolvidos no join.
+    `uf`, `municipality_id` e `has_cellphone` sao COPIAS de `establishments` --
+    de proposito. Sem elas o banco acha os candidatos por CNAE aqui e precisa
+    sondar a PK da tabela grande um por um pra descobrir quem e do RS e tem
+    celular; num recorte seletivo isso e o gargalo de volta. Pior no caso da
+    cidade: com `municipality_id` so na tabela grande, CNAE + municipio vira um
+    BitmapAnd entre dois indices, que monta os dois bitmaps inteiros antes da
+    primeira linha e perde a ordem por `cnpj`. Com as copias aqui, filtro e
+    ordem saem de um indice unico, sem tocar em `establishments`.
+
+    Duplicar coluna normalmente e divida de manutencao, mas aqui nao ha update
+    possivel: as duas tabelas sao reconstruidas do zero a cada import e
+    trocadas no MESMO RENAME atomico (ver _build_final_table). Sao esses tres
+    filtros copiados porque sao os que aparecem em praticamente toda busca --
+    os outros (porte, situacao, MEI, data) continuam sendo resolvidos no join.
 
     Sem FOREIGN KEY pra `establishments`: as duas trocam de nome no mesmo swap,
     e uma FK entre elas so criaria ordem obrigatoria no RENAME em troca de
     garantia nenhuma (ambas saem do mesmo INSERT, do mesmo snapshot).
 
     Ordem das colunas pelo mesmo motivo de `Establishment`: largura fixa
-    decrescente, 16 bytes de parte fixa sem padding.
+    decrescente, 20 bytes de parte fixa sem padding.
     """
 
     __tablename__ = "establishment_cnaes"
@@ -243,6 +247,15 @@ class EstablishmentCnae(Base):
         # depois dele; `cnpj` no fim pra saida ja sair na ordem do ORDER BY --
         # e isso que faz o LIMIT parar cedo em vez de ordenar o conjunto todo.
         Index("ix_establishment_cnaes_cnae_uf_cnpj", "cnae", "uf", "cnpj"),
+        # O mesmo, mas pro recorte por cidade. Existe pra que o filtro
+        # CNAE + municipio saia de UM indice so: com indices separados
+        # (`cnae` aqui, `municipality_id` em `establishments`) o Postgres
+        # intersecta os dois num BitmapAnd, que precisa montar os dois bitmaps
+        # INTEIROS antes de emitir a primeira linha e devolve o resultado em
+        # ordem de pagina fisica -- ou seja, o LIMIT deixa de cortar cedo e o
+        # Sort volta. Com as duas colunas no mesmo indice e igualdade nas duas,
+        # `cnpj` ja sai ordenado e a pagina para na 25a linha.
+        Index("ix_establishment_cnaes_cnae_municipality_cnpj", "cnae", "municipality_id", "cnpj"),
         # Mesma coisa, podado pra quem tem celular -- o default da API e
         # `only_with_cellphone=true`. Parcial e seguro aqui (ao contrario do
         # que aconteceu com `registration_status = 2`, ver DEFERRED_INDEXES):
@@ -259,6 +272,10 @@ class EstablishmentCnae(Base):
     # que e como a serializacao remonta o que era o array.
     cnpj: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     cnae: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    # Copia de `establishments.municipality_id`, pelo mesmo motivo que `uf`
+    # (ver o docstring). Vem logo depois de `cnae` porque as duas sao de 4
+    # bytes: a parte fixa vai de 16 pra 20 bytes, sem padding novo.
+    municipality_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     uf: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     is_main: Mapped[bool] = mapped_column(Boolean)
     has_cellphone: Mapped[bool] = mapped_column(Boolean)
