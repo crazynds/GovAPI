@@ -147,6 +147,38 @@ def import_municipalities_geo_command():
         db.close()
 
 
+@cli.command("fix-municipality-duplicates")
+def fix_municipality_duplicates():
+    """
+    Junta as linhas duplicadas de `municipalities` e reaponta os
+    estabelecimentos pra linha que sobrou.
+
+    O estado que isso conserta: o mesmo município aparece duas vezes -- uma
+    linha do IBGE (com `ibge_code`, sem `receita_code`) e outra criada pelo
+    merge por nome da Receita (com `receita_code`, sem `ibge_code`). Os
+    estabelecimentos apontam pra segunda (o build casa por `receita_code`),
+    mas a busca por cidade filtra por `ibge_code`, que só existe na primeira --
+    então aquela cidade devolve zero com o dado todo no banco. Visto em
+    produção com SANTA MARIA/RS.
+
+    Casa por `(nome, uf)`, que é único, ao contrário do nome sozinho que o
+    merge original usava.
+    """
+    from app.importer.pipeline import consolidate_municipality_duplicates
+
+    db = SessionLocal()
+    try:
+        result = consolidate_municipality_duplicates(db)
+    finally:
+        db.close()
+
+    typer.echo(f"Municípios consolidados: {result['pairs']} par(es).")
+    for table, count in result["remapped"].items():
+        typer.echo(f"  {table}: {count} linha(s) reapontada(s).")
+    if result["skipped"]:
+        typer.echo(f"  {len(result['skipped'])} não consolidado(s) -- ver o log para o motivo de cada.")
+
+
 @cli.command("backfill-cnae-municipality")
 def backfill_cnae_municipality():
     """

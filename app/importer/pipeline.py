@@ -803,8 +803,19 @@ def _merge_municipalities_receita(db: Session, rows) -> int:
     receita_code+nome, sem ibge_code/uf, igual ao caso de "nome sem
     correspondencia" -- ambos ficam pra tras do FK com `postal_codes` ate
     alguem resolver a ambiguidade a mao, mas nao travam o import.
+
+    So linhas COM `ibge_code` entram como candidatas, e isso e load-bearing.
+    Considerar todas fazia o bug se auto-perpetuar: uma duplicata criada aqui
+    (linha so com receita_code+nome) virava candidata na execucao seguinte, os
+    dois candidatos com o mesmo nome davam "ambiguo", e o merge nunca mais
+    consertava -- reinserindo a duplicata pra sempre. Aconteceu em producao com
+    SANTA MARIA/RS: `establishments.municipality_id` apontava pra duplicata (o
+    build casa por `receita_code`) enquanto o `ibge_code` ficava na outra linha,
+    e a busca por cidade, que filtra por `ibge_code`, devolvia zero.
     """
-    existing = db.query(Municipality.id, Municipality.name).all()
+    existing = db.query(Municipality.id, Municipality.name).filter(
+        Municipality.ibge_code.isnot(None)
+    ).all()
     by_name: dict[str, list[int]] = {}
     for municipality_id, name in existing:
         by_name.setdefault(municipalities_bootstrap.normalize_name(name), []).append(municipality_id)
@@ -1038,6 +1049,91 @@ def _build_cnaes_table(db: Session, display: ProgressDisplay, slot: int) -> None
         "establishment_cnaes_new: %d linhas em %.1fs (%d sem cidade).",
         rows, time.monotonic() - t0, orphans,
     )
+
+
+def consolidate_municipality_duplicates(db: Session) -> dict:
+    """Junta as linhas duplicadas de `municipalities` -- as que o merge por nome
+    criou -- e reaponta os estabelecimentos pra linha que sobrou.
+
+    O estado que isso conserta: o mesmo municipio existe DUAS vezes, uma linha
+    vinda do IBGE (tem `ibge_code`, nao tem `receita_code`) e outra criada pelo
+    `_merge_municipalities_receita` quando o casamento por nome falhou (tem
+    `receita_code`, nao tem `ibge_code`). `establishments.municipality_id`
+    aponta pra segunda, porque o build casa por `receita_code` -- mas a busca
+    por cidade filtra por `ibge_code`, que so existe na primeira. Resultado:
+    zero resultado pra aquela cidade, com o dado todo no banco.
+
+    O casamento aqui usa `(nome normalizado, uf)`, e nao so o nome: a linha da
+    Receita ja tem UF nesse ponto (preenchida do staging, ver
+    `_build_final_table`), e com o par o nome repetido entre estados deixa de
+    ser ambiguo -- que era exatamente o que fazia o merge original desistir.
+
+    Move `receita_code` pra linha do IBGE em vez de mexer em `ibge_code`:
+    `ibge_code` e alvo da FK de `postal_codes`, `receita_code` nao e alvo de
+    nada. A linha antiga fica pra tras sem codigo nenhum (nao da pra apagar: o
+    FK de `establishments.municipality_id` ainda a referencia enquanto as linhas
+    nao forem reapontadas, e depois disso apagar exigiria varrer 72M linhas sem
+    indice pra provar que ninguem mais aponta). Ela e inofensiva: sem
+    `ibge_code` nunca casa no filtro por cidade, e o merge agora ignora quem nao
+    tem `ibge_code`.
+    """
+    rows = db.query(
+        Municipality.id, Municipality.name, Municipality.uf,
+        Municipality.receita_code, Municipality.ibge_code,
+    ).all()
+
+    normalize = municipalities_bootstrap.normalize_name
+    ibge_by_key: dict[tuple[str, int], list[int]] = {}
+    for mid, name, uf, receita_code, ibge_code in rows:
+        if ibge_code is not None and receita_code is None and uf is not None:
+            ibge_by_key.setdefault((normalize(name), uf), []).append(mid)
+
+    pairs: list[tuple[int, int, int, str]] = []  # (origem, destino, receita_code, nome)
+    skipped: list[str] = []
+    for mid, name, uf, receita_code, ibge_code in rows:
+        if receita_code is None or ibge_code is not None:
+            continue  # ja esta consolidada, ou nao e uma linha da Receita
+        if uf is None:
+            skipped.append(f"{name!r} (id={mid}): sem uf, nao da pra desempatar")
+            continue
+        candidates = ibge_by_key.get((normalize(name), uf), [])
+        if len(candidates) == 1:
+            pairs.append((mid, candidates[0], receita_code, name))
+        else:
+            skipped.append(f"{name!r}/{uf} (id={mid}): {len(candidates)} candidatos no IBGE")
+
+    for source_id, target_id, receita_code, name in pairs:
+        # NULL na origem ANTES de gravar no destino -- `receita_code` e unique.
+        db.execute(update(Municipality.__table__).where(
+            Municipality.id == source_id
+        ).values(receita_code=None))
+        db.execute(update(Municipality.__table__).where(
+            Municipality.id == target_id
+        ).values(receita_code=receita_code, name=name))
+    db.commit()
+    logger.info("Municípios consolidados: %d par(es).", len(pairs))
+
+    remapped: dict[str, int] = {}
+    if pairs:
+        # Um UPDATE por tabela, com o mapa inteiro num VALUES. So as linhas das
+        # cidades afetadas sao tocadas -- em `establishment_cnaes`
+        # `municipality_id` e a coluna lider do indice, entao cada `= origem` e
+        # um index scan, nao uma varredura.
+        mapping = ", ".join(f"({s}, {t})" for s, t, _, _ in pairs)
+        for table in ("establishments", "establishment_cnaes"):
+            result = db.execute(text(f"""
+                UPDATE {table} t SET municipality_id = m.target
+                FROM (VALUES {mapping}) AS m(source, target)
+                WHERE t.municipality_id = m.source
+            """))
+            db.commit()
+            remapped[table] = result.rowcount
+            logger.info("  %s: %d linha(s) reapontada(s).", table, result.rowcount)
+
+    for note in skipped:
+        logger.warning("  nao consolidado -- %s", note)
+
+    return {"pairs": len(pairs), "remapped": remapped, "skipped": skipped}
 
 
 def rebuild_cnae_municipalities(db: Session) -> tuple[int, int]:
