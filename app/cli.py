@@ -147,6 +147,42 @@ def import_municipalities_geo_command():
         db.close()
 
 
+@cli.command("backfill-cnae-municipality")
+def backfill_cnae_municipality():
+    """
+    Preenche `establishment_cnaes.municipality_id` a partir de `establishments`,
+    sem reimportar nada.
+
+    Serve pro estado em que a coluna entrou por migration (NULL em toda linha já
+    gravada) e o `import-all` que a preencheria ainda não rodou até o fim. Como
+    a busca entra por essa coluna com INNER JOIN em `municipalities`, enquanto
+    ela está NULL a rota devolve zero pra qualquer filtro -- mesmo com o dado
+    todo lá.
+
+    Não substitui o `import-all`: os CNAEs em si continuam vindo do arquivo da
+    Receita. Isto só recalcula, do que já está no banco, as duas colunas que são
+    cópia de `establishments` (`municipality_id` e `has_cellphone`).
+
+    Reconstrói a tabela e troca por RENAME atômico em vez de dar UPDATE -- num
+    volume desses um UPDATE reescreveria todas as linhas e jogaria a tabela
+    inteira no WAL. Roda `alembic upgrade head` antes.
+    """
+    from app.importer.pipeline import rebuild_cnae_municipalities
+
+    db = SessionLocal()
+    try:
+        rows, orphans = rebuild_cnae_municipalities(db)
+    finally:
+        db.close()
+
+    typer.echo(f"establishment_cnaes: {rows} linha(s) reconstruída(s).")
+    if orphans:
+        typer.echo(
+            f"  {orphans} sem cidade (CNPJ sem linha em `establishments`, ou "
+            f"estabelecimento cujo município da Receita não casou com `municipalities`)."
+        )
+
+
 @cli.command("import-ceps-osm")
 def import_ceps_osm_command():
     """

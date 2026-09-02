@@ -1013,9 +1013,144 @@ def _build_cnaes_table(db: Session, display: ProgressDisplay, slot: int) -> None
         WHERE c.cnae IS NOT NULL
     """))
     db.commit()
+    rows = inserted.rowcount
+
+    # `municipality_id` e a coluna LIDER do unico indice da tabela, e a busca
+    # entra por ela com INNER JOIN em `municipalities` -- se ela vier NULL, a
+    # rota devolve zero pra tudo, com a tabela cheia e sem erro nenhum. Ja
+    # aconteceu (a coluna entrou por migration e ficou NULL ate um import
+    # completo rodar), e custou horas justamente por ser calado. Uma varredura
+    # aqui, na tabela recem-escrita e ainda quente, e barata perto disso.
+    orphans = db.execute(text(
+        "SELECT count(*) FROM establishment_cnaes_new WHERE municipality_id IS NULL"
+    )).scalar_one()
+    if rows and orphans == rows:
+        raise RuntimeError(
+            "establishment_cnaes_new ficou com municipality_id NULL em TODAS as "
+            f"{rows} linhas -- o join com `municipalities` nao casou nada. Sem essa "
+            "coluna a busca devolve zero pra qualquer filtro. Provavel causa: "
+            "`municipalities.receita_code` vazio (a fase 1 do import-all, "
+            "`import-municipalities`, e o Municipios.zip da Receita precisam ter "
+            "rodado antes desta)."
+        )
+
     logger.info(
-        "establishment_cnaes_new: %d linhas em %.1fs", inserted.rowcount, time.monotonic() - t0
+        "establishment_cnaes_new: %d linhas em %.1fs (%d sem cidade).",
+        rows, time.monotonic() - t0, orphans,
     )
+
+
+def rebuild_cnae_municipalities(db: Session) -> tuple[int, int]:
+    """Preenche `establishment_cnaes.municipality_id` a partir de
+    `establishments`, SEM reimportar nada. Devolve (linhas, linhas sem cidade).
+
+    Existe por um caso concreto: `municipality_id` entrou na tabela N:N por
+    migration, ou seja NULL em toda linha ja gravada, e quem preenche e o
+    `_build_cnaes_table` -- que so roda num `import-all` completo. Enquanto ele
+    nao rodava, a busca (que hoje entra por essa coluna, com INNER JOIN em
+    `municipalities`) devolvia zero pra tudo. Isso reconstroi so a tabela N:N a
+    partir do que ja esta no banco: `establishments.municipality_id` ja esta
+    preenchido, e a relacao e 1:1 por `cnpj`.
+
+    Reconstroi + troca em vez de dar UPDATE. Um UPDATE em ~150M linhas reescreve
+    todas elas (MVCC), dobra a tabela em bloat, e joga o equivalente a tabela
+    inteira no WAL -- e essa base ja mostrou o que checkpoint sob carga faz aqui.
+    Um INSERT ... SELECT em tabela UNLOGGED nova, indice depois e RENAME atomico
+    no fim e o mesmo caminho que o import ja usa, e nao deixa bloat.
+
+    Os CNAEs em si (que sao o dado que nao da pra rederivar sem o arquivo da
+    Receita) saem da propria tabela; so `municipality_id` e `has_cellphone` sao
+    recalculados do lado de `establishments`, que e a fonte deles.
+
+    LEFT JOIN de proposito: uma linha cuja empresa nao esta em `establishments`
+    continua existindo, com a cidade NULL -- ela ja era invisivel pra busca, e
+    sumir com ela calada seria pior que mante-la. O retorno diz quantas sao.
+    """
+    missing_column = db.execute(text("""
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'establishment_cnaes' AND column_name = 'uf'
+    """)).first()
+    if missing_column:
+        raise RuntimeError(
+            "`establishment_cnaes` ainda tem a coluna `uf`: rode `alembic upgrade head` "
+            "antes deste comando, senao o swap deixaria a tabela num formato que a "
+            "migration seguinte nao consegue aplicar."
+        )
+
+    t0 = time.monotonic()
+    logger.info("Reconstruindo establishment_cnaes com a cidade de establishments...")
+
+    db.execute(text("DROP TABLE IF EXISTS establishment_cnaes_new"))
+    db.execute(text("""
+        CREATE UNLOGGED TABLE establishment_cnaes_new (
+            cnpj bigint NOT NULL,
+            cnae integer NOT NULL,
+            municipality_id integer,
+            has_cellphone boolean NOT NULL
+        )
+    """))
+    db.execute(text("ALTER TABLE establishment_cnaes_new SET (fillfactor = 100)"))
+    db.commit()
+
+    inserted = db.execute(text("""
+        INSERT INTO establishment_cnaes_new (cnpj, cnae, municipality_id, has_cellphone)
+        SELECT ec.cnpj, ec.cnae, e.municipality_id,
+               coalesce(e.cellphone IS NOT NULL, false)
+        FROM establishment_cnaes ec
+        LEFT JOIN establishments e ON e.cnpj = ec.cnpj
+    """))
+    db.commit()
+    rows = inserted.rowcount
+    logger.info("  %d linhas copiadas em %.1fs", rows, time.monotonic() - t0)
+
+    logger.info("  criando PK e indice (isso e a maior parte do tempo)...")
+    db.execute(text(
+        "ALTER TABLE establishment_cnaes_new "
+        "ADD CONSTRAINT establishment_cnaes_new_pkey PRIMARY KEY (cnpj, cnae)"
+    ))
+    db.commit()
+    for name, cols, where, using in CNAES_DEFERRED_INDEXES:
+        using_sql = f" USING {using}" if using else ""
+        where_sql = f" WHERE {where}" if where else ""
+        db.execute(text(
+            f'CREATE INDEX "{name}_new" ON establishment_cnaes_new{using_sql} {cols}{where_sql}'
+        ))
+        db.commit()
+
+    logger.info("  SET LOGGED (grava no WAL)...")
+    db.execute(text("ALTER TABLE establishment_cnaes_new SET LOGGED"))
+    db.commit()
+
+    orphans = db.execute(text(
+        "SELECT count(*) FROM establishment_cnaes_new WHERE municipality_id IS NULL"
+    )).scalar_one()
+
+    # Swap atomico, o mesmo de _build_final_table: a tabela antiga sai e a nova
+    # entra na mesma transacao, entao nenhuma request ve as duas nem nenhuma.
+    logger.info("  swap atômico...")
+    db.execute(text("DROP TABLE IF EXISTS establishment_cnaes_old"))
+    db.execute(text("ALTER TABLE establishment_cnaes RENAME TO establishment_cnaes_old"))
+    db.execute(text("ALTER TABLE establishment_cnaes_new RENAME TO establishment_cnaes"))
+    # A tabela antiga sai ANTES dos ALTER INDEX -- os indices dela ainda seguram
+    # os nomes canonicos, e renomear por cima colidiria. Mesma ordem de
+    # _build_final_table, pelo mesmo motivo.
+    db.execute(text("DROP TABLE establishment_cnaes_old"))
+    db.execute(text("ALTER INDEX establishment_cnaes_new_pkey RENAME TO establishment_cnaes_pkey"))
+    for name, _cols, _where, _using in CNAES_DEFERRED_INDEXES:
+        db.execute(text(f'ALTER INDEX "{name}_new" RENAME TO "{name}"'))
+    db.commit()
+
+    # Sem estatistica o planner nao sabe nada da tabela recem-trocada, e a
+    # primeira busca pagaria um plano ruim.
+    logger.info("  ANALYZE...")
+    db.execute(text("ANALYZE establishment_cnaes"))
+    db.commit()
+
+    logger.info(
+        "establishment_cnaes reconstruida: %d linhas em %.1fs (%d sem cidade).",
+        rows, time.monotonic() - t0, orphans,
+    )
+    return rows, orphans
 
 
 def _build_final_table(db: Session, progress: Session, period: str, display: ProgressDisplay) -> None:
