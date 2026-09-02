@@ -49,7 +49,6 @@ from app.importer.csv_reader import read_csv
 from app import stats_rollup
 from app.importer.progress import ProgressDisplay, human_bytes, log_through
 from app.importer.rows import GROUP_SPECS, Counters
-from app.regions import CODE_TO_UF
 from app.models import (
     Cnae,
     CompanyStaging,
@@ -864,35 +863,25 @@ def _merge_municipalities_receita(db: Session, rows) -> int:
 # respondia em 0,35s. Indice parcial so vale quando o predicado dele esta
 # SEMPRE no WHERE da query, o que aqui nao acontece.
 DEFERRED_INDEXES = [
-    ("ix_establishments_cellphone", "(cellphone)", "cellphone IS NOT NULL", None),
-    # Filtro por UF. O sufixo de ordenacao e vestigial -- a API ordena sempre
-    # pela PK --, mas o prefixo `(uf)` e o que a busca usa. Substitui o antigo
-    # ix_establishments_uf, que era parcial em `registration_status = 2`.
-    ("ix_establishments_uf_confidence", "(uf, cellphone_confidence DESC, cnpj DESC)", None, None),
-    ("ix_establishments_main_cnae", "(main_cnae)", None, None),
-    ("ix_establishments_registration_status", "(registration_status)", None, None),
+    # So o indice da FK de `cep`. `establishments` deixou de ser ponto de
+    # ENTRADA de busca: a rota entra por `establishment_cnaes` (cidade + CNAE,
+    # ja em ordem de `cnpj`) e chega aqui pela PK, uma linha por resultado da
+    # pagina -- ver models.Establishment. Os indices de `uf`, `main_cnae`,
+    # `registration_status` e os dois GIN de trigrama sairam junto com os
+    # filtros que os usavam (migration b2d5f8a91c04): sao ~72M linhas
+    # reconstruidas a cada import, e indice que ninguem le e so escrita cara.
     ("ix_establishments_cep", "(cep)", "cep IS NOT NULL", None),
-    # Busca por nome (`?name=`) e `ILIKE '%x%'`, que um btree nao consegue
-    # avaliar de jeito nenhum -- e a unica estrutura que serve e um GIN de
-    # trigramas. Sem isso a busca por nome varre a tabela inteira.
-    # `trade_name` e nullable e a maioria das empresas nao tem, entao esse fica
-    # parcial; `company_name` e NOT NULL e nao tem o que podar.
-    ("ix_establishments_company_name_trgm", "(company_name gin_trgm_ops)", None, "gin"),
-    ("ix_establishments_trade_name_trgm", "(trade_name gin_trgm_ops)", "trade_name IS NOT NULL", "gin"),
 ]
 
-# Indices da relacao N:N empresa-CNAE (ver models.EstablishmentCnae). Mesma
+# Indice da relacao N:N empresa-CNAE (ver models.EstablishmentCnae). Mesma
 # logica de adiar: a tabela e maior que `establishments` (uma linha por CNAE da
-# empresa, nao por empresa) e cria os indices depois do bulk load.
+# empresa, nao por empresa) e cria o indice depois do bulk load.
 CNAES_DEFERRED_INDEXES = [
-    ("ix_establishment_cnaes_cnae_uf_cnpj", "(cnae, uf, cnpj)", None, None),
-    # CNAE + cidade num indice so -- ver o comentario em models.EstablishmentCnae.
-    ("ix_establishment_cnaes_cnae_municipality_cnpj", "(cnae, municipality_id, cnpj)", None, None),
-    # Parcial pra `only_with_cellphone=true`, que e o default da API. Aqui o
-    # predicado parcial e seguro (ao contrario do caso de `registration_status`
-    # comentado acima): quando o cliente manda `false`, o filtro sai do WHERE,
-    # o Postgres descarta este indice e cai no de cima, que cobre tudo.
-    ("ix_establishment_cnaes_cellphone", "(cnae, uf, cnpj)", "has_cellphone", None),
+    # UM indice, e ele e a busca inteira: `municipality_id` lider porque toda
+    # busca entra por lugar (cidade `= id`, ou estado -> `IN (as cidades da
+    # UF)`), `cnae` como segundo predicado de igualdade, `cnpj` no fim pra
+    # saida sair ordenada dentro de cada cidade.
+    ("ix_establishment_cnaes_municipality_cnae_cnpj", "(municipality_id, cnae, cnpj)", None, None),
 ]
 
 PARTNERS_DEFERRED_INDEXES = [
@@ -980,6 +969,12 @@ def _build_cnaes_table(db: Session, display: ProgressDisplay, slot: int) -> None
     array e NULL (nao vazio) quando nao ha secundario nenhum, e `main_cnae`
     NULL cai no WHERE.
 
+    Sem `uf` nem `is_main`. A UF sai de `municipalities` no join da busca (a
+    tabela tem ~5.570 linhas -- e um hash), e "e secundario?" e `cnae <>
+    establishments.main_cnae`, que a serializacao ja resolve. Guardar as duas
+    aqui era copia sem leitor depois que a busca passou a entrar por
+    `municipality_id` -- ver models.EstablishmentCnae.
+
     UNLOGGED e sem indice nenhum durante o load, igual `establishments_new`:
     PK e indices vem depois, em `_finalize_cnaes`.
     """
@@ -991,8 +986,6 @@ def _build_cnaes_table(db: Session, display: ProgressDisplay, slot: int) -> None
             cnpj bigint NOT NULL,
             cnae integer NOT NULL,
             municipality_id integer,
-            uf smallint,
-            is_main boolean NOT NULL,
             has_cellphone boolean NOT NULL
         )
     """))
@@ -1001,8 +994,8 @@ def _build_cnaes_table(db: Session, display: ProgressDisplay, slot: int) -> None
 
     inserted = db.execute(text("""
         INSERT INTO establishment_cnaes_new
-            (cnpj, cnae, municipality_id, uf, is_main, has_cellphone)
-        SELECT s.cnpj, c.cnae, m.id, s.uf, c.is_main, s.cellphone IS NOT NULL
+            (cnpj, cnae, municipality_id, has_cellphone)
+        SELECT s.cnpj, c.cnae, m.id, s.cellphone IS NOT NULL
         FROM establishments_staging s
         -- Mesmo join de `_build_final_table`: o staging so tem o codigo da
         -- Receita, e a copia aqui precisa ser o MESMO `municipality_id` que
@@ -1010,12 +1003,12 @@ def _build_cnaes_table(db: Session, display: ProgressDisplay, slot: int) -> None
         -- as duas tabelas. `municipalities` tem ~5.570 linhas -- hash join.
         LEFT JOIN municipalities m ON m.receita_code = s.municipality_code
         CROSS JOIN LATERAL (
-            SELECT s.main_cnae AS cnae, true AS is_main
+            SELECT s.main_cnae AS cnae
             UNION ALL
             SELECT DISTINCT unnest(array_remove(
                 coalesce(s.secondary_cnaes, '{}'::integer[]),
                 s.main_cnae
-            )), false
+            ))
         ) c
         WHERE c.cnae IS NOT NULL
     """))
@@ -1217,18 +1210,27 @@ def _build_final_table(db: Session, progress: Session, period: str, display: Pro
     # nao casa nada.
     _set_step(progress, "build", period=period, group="build", status="running", message="preenchendo UF dos municípios")
     display.set(slot, "  build: preenchendo UF dos municípios")
-    # `municipalities.uf` continua em texto (e a sigla que a API expoe, e a tabela
-    # tem ~5,5k linhas), enquanto o staging guarda o codigo numerico -- dai o
-    # join contra a lista de codigos, montada do mapa de app/regions.py pra nao
-    # duplicar a tabela de siglas em SQL.
-    uf_values = ", ".join(f"({code}, '{abbr}')" for code, abbr in sorted(CODE_TO_UF.items()))
-    db.execute(text(f"""
-        UPDATE municipalities m SET uf = codes.abbr
+    # `municipalities.uf` e SMALLINT com o MESMO codigo do staging (o de
+    # app/regions.py, ver a migration b2d5f8a91c04) -- entao a UF vai direto,
+    # sem o join contra a tabela de siglas que existia aqui enquanto a coluna
+    # era texto.
+    db.execute(text("""
+        UPDATE municipalities m SET uf = v.uf
         FROM (SELECT DISTINCT ON (municipality_code) municipality_code, uf
               FROM establishments_staging
               WHERE municipality_code IS NOT NULL AND uf IS NOT NULL) v
-        JOIN (VALUES {uf_values}) AS codes(code, abbr) ON codes.code = v.uf
-        WHERE v.municipality_code = m.receita_code AND m.uf IS DISTINCT FROM codes.abbr
+        WHERE v.municipality_code = m.receita_code AND m.uf IS DISTINCT FROM v.uf
+    """))
+    db.commit()
+
+    # Pais do municipio. A base so tem municipio brasileiro, entao e a mesma
+    # linha de `countries` pra todos -- 105 e o codigo do Brasil na tabela de
+    # referencia da Receita, importada no grupo "reference" desta mesma fase.
+    # Idempotente e best-effort: sem a referencia importada, fica NULL.
+    db.execute(text("""
+        UPDATE municipalities m SET country_id = c.id
+        FROM countries c
+        WHERE btrim(c.code) = '105' AND m.country_id IS DISTINCT FROM c.id
     """))
     db.commit()
 

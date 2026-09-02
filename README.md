@@ -383,16 +383,29 @@ Full interactive docs (Swagger) at `/docs`.
 
 ### Pagination
 
-`/establishments`, `/partners/search` and `/addresses/search` paginate by **cursor**, not page number:
+`/partners/search` and `/addresses/search` paginate by **cursor**, not page number:
 
 ```
-GET /establishments?uf=PR&limit=25
+GET /partners/search?name=SILVA&limit=25
 { "data": [...], "next_cursor": "eyJ2IjoxLCJrIjpb...", "limit": 25 }
 
-GET /establishments?uf=PR&limit=25&cursor=eyJ2IjoxLCJrIjpb...
+GET /partners/search?name=SILVA&limit=25&cursor=eyJ2IjoxLCJrIjpb...
 ```
 
 Keep following `next_cursor` until it comes back `null` — that's the last page.
+
+`/establishments` is the exception: it paginates by **`offset`/`limit`**.
+
+```
+GET /establishments?uf=PR&limit=25
+{ "data": [...], "offset": 0, "limit": 25, "has_more": true }
+
+GET /establishments?uf=PR&limit=25&offset=25
+```
+
+It can afford `OFFSET` precisely because it *requires* a geographic slice (a city or a state),
+which caps how many rows exist to skip over — a few thousand, not tens of millions. `has_more`
+comes free by reading one row past the `limit`; there's still no `total`.
 
 There is deliberately **no `total` and no page count**. Producing them means running a
 `count()` over the whole result set on every request, which on a 70M+ row table costs the
@@ -403,12 +416,19 @@ produce and throw away 50 000 rows, while a cursor is an index seek.
 The trade-off is that you can only move forward one page at a time — no jumping to an
 arbitrary page, and no "page 3 of 812".
 
-**Results always come back in primary-key order, and that isn't configurable.** These endpoints
-used to accept `sort_by`/`sort_dir`; those are gone. Ordering by a non-key column forces the
-database to order the entire filtered result before it can cut the page — to know which company
-in Paraná has the highest `cellphone_confidence`, it has to look at every company in Paraná, and
-no `limit` saves you from that. Ordering by the primary key is free: the page comes out of a
-contiguous stretch of an index that already exists.
+**No endpoint lets you choose the ordering.** They used to accept `sort_by`/`sort_dir`; those are
+gone. Ordering by a non-key column forces the database to order the entire filtered result before
+it can cut the page — to know which company in Paraná has the highest `cellphone_confidence`, it
+has to look at every company in Paraná, and no `limit` saves you from that.
+
+The cursor endpoints order by primary key, which is free: the page comes out of a contiguous
+stretch of an index that already exists. `/establishments` issues **no `ORDER BY` at all** — rows
+arrive in whatever order the `(municipality_id, cnae, cnpj)` index hands them over, which for a
+single city and a single CNAE is already `cnpj` order. Be aware of what that costs: without an
+`ORDER BY`, the database guarantees no ordering, so a changed plan between two requests can make
+a page repeat or skip rows. What holds it stable here is a property of this database — the search
+tables are never written in place, only replaced wholesale by an atomic `RENAME` at the end of an
+import — so within one snapshot the same query keeps the same plan and the same order.
 
 The one exception is `/addresses`: passing `lat`+`lon` (and `/addresses/nearby`) sorts by
 distance, because "nearest first" is the entire point of those. They pay for it, so use them
@@ -424,17 +444,26 @@ the planner would walk the primary key filtering row by row, which on a selectiv
 (`?cnae_codes=6202300&uf=RS&only_with_cellphone=true`) means reading all 63M rows — a timeout.
 
 The relation now lives in its own table, `establishment_cnaes`: one row per (company, CNAE),
-with `is_main` marking the main one. The filter becomes plain equality on one column, and an
-index ending in `cnpj` hands back the page already in order, so `LIMIT` stops early instead of
-sorting the whole filtered set. `establishments.main_cnae` stays — it's a dimension of the
-stats aggregate and appears in every response.
+main and secondary alike. The filter becomes plain equality on one column.
+`establishments.main_cnae` stays — it's a dimension of the stats aggregate, it appears in every
+response, and it's what tells main from secondary on the way out (a row whose `cnae` differs
+from it *is* a secondary one), so no `is_main` flag is stored across tens of millions of rows.
 
-That table also carries **copies** of `uf` and a `has_cellphone` flag, and the search pushes
-those two filters into it. Without them the database would find candidates by CNAE and then
-probe the 63M-row table one by one to discover which are in Rio Grande do Sul and have a
-cellphone; with them, filter *and* order come out of a single index. Duplicating a column is
-normally a maintenance liability, but no update is possible here: both tables are rebuilt from
-scratch by the import and swapped in the *same* atomic `RENAME`.
+**That table is the entry point of every search** — `establishments` is the side pulled by
+primary key afterwards, one row per result on the page, not the side scanned. It carries a
+**copy** of `municipality_id` and a `has_cellphone` flag, and the search pushes both into it,
+so a single index `(municipality_id, cnae, cnpj)` answers place *and* activity from one
+contiguous range. State searches join `municipalities` (~5,570 rows, a hash) rather than
+keeping a second copy of `uf` here.
+
+Getting this backwards is what caused a real production timeout: the query used to start from
+`establishments` with `cnpj IN (subquery)` and the city filter repeated in the outer `WHERE`.
+With `ORDER BY cnpj LIMIT 25` and no index on `establishments.municipality_id`, the planner
+walked the primary key in *nationwide* `cnpj` order, filtering row by row until it collected 25
+from one city — tens of millions of rows to return 25.
+
+Duplicating a column is normally a maintenance liability, but no update is possible here: both
+tables are rebuilt from scratch by the import and swapped in the *same* atomic `RENAME`.
 
 Passing several codes matches companies having **at least one** of them. There used to be a
 `cnae_match=all` ("has all of these") — it's gone: intersection can't be answered by merging
@@ -460,9 +489,9 @@ secondary CNAEs would undercount by 39%. A company appears in one bucket per dis
 has, so buckets can't be summed *across* CNAEs; within a single CNAE the sum is exact, and
 that's the only way it's used — **one CNAE per request**. Several CNAEs at once fall back.
 
-Requests using a filter neither aggregate carries — `name`, `opened_after`/`opened_before`,
-`municipality_codes`, `has_phone`, several CNAEs, or a CNAE together with `include_breakdowns` —
-fall back to the full table rather than return a fast wrong number, and can be slow.
+Requests using a filter neither aggregate carries — a city (`municipality_code`: the aggregates
+stop at state level), several CNAEs, or a CNAE together with `include_breakdowns` — fall back to
+the full table rather than return a fast wrong number, and can be slow.
 
 ### Text search
 
@@ -479,9 +508,9 @@ arbitrary slice.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/establishments` | Search companies. Filters: `cnae_codes` (matches the main CNAE or any secondary one; with several codes, matches companies having at least one of them), `uf`, `region`, `municipality_codes`, `company_size`, `is_mei`, `is_simples`, `is_headquarters`, `name`, `status` (registration status, code or label — includes all statuses unless filtered), `has_phone`, `only_with_cellphone`, `only_with_email`, `opened_after`/`opened_before`; paginated by cursor via `cursor`/`limit` (see [Pagination](#pagination)). Results include CNAE, legal-nature, and deregistration-reason descriptions, plus human-readable labels for company size and registration status. |
+| `GET` | `/establishments` | Search companies. **Exactly one geographic slice is required**: `uf` (state abbreviation) *or* `municipality_code` (7-digit IBGE code) — never both, never neither, because it's what lets the search enter the index instead of scanning the table. Other filters: `cnae_codes` (matches the main CNAE or any secondary one; with several codes, matches companies having at least one of them), `is_mei`, `is_simples`, `is_headquarters`, `only_with_cellphone` (default `true`), `only_with_email`; paginated via `offset`/`limit`, with `has_more` in the response (see [Pagination](#pagination)). Results include CNAE, legal-nature, and deregistration-reason descriptions, plus human-readable labels for company size and registration status. |
 | `GET` | `/establishments/by-cnpj` | Look up specific companies by CNPJ (`cnpjs=...`, repeatable). Accepts punctuation, a full CNPJ, or just the 8-position root. |
-| `GET` | `/establishments/stats` | Totals and breakdowns over the same filters as `/establishments`. Answered from a precomputed aggregate table rebuilt by the import, so it doesn't scan the 70M-row table at request time. Filters the aggregate doesn't carry (`name`, `opened_after`/`opened_before`, `municipality_codes`, `cnae_codes`, `only_with_cellphone`/`only_with_email`, `has_phone`) fall back to the full table and can be slow — for those, `include_breakdowns=true` is what makes it expensive. |
+| `GET` | `/establishments/stats` | Totals and breakdowns over the same filters as `/establishments`. Answered from a precomputed aggregate table rebuilt by the import, so it doesn't scan the 70M-row table at request time. Filters the aggregate doesn't carry (`municipality_code`, several `cnae_codes`) fall back to the full table and can be slow — for those, `include_breakdowns=true` is what makes it expensive. |
 | `GET` | `/cnaes/search-by-description` | Search CNAE codes by description (`words=...`, repeatable). |
 | `GET` | `/cnaes/codes` | List all CNAE codes. |
 | `GET` | `/municipalities/search` | Search municipalities by `name`, `uf`, and/or `region`. Includes `population` and `area_km2` once `import-ibge` has run. |

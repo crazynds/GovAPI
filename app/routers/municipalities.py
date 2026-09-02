@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.models import Municipality
-from app.regions import UF_TO_REGION, ufs_for_region
+from app.regions import UF_TO_REGION, uf_code, uf_name, ufs_for_region
 
 router = APIRouter(prefix="/municipalities", tags=["municipalities"])
 
@@ -24,8 +24,10 @@ def _serialize(m: Municipality) -> dict:
         # app.importer.pipeline._merge_municipalities_receita.
         "receita_code": f"{m.receita_code:0{RECEITA_CODE_WIDTH}d}" if m.receita_code is not None else None,
         "name": m.name,
-        "uf": m.uf,
-        "region": UF_TO_REGION.get(m.uf) if m.uf else None,
+        # A coluna e SMALLINT (o codigo de app/regions.py, o mesmo de
+        # `establishments.uf`); a API continua expondo a sigla, como sempre.
+        "uf": uf_name(m.uf),
+        "region": UF_TO_REGION.get(uf_name(m.uf)) if m.uf is not None else None,
         "ibge_code": f"{m.ibge_code:0{IBGE_CODE_WIDTH}d}" if m.ibge_code is not None else None,
         "population": m.population,
         "area_km2": float(m.area_km2) if m.area_km2 is not None else None,
@@ -52,7 +54,14 @@ def search(
             raise HTTPException(422, f"Região desconhecida: {region!r} (use norte/nordeste/centro-oeste/sudeste/sul)")
         ufs |= set(region_ufs)
     if ufs:
-        query = query.filter(Municipality.uf.in_(ufs))
+        # Traduz a sigla pro codigo numerico ANTES da query: comparar contra a
+        # coluna e igualdade em SMALLINT, e castar a coluna pra texto aqui
+        # descartaria o indice `(uf, ibge_code)`.
+        codes = [uf_code(u) for u in ufs]
+        unknown = sorted(u for u, c in zip(ufs, codes) if c is None)
+        if unknown:
+            raise HTTPException(422, f"UF desconhecida: {unknown}")
+        query = query.filter(Municipality.uf.in_(codes))
 
     # Ordena pela PK, como todo o resto da API -- ordenar por `name` faria o
     # banco ordenar o resultado filtrado antes de cortar o `limit`.

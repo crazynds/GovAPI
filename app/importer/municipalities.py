@@ -21,6 +21,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.models import Municipality
+from app.regions import uf_code
 
 logger = logging.getLogger("importer")
 
@@ -54,7 +55,9 @@ def import_municipalities(db: Session) -> int:
 
     count = 0
     for item in data:
-        uf = _extract_uf(item)
+        # `municipalities.uf` e SMALLINT (o codigo de app/regions.py); o IBGE
+        # devolve a sigla, entao a traducao acontece aqui, na entrada.
+        uf = uf_code(_extract_uf(item))
         # Nome em maiuscula, pra bater com a convencao que o Municipios.zip da
         # Receita ja usa (esse import roda depois e sobrescreve `name` de
         # qualquer forma quando casa, mas ate la o nome fica no mesmo padrao).

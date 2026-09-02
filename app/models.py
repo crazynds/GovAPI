@@ -37,11 +37,27 @@ class Municipality(Base):
     """
 
     __tablename__ = "municipalities"
+    __table_args__ = (
+        # Os dois caminhos de entrada da busca: por cidade (`ibge_code`) e por
+        # estado (`uf`, que vira a lista de `municipalities.id` daquela UF --
+        # ver o filtro em app/routers/establishments.py). Com `uf` na frente o
+        # mesmo indice serve aos dois: `(uf, ibge_code)` responde a UF inteira,
+        # e `ibge_code` sozinho ja tem o unique que a FK de postal_codes exige.
+        Index("ix_municipalities_uf_ibge_code", "uf", "ibge_code"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     receita_code: Mapped[int | None] = mapped_column(Integer, unique=True, index=True, nullable=True)
     name: Mapped[str] = mapped_column(String(120))
-    uf: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    # SMALLINT com o codigo de app/regions.py -- o MESMO de `establishments.uf`.
+    # Era varchar(2); virou numero pra caber no indice acima sem carregar o
+    # comprimento de um texto por linha, e pra comparar com o resto do schema
+    # sem cast (cast na coluna descartaria o indice).
+    uf: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    # Base so tem municipio brasileiro, entao isso e a mesma linha pra todos --
+    # existe pra fechar a hierarquia (pais -> UF -> municipio) sem repetir o
+    # nome do pais em ~5.570 linhas.
+    country_id: Mapped[int | None] = mapped_column(ForeignKey("countries.id"), nullable=True)
     # Integer (nao String) pra poder ser alvo de FOREIGN KEY de
     # postal_codes.municipality_ibge_code, que ja e Integer -- Postgres nao aceita
     # FK entre tipos diferentes. unique=True pela mesma razao: FK exige indice
@@ -122,26 +138,18 @@ class Establishment(Base):
 
     __tablename__ = "establishments"
     __table_args__ = (
-        # Parcial so onde o predicado esta SEMPRE no WHERE da query. `uf` e
-        # `main_cnae` ja foram parciais em `registration_status = 2` e isso
-        # quebrou a busca: o filtro de situacao e opcional na API, e sem ele no
-        # WHERE o Postgres descarta o indice e cai em seq scan sobre 72M linhas
-        # (ver DEFERRED_INDEXES em app/importer/pipeline.py).
-        Index("ix_establishments_cellphone", "cellphone", postgresql_where=text("cellphone IS NOT NULL")),
-        # O que serve o filtro por UF. O sufixo de ordenacao e vestigial (a API
-        # so ordena pela PK), mas o prefixo `(uf)` e o que importa e refazer o
-        # indice so pra encurtar nao paga.
-        Index("ix_establishments_uf_confidence", "uf", text("cellphone_confidence DESC"), text("cnpj DESC")),
-        Index("ix_establishments_main_cnae", "main_cnae"),
-        Index("ix_establishments_registration_status", "registration_status"),
+        # SO indice de FK aqui, mais a PK. Esta tabela nao e mais ponto de
+        # ENTRADA de busca nenhuma: a busca entra por `establishment_cnaes`
+        # (cidade + CNAE, ja ordenada por `cnpj`) e chega aqui pela PK, uma
+        # linha por resultado da pagina. Os filtros que sobraram na rota
+        # (is_mei, is_simples, is_headquarters, celular/email) sao rechecagem
+        # por linha sobre essas ~25, e indice pra isso nao serve pra nada.
+        #
+        # Os indices de `uf`, `main_cnae`, `registration_status` e os dois GIN
+        # de trigrama foram removidos junto com os filtros que os usavam (ver
+        # a migration b2d5f8a91c04). Sao ~72M linhas reconstruidas a cada
+        # import: indice que ninguem le e so custo de escrita.
         Index("ix_establishments_cep", "cep", postgresql_where=text("cep IS NOT NULL")),
-        # `?name=` e ILIKE '%x%', que btree nenhum avalia -- so um GIN de
-        # trigramas serve. Sem isso a busca por nome varre a tabela inteira.
-        Index("ix_establishments_company_name_trgm", "company_name",
-              postgresql_using="gin", postgresql_ops={"company_name": "gin_trgm_ops"}),
-        Index("ix_establishments_trade_name_trgm", "trade_name",
-              postgresql_using="gin", postgresql_ops={"trade_name": "gin_trgm_ops"},
-              postgresql_where=text("trade_name IS NOT NULL")),
     )
     # fillfactor = 100 (sem UPDATE depois do bulk load, nao faz sentido
     # reservar espaco livre por pagina pra HOT update) e aplicado por SQL na
@@ -204,66 +212,62 @@ class EstablishmentCnae(Base):
     """Relacao N:N entre estabelecimento e CNAE -- uma linha por (empresa, CNAE).
 
     Substitui o par `main_cnae` + `secondary_cnaes` (array) como CAMINHO DE
-    BUSCA. `establishments.main_cnae` continua existindo, porque e dimensao do
-    agregado de /stats e sai em toda resposta; o array de secundarios saiu, e o
-    conteudo dele agora vive aqui, uma linha por codigo, com `is_main`
-    distinguindo o principal.
+    BUSCA, e e por onde TODA busca entra -- `establishments` virou o lado
+    puxado pela PK, nao o lado varrido (ver _apply_filters no router).
+    `establishments.main_cnae` continua existindo, porque e dimensao do
+    agregado de /stats e sai em toda resposta.
 
-    RegistrationStatusReason: o filtro `?cnae_codes=` era `main_cnae = X OR secondary_cnaes && [X]`,
+    O filtro `?cnae_codes=` era `main_cnae = X OR secondary_cnaes && [X]`,
     um OR entre um btree e um GIN que nao produz saida ordenada por `cnpj`.
     Com `ORDER BY cnpj LIMIT n` o planner ou ordenava o conjunto filtrado
     inteiro, ou (o que ele escolhia) varria a PK linha a linha filtrando --
     a tabela toda, ~63M linhas, e timeout. Aqui o mesmo filtro e igualdade
-    numa coluna so, e um indice terminado em `cnpj` entrega a pagina em ordem
-    sem ordenar nada.
+    numa coluna so.
 
-    `uf`, `municipality_id` e `has_cellphone` sao COPIAS de `establishments` --
-    de proposito. Sem elas o banco acha os candidatos por CNAE aqui e precisa
-    sondar a PK da tabela grande um por um pra descobrir quem e do RS e tem
-    celular; num recorte seletivo isso e o gargalo de volta. Pior no caso da
-    cidade: com `municipality_id` so na tabela grande, CNAE + municipio vira um
-    BitmapAnd entre dois indices, que monta os dois bitmaps inteiros antes da
-    primeira linha e perde a ordem por `cnpj`. Com as copias aqui, filtro e
-    ordem saem de um indice unico, sem tocar em `establishments`.
+    `municipality_id` e `has_cellphone` sao COPIAS de `establishments`, de
+    proposito: sao os dois predicados que precisam estar DESTE lado pra faixa
+    do indice ja sair filtrada. `municipality_id` e a coluna lider do indice --
+    e o que garante que a busca comece por uma faixa da cidade em vez de varrer
+    a PK da tabela grande em ordem de `cnpj` nacional, que era o timeout real.
+
+    NAO ha copia de `uf`: o estado sai do join com `municipalities` (~5.570
+    linhas, um hash), que vira uma faixa por municipio no mesmo indice.
+    Tambem nao ha `is_main`: a PK garante uma linha por CNAE DISTINTO, entao
+    "e secundario" e `cnae <> establishments.main_cnae` -- deduzir na
+    serializacao das ~25 linhas da pagina sai mais barato que um booleano em
+    dezenas de milhoes de linhas.
 
     Duplicar coluna normalmente e divida de manutencao, mas aqui nao ha update
     possivel: as duas tabelas sao reconstruidas do zero a cada import e
-    trocadas no MESMO RENAME atomico (ver _build_final_table). Sao esses tres
-    filtros copiados porque sao os que aparecem em praticamente toda busca --
-    os outros (porte, situacao, MEI, data) continuam sendo resolvidos no join.
+    trocadas no MESMO RENAME atomico (ver _build_final_table).
 
     Sem FOREIGN KEY pra `establishments`: as duas trocam de nome no mesmo swap,
     e uma FK entre elas so criaria ordem obrigatoria no RENAME em troca de
     garantia nenhuma (ambas saem do mesmo INSERT, do mesmo snapshot).
 
     Ordem das colunas pelo mesmo motivo de `Establishment`: largura fixa
-    decrescente, 20 bytes de parte fixa sem padding.
+    decrescente, sem padding de alinhamento.
     """
 
     __tablename__ = "establishment_cnaes"
     __table_args__ = (
-        # O indice da busca. `cnae` primeiro porque e sempre igualdade e e o
-        # que define a consulta; `uf` em seguida porque e o filtro mais comum
-        # depois dele; `cnpj` no fim pra saida ja sair na ordem do ORDER BY --
-        # e isso que faz o LIMIT parar cedo em vez de ordenar o conjunto todo.
-        Index("ix_establishment_cnaes_cnae_uf_cnpj", "cnae", "uf", "cnpj"),
-        # O mesmo, mas pro recorte por cidade. Existe pra que o filtro
-        # CNAE + municipio saia de UM indice so: com indices separados
-        # (`cnae` aqui, `municipality_id` em `establishments`) o Postgres
-        # intersecta os dois num BitmapAnd, que precisa montar os dois bitmaps
-        # INTEIROS antes de emitir a primeira linha e devolve o resultado em
-        # ordem de pagina fisica -- ou seja, o LIMIT deixa de cortar cedo e o
-        # Sort volta. Com as duas colunas no mesmo indice e igualdade nas duas,
-        # `cnpj` ja sai ordenado e a pagina para na 25a linha.
-        Index("ix_establishment_cnaes_cnae_municipality_cnpj", "cnae", "municipality_id", "cnpj"),
-        # Mesma coisa, podado pra quem tem celular -- o default da API e
-        # `only_with_cellphone=true`. Parcial e seguro aqui (ao contrario do
-        # que aconteceu com `registration_status = 2`, ver DEFERRED_INDEXES):
-        # quando o cliente manda `only_with_cellphone=false` o predicado sai do
-        # WHERE, o Postgres descarta este indice e usa o de cima, que cobre
-        # todas as linhas.
-        Index("ix_establishment_cnaes_cellphone", "cnae", "uf", "cnpj",
-              postgresql_where=text("has_cellphone")),
+        # UM indice, e ele e a busca inteira.
+        #
+        # `municipality_id` na frente porque toda busca entra por lugar: ou uma
+        # cidade (`= id`), ou um estado -- que a rota resolve pra
+        # `municipality_id IN (as cidades da UF)`, tambem igualdade na coluna
+        # lider. `cnae` em seguida, o outro predicado de igualdade. `cnpj` no
+        # fim mantem a saida ja ordenada DENTRO de cada cidade, que e o que o
+        # `ORDER BY cnpj LIMIT` da paginacao consome.
+        #
+        # O que isso custa, explicito: numa busca por estado o Postgres varre
+        # uma faixa por municipio e precisa ordenar antes do LIMIT -- nao ha
+        # mais um indice que entregue a UF inteira ja em ordem de `cnpj`. O
+        # custo passa a ser proporcional as linhas que casam (o resultado),
+        # nao mais a tabela toda; e a tabela toda era o caso real que dava
+        # timeout, quando o filtro de cidade ficava fora do indice e a pagina
+        # saia varrendo a PK de `establishments` em ordem de `cnpj` nacional.
+        Index("ix_establishment_cnaes_municipality_cnae_cnpj", "municipality_id", "cnae", "cnpj"),
     )
 
     # (cnpj, cnae) e a chave natural e serve as duas coisas: garante que nao ha
@@ -272,12 +276,11 @@ class EstablishmentCnae(Base):
     # que e como a serializacao remonta o que era o array.
     cnpj: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     cnae: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
-    # Copia de `establishments.municipality_id`, pelo mesmo motivo que `uf`
-    # (ver o docstring). Vem logo depois de `cnae` porque as duas sao de 4
-    # bytes: a parte fixa vai de 16 pra 20 bytes, sem padding novo.
+    # Copia de `establishments.municipality_id` -- a coluna LIDER do indice, e
+    # a razao de a busca conseguir entrar por aqui (ver o docstring). Vem logo
+    # depois de `cnae` porque as duas sao de 4 bytes: a parte fixa fecha em 16
+    # bytes, sem padding.
     municipality_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    uf: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
-    is_main: Mapped[bool] = mapped_column(Boolean)
     has_cellphone: Mapped[bool] = mapped_column(Boolean)
 
 

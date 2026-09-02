@@ -101,7 +101,27 @@ class PartnerPageOut(CursorPage):
     data: list[PartnerOut]
 
 
-class EstablishmentPage(CursorPage):
+class OffsetPage(BaseModel):
+    """Pagina de uma busca paginada por `offset`/`limit`.
+
+    So /establishments usa esta forma. Ela cabe ali porque a busca exige um
+    recorte geografico (cidade ou estado), e isso limita o conjunto a percorrer
+    -- o `OFFSET` faz o banco produzir e descartar `offset` linhas, o que e
+    barato sobre alguns milhares e nao seria sobre dezenas de milhoes. As
+    outras buscas continuam por cursor (`CursorPage`), onde o conjunto nao tem
+    esse teto.
+
+    Continua sem `total`/`last_page`, pelo mesmo motivo de sempre: contar exige
+    varrer o resultado inteiro. `has_more` responde a unica pergunta que a
+    paginacao precisa -- e sai de graca, lendo uma linha a mais que o `limit`.
+    """
+
+    offset: int
+    limit: int
+    has_more: bool
+
+
+class EstablishmentPage(OffsetPage):
     data: list[EstablishmentOut]
 
 

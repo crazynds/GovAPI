@@ -6,10 +6,8 @@ formatos publicos acontece toda aqui: `_serialize` na saida, `_apply_filters`
 na entrada. O contrato da API e o mesmo de quando as colunas eram texto.
 """
 
-from datetime import date
-
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, or_, select
+from sqlalchemy import func
 from sqlalchemy.orm import Query as ORMQuery, Session
 
 from sqlalchemy import text
@@ -27,8 +25,7 @@ from app.models import (
     Municipality,
     LegalNature,
 )
-from app.regions import UF_TO_REGION, uf_code, uf_name, ufs_for_region
-from app.pagination import SortKey, make_fingerprint, paginate
+from app.regions import UF_TO_REGION, uf_code, uf_name
 from app.schemas import AddressOut, EstablishmentOut, EstablishmentPage, EstablishmentStatsOut
 
 router = APIRouter(prefix="/establishments", tags=["establishments"])
@@ -52,26 +49,11 @@ STATUS_LABELS = {
     4: "inapta",
     8: "baixada",
 }
-STATUS_CODES_BY_LABEL = {label: code for code, label in STATUS_LABELS.items()}
 
 
 def _code(value: int | None, width: int = 2) -> str | None:
     """Codigo numerico -> a string com zero a esquerda que a API sempre expos."""
     return f"{value:0{width}d}" if value is not None else None
-
-
-def _resolve_status_codes(values: list[str]) -> list[int]:
-    """Aceita label ("ativa") ou codigo ("02"/"2"), devolve o inteiro do banco."""
-    codes = []
-    for raw in values:
-        value = raw.strip().lower()
-        if value in STATUS_CODES_BY_LABEL:
-            codes.append(STATUS_CODES_BY_LABEL[value])
-        elif value.isdigit():
-            codes.append(int(value))
-        else:
-            raise HTTPException(422, f"Situação cadastral desconhecida: {raw!r}")
-    return codes
 
 
 def _cnae_codes_to_int(values: list[str]) -> list[int]:
@@ -156,24 +138,32 @@ def _code_descriptions(db: Session, model, codes: set[int], width: int) -> dict[
     return {as_text[code]: description for code, description in rows if code in as_text}
 
 
-def _secondary_cnaes(db: Session, cnpjs: set[int]) -> dict[int, list[int]]:
+def _secondary_cnaes(db: Session, items: list[Establishment]) -> dict[int, list[int]]:
     """Os CNAEs secundarios das empresas da pagina, numa query so.
 
     Era uma coluna `integer[]` em `establishments`; virou linha em
     `establishment_cnaes` pra busca poder indexar (ver models.EstablishmentCnae).
     A leitura ficou uma query a mais por pagina, resolvida pelo prefixo `cnpj`
     da PK da tabela N:N sobre as ~25 empresas da resposta.
+
+    "Secundario" e deduzido comparando com `establishments.main_cnae`, e nao lido
+    de uma coluna `is_main`: a tabela N:N tem uma linha por CNAE DISTINTO da
+    empresa (a PK garante), entao "todos menos o principal" e exatamente o que
+    a coluna dizia -- sem guardar um booleano em dezenas de milhoes de linhas.
     """
-    if not cnpjs:
+    if not items:
         return {}
 
+    main_by_cnpj = {e.cnpj: e.main_cnae for e in items}
     rows = (
         db.query(EstablishmentCnae.cnpj, EstablishmentCnae.cnae)
-        .filter(EstablishmentCnae.cnpj.in_(cnpjs), EstablishmentCnae.is_main.is_(False))
+        .filter(EstablishmentCnae.cnpj.in_(main_by_cnpj))
         .all()
     )
     grouped: dict[int, list[int]] = {}
     for cnpj, cnae in rows:
+        if cnae == main_by_cnpj.get(cnpj):
+            continue
         grouped.setdefault(cnpj, []).append(cnae)
     # Ordem estavel na resposta: a tabela nao garante nenhuma, e o array antigo
     # saia na ordem do arquivo da Receita.
@@ -234,7 +224,7 @@ def _e164(national: int | None) -> str | None:
 
 
 def _serialize_many(db: Session, items: list[Establishment]) -> list[EstablishmentOut]:
-    secondary = _secondary_cnaes(db, {e.cnpj for e in items})
+    secondary = _secondary_cnaes(db, items)
 
     cnae_codes: set[int] = set()
     legal_nature_codes: set[int] = set()
@@ -258,120 +248,114 @@ def _serialize_many(db: Session, items: list[Establishment]) -> list[Establishme
     ]
 
 
+def _resolve_place(uf: str | None, municipality_code: str | None) -> tuple[str, int]:
+    """Valida o recorte geografico e devolve (tipo, valor ja em numero).
+
+    Exatamente um dos dois, nunca nenhum e nunca os dois.
+
+    OBRIGATORIO porque o unico indice de `establishment_cnaes` comeca em
+    `municipality_id` (ver models.EstablishmentCnae): sem cidade nem estado no
+    WHERE nao ha prefixo pra usar e a busca viraria uma varredura da tabela
+    inteira -- exatamente o caso que essa rota existe pra nao ter.
+
+    EXCLUSIVO porque um recorte ja contem o outro. Aceitar os dois juntos so
+    criaria a combinacao que se contradiz (cidade fora do estado), que devolve
+    vazio sem erro nenhum -- e um jeito calado de a busca parecer quebrada.
+    """
+    if (uf is None) == (municipality_code is None):
+        raise HTTPException(
+            422,
+            "Informe exatamente um recorte geográfico: `uf` OU `municipality_code` "
+            "(código IBGE da cidade) -- nunca os dois, nunca nenhum.",
+        )
+
+    if municipality_code is not None:
+        digits = "".join(c for c in municipality_code if c.isdigit())
+        if not digits:
+            raise HTTPException(422, f"Código IBGE de município inválido: {municipality_code!r}")
+        return "municipality", int(digits)
+
+    code = uf_code(uf)
+    if code is None:
+        raise HTTPException(422, f"UF desconhecida: {uf!r}")
+    return "uf", code
+
+
 def _apply_filters(
     query: ORMQuery,
     *,
     cnae_codes: list[str] | None,
-    uf: list[str] | None,
-    region: str | None,
-    municipality_codes: list[str] | None,
-    company_size: list[str] | None,
+    uf: str | None,
+    municipality_code: str | None,
     is_mei: bool | None,
     is_simples: bool | None,
     is_headquarters: bool | None,
-    name: str | None,
-    status: list[str] | None,
     only_with_cellphone: bool,
     only_with_email: bool,
-    has_phone: bool | None,
-    opened_after: date | None,
-    opened_before: date | None,
 ) -> ORMQuery:
-    # UF antes do CNAE porque o filtro de CNAE reaproveita os codigos: eles vao
-    # empurrados pra DENTRO da subquery da tabela N:N (ver abaixo).
-    ufs = set(uf or [])
-    if region:
-        region_ufs = ufs_for_region(region)
-        if not region_ufs:
-            raise HTTPException(422, f"Região desconhecida: {region!r} (use norte/nordeste/centro-oeste/sudeste/sul)")
-        ufs |= set(region_ufs)
-    uf_codes: list[int] = []
-    if ufs:
-        uf_codes = [uf_code(u) for u in ufs]
-        unknown = [u for u, c in zip(ufs, uf_codes) if c is None]
-        if unknown:
-            raise HTTPException(422, f"UF desconhecida: {sorted(unknown)}")
-        query = query.filter(Establishment.uf.in_(uf_codes))
+    """A busca inteira, numa forma so:
 
-    # Cidade ANTES do CNAE, como a UF e pelo mesmo motivo: `municipality_id` vai
-    # empurrado pra DENTRO da subquery da tabela N:N.
-    municipality_ids: list[int] = []
-    if municipality_codes:
-        receita_codes = [int(c) for c in municipality_codes if str(c).strip().isdigit()]
-        if not receita_codes:
-            raise HTTPException(422, f"Código de município inválido: {municipality_codes}")
-        # Resolve receita_code -> id AQUI, numa consulta a parte, em vez de
-        # deixar como subquery correlacionada (`.has(...)`). A tabela tem ~5.570
-        # linhas, entao isso e uma consulta de microssegundos; como `.has()`,
-        # virava um EXISTS reavaliado por linha candidata de `establishments` --
-        # sem indice util, filtrar por cidade saia mais caro que nao filtrar.
-        municipality_ids = [
-            row[0] for row in query.session.query(Municipality.id)
-            .filter(Municipality.receita_code.in_(receita_codes)).all()
-        ]
-        if not municipality_ids:
-            raise HTTPException(422, f"Município não encontrado: {municipality_codes}")
-        query = query.filter(Establishment.municipality_id.in_(municipality_ids))
+        SELECT establishments.* FROM establishment_cnaes
+        JOIN establishments ON establishment_cnaes.cnpj = establishments.cnpj
+        JOIN municipalities ON municipalities.id = establishment_cnaes.municipality_id
+        WHERE cnae IN (?) AND municipalities.ibge_code = ?   -- ou .uf = ?
+          AND has_cellphone = ?
+        ORDER BY cnpj LIMIT ?
+
+    A ENTRADA e `establishment_cnaes`, nao `establishments`. E a inversao que
+    faz essa rota funcionar: a tabela N:N tem `(municipality_id, cnae, cnpj)`
+    num indice so, entao lugar e CNAE sao igualdade nas duas primeiras colunas
+    e o corte sai de uma faixa continua do indice. `establishments` entra
+    depois, pela PK, uma linha por resultado da pagina.
+
+    Era ao contrario, e por isso dava timeout: a query saia de `establishments`
+    com `cnpj IN (subquery)` mais `municipality_id`/`uf` repetidos no WHERE de
+    fora. Com `ORDER BY cnpj LIMIT 25` e sem indice de `municipality_id`
+    naquela tabela, o planner varria a PK em ordem de `cnpj` NACIONAL filtrando
+    linha a linha ate juntar 25 de uma cidade -- dezenas de milhoes de linhas
+    pra devolver 25.
+
+    A UF vem de `municipalities`, nao de uma copia aqui: sao ~5.570 linhas, o
+    join custa um hash, e o estado vira uma faixa por municipio no mesmo
+    indice.
+
+    Os filtros que sobraram de `establishments` (MEI, Simples, matriz, email)
+    nao tem indice e nao precisam: eles rodam por linha sobre o punhado que o
+    join ja selecionou.
+    """
+    kind, place = _resolve_place(uf, municipality_code)
+
+    query = query.join(
+        EstablishmentCnae, EstablishmentCnae.cnpj == Establishment.cnpj
+    ).join(
+        Municipality, Municipality.id == EstablishmentCnae.municipality_id
+    )
+
+    if kind == "municipality":
+        query = query.filter(Municipality.ibge_code == place)
+    else:
+        query = query.filter(Municipality.uf == place)
 
     if cnae_codes:
-        # Semi-join na tabela N:N: "as empresas que tem algum destes CNAEs".
-        # Antes era `main_cnae = X OR secondary_cnaes && [X]`, um OR entre btree
-        # e GIN que nao produz saida ordenada por `cnpj` -- e com `ORDER BY cnpj
-        # LIMIT n` o planner acabava varrendo a PK filtrando linha a linha, as
-        # 63M. Aqui e igualdade numa coluna so.
-        #
-        # Os filtros de recorte sao REPETIDOS dentro da subquery, mesmo ja
-        # estando no WHERE de fora. E o ponto todo de a tabela N:N carregar
-        # copias de `uf`, `municipality_id` e `has_cellphone`: com elas aqui, um
-        # indice unico devolve os candidatos ja filtrados e em ordem de `cnpj`;
-        # sem elas, o banco traria todos os candidatos do CNAE no pais inteiro
-        # pra descobrir na tabela grande, um por um, quais servem.
-        #
-        # Um `IN` numa coluna so, e nao um ramo por CNAE unido por UNION ALL.
-        # O UNION ALL foi tentado e MEDIDO (8M linhas sinteticas): o Postgres
-        # nao gera MergeAppend a partir dele -- sai `Append` + `Sort`, ou seja o
-        # mesmo trabalho do `IN` com um no a mais. O `IN` ficou mais rapido
-        # (1.9ms contra 2.7ms) e e mais simples.
-        #
-        # MergeAppend so aparece com `ORDER BY cnpj LIMIT n` DENTRO de cada
-        # ramo (medido: 0.23ms, lendo 27 linhas em vez de 19 mil). Mas isso e
-        # INCORRETO aqui: a subquery nao carrega todos os filtros da busca --
-        # porte, MEI, situacao, nome e data ficam no WHERE de fora. Um ramo que
-        # devolve so as 25 primeiras entrega candidatos que o filtro externo
-        # ainda pode descartar, e a pagina viria curta calada, perdendo linhas.
-        # So daria pra usar se a subquery fosse o filtro inteiro.
-        #
-        # O que sobra do `Sort` aqui e barato porque `municipality_id`/`uf`
-        # podam o conjunto ANTES dele: sao dezenas de milhares de linhas, nao
-        # milhoes. O caso que continua caro e multi-CNAE sem cidade nem UF --
-        # ver o comentario no fim de _apply_filters.
-        codes = _cnae_codes_to_int(cnae_codes)
-        codes_matching = select(EstablishmentCnae.cnpj).where(EstablishmentCnae.cnae.in_(codes))
-        if municipality_ids:
-            # Cidade e mais seletiva que UF e ja a implica, entao aqui vai so
-            # ela -- e o que faz a subquery cair no indice
-            # (cnae, municipality_id, cnpj). Somar a UF junto so daria ao
-            # planner motivo pra hesitar entre os dois indices; o predicado de
-            # UF continua no WHERE de fora, onde custa nada.
-            codes_matching = codes_matching.where(
-                EstablishmentCnae.municipality_id.in_(municipality_ids))
-        elif uf_codes:
-            codes_matching = codes_matching.where(EstablishmentCnae.uf.in_(uf_codes))
-        if only_with_cellphone:
-            # A coluna crua, sem `== True`/`IS TRUE`: e a forma que casa
-            # LITERALMENTE com o predicado do indice parcial
-            # (`... WHERE has_cellphone`). O Postgres so usa um indice parcial
-            # se conseguir provar o predicado a partir do WHERE, e escrever isso
-            # de outro jeito e apostar nessa prova sem precisar.
-            codes_matching = codes_matching.where(EstablishmentCnae.has_cellphone)
-        matching = codes_matching
-        query = query.filter(Establishment.cnpj.in_(matching))
+        query = query.filter(EstablishmentCnae.cnae.in_(_cnae_codes_to_int(cnae_codes)))
 
-    if company_size:
-        sizes = [int(c) for c in company_size if str(c).strip().isdigit()]
-        if not sizes:
-            raise HTTPException(422, f"Código de porte inválido: {company_size}")
-        query = query.filter(Establishment.company_size.in_(sizes))
+    if only_with_cellphone:
+        # A copia da tabela N:N, e nao `establishments.cellphone IS NOT NULL`:
+        # e o mesmo predicado (a coluna e essa comparacao, materializada no
+        # import) resolvido do lado que a busca ja esta varrendo.
+        query = query.filter(EstablishmentCnae.has_cellphone)
+
+    # Uma empresa tem uma linha na N:N por CNAE distinto -- todas com o mesmo
+    # `municipality_id`. Sem isto, uma busca por cidade devolveria a mesma
+    # empresa uma vez por CNAE dela, e uma busca por dois CNAEs devolveria
+    # duas vezes quem tem os dois.
+    #
+    # DISTINCT ON e nao DISTINCT: o segundo compara a linha inteira (inclusive
+    # o JSONB de `address`), o primeiro para no `cnpj`. Sem ORDER BY o Postgres
+    # aceita e escolhe uma linha arbitraria de cada grupo -- e aqui tanto faz
+    # qual: todas trazem a MESMA linha de `establishments`, so diferem no CNAE
+    # que casou, que nao vai pra resposta.
+    query = query.distinct(EstablishmentCnae.cnpj)
 
     if is_mei is not None:
         query = query.filter(Establishment.is_mei == is_mei)
@@ -382,29 +366,8 @@ def _apply_filters(
     if is_headquarters is not None:
         query = query.filter(Establishment.is_headquarters == is_headquarters)
 
-    if name:
-        pattern = f"%{name}%"
-        query = query.filter(
-            or_(Establishment.company_name.ilike(pattern), Establishment.trade_name.ilike(pattern))
-        )
-
-    if status:
-        query = query.filter(Establishment.registration_status.in_(_resolve_status_codes(status)))
-
-    if only_with_cellphone:
-        query = query.filter(Establishment.cellphone.isnot(None))
-
     if only_with_email:
         query = query.filter(Establishment.email.isnot(None))
-
-    if has_phone is not None:
-        query = query.filter(Establishment.phone.isnot(None) if has_phone else Establishment.phone.is_(None))
-
-    if opened_after:
-        query = query.filter(Establishment.opened_at >= opened_after)
-
-    if opened_before:
-        query = query.filter(Establishment.opened_at <= opened_before)
 
     return query
 
@@ -416,81 +379,64 @@ def search(
         description="Códigos CNAE (principal ou secundário). Com vários, casa quem tem "
                     "ao menos um deles.",
     ),
-    uf: list[str] | None = Query(None, description="Uma ou mais UFs, ex: ?uf=SP&uf=RJ"),
-    region: str | None = Query(None, description="norte/nordeste/centro-oeste/sudeste/sul, combina com uf"),
-    municipality_codes: list[str] | None = Query(None),
-    company_size: list[str] | None = Query(None, description="Códigos de porte (00/01/03/05), aceita múltiplos"),
+    uf: str | None = Query(
+        None, description="Sigla do estado, ex: RS. Exclusivo com `municipality_code`."
+    ),
+    municipality_code: str | None = Query(
+        None,
+        description="Código IBGE da cidade (7 dígitos). Exclusivo com `uf`. Um dos dois "
+                    "é obrigatório.",
+    ),
     is_mei: bool | None = Query(None),
     is_simples: bool | None = Query(None),
     is_headquarters: bool | None = Query(None),
-    name: str | None = Query(None, description="Busca por razão social ou name fantasia"),
-    status: list[str] | None = Query(
-        None, description="Código (01/02/03/04/08) ou label (nula/ativa/suspensa/inapta/baixada); sem filtro, mostra todas"
-    ),
     only_with_cellphone: bool = Query(True),
     only_with_email: bool = Query(False),
-    has_phone: bool | None = Query(None, description="Filtra por ter (true) ou não ter (false) telefone fixo"),
-    opened_after: date | None = Query(None, description="Data de abertura >= (YYYY-MM-DD)"),
-    opened_before: date | None = Query(None, description="Data de abertura <= (YYYY-MM-DD)"),
-    cursor: str | None = Query(
-        None,
-        description="Cursor da página anterior (`next_cursor`). Sem ele, começa do início. "
-                    "Filtros e ordenação precisam ser os mesmos que geraram o cursor.",
-    ),
+    offset: int = Query(0, ge=0, description="Quantas linhas pular. Página seguinte: offset + limit."),
     limit: int = Query(25, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
-    """Busca paginada por cursor: devolve `next_cursor`, que você repassa em
-    `?cursor=` pra próxima página. Não há `total` nem número de páginas --
-    contá-los custaria uma varredura completa da tabela a cada request (ver
-    app/pagination.py).
+    """Busca paginada por `offset`/`limit`. Não há `total` nem número de
+    páginas -- contá-los custaria uma varredura completa a cada request.
+    `has_more` diz se existe próxima página, e sai de graça (lê uma linha a
+    mais que o `limit`).
 
-    O resultado sai sempre na ordem da chave primária, e isso não é
-    configurável: ordenar por qualquer outra coluna obriga o banco a ordenar o
-    resultado filtrado inteiro antes de cortar a página, e nenhum `limit`
-    escapa disso."""
+    O recorte geográfico (`uf` ou `municipality_code`, exatamente um) é
+    obrigatório: é o que faz a busca entrar pelo índice em vez de varrer a
+    tabela, e é também o que torna o `OFFSET` viável -- ver `_apply_filters`.
+
+    SEM `ORDER BY`. As linhas saem na ordem em que o índice
+    `(municipality_id, cnae, cnpj)` as entrega, que para um recorte de uma
+    cidade e um CNAE já é a ordem de `cnpj`. O banco não *garante* ordem sem
+    `ORDER BY`, e a consequência é real: se o plano mudar entre duas
+    requisições, uma página pode repetir ou pular linhas. O que segura isso
+    aqui é a propriedade da base -- `establishments` e `establishment_cnaes`
+    nunca são escritas em uso, só substituídas inteiras num RENAME atômico
+    (ver _build_final_table), então dentro de um mesmo snapshot a mesma query
+    tem o mesmo plano e a mesma ordem."""
     query = _apply_filters(
         db.query(Establishment),
         cnae_codes=cnae_codes,
         uf=uf,
-        region=region,
-        municipality_codes=municipality_codes,
-        company_size=company_size,
+        municipality_code=municipality_code,
         is_mei=is_mei,
         is_simples=is_simples,
         is_headquarters=is_headquarters,
-        name=name,
-        status=status,
         only_with_cellphone=only_with_cellphone,
         only_with_email=only_with_email,
-        has_phone=has_phone,
-        opened_after=opened_after,
-        opened_before=opened_before,
     )
 
-    # SEMPRE a PK, e so ela. O endpoint ja aceitou `sort_by`/`sort_dir`; foram
-    # removidos porque eram uma armadilha exposta como funcionalidade. Ordenar
-    # por coluna nao-chave obriga o banco a ordenar o resultado filtrado
-    # INTEIRO antes de cortar a pagina -- pra saber quem tem o maior
-    # `cellphone_confidence` em PR ele precisa olhar todas as linhas de PR, e
-    # o `limit` nao ajuda. Era o que levava `?uf=PR&limit=1` a timeout.
-    #
-    # A PK sozinha ja e uma ordem TOTAL, entao serve de cursor sem desempate.
-    keys = [SortKey(Establishment.cnpj, "cnpj", nullable=False)]
+    # Uma linha a mais que o pedido: a existencia dela E a resposta de
+    # "tem proxima pagina?", sem contar nada. Ela nao vai pra resposta.
+    rows = query.offset(offset).limit(limit + 1).all()
+    has_more = len(rows) > limit
 
-    items, next_cursor = paginate(
-        query, keys, cursor, limit,
-        make_fingerprint(
-            cnae_codes=cnae_codes, uf=uf, region=region,
-            municipality_codes=municipality_codes, company_size=company_size, is_mei=is_mei,
-            is_simples=is_simples, is_headquarters=is_headquarters, name=name,
-            status=status, only_with_cellphone=only_with_cellphone,
-            only_with_email=only_with_email, has_phone=has_phone,
-            opened_after=opened_after, opened_before=opened_before,
-        ),
+    return EstablishmentPage(
+        data=_serialize_many(db, rows[:limit]),
+        offset=offset,
+        limit=limit,
+        has_more=has_more,
     )
-
-    return EstablishmentPage(data=_serialize_many(db, items), next_cursor=next_cursor, limit=limit)
 
 
 @router.get("/by-cnpj", response_model=list[EstablishmentOut])
@@ -540,9 +486,7 @@ def _rollup_query(
     db: Session,
     model,
     *,
-    uf_codes: list[int],
-    company_size: list[str] | None,
-    status: list[str] | None,
+    uf_code_value: int | None,
     is_mei: bool | None,
     is_simples: bool | None,
     is_headquarters: bool | None,
@@ -556,12 +500,8 @@ def _rollup_query(
     S = model
     query = db.query(model)
 
-    if uf_codes:
-        query = query.filter(S.uf.in_(uf_codes))
-    if company_size:
-        query = query.filter(S.company_size.in_([int(c) for c in company_size if str(c).strip().isdigit()]))
-    if status:
-        query = query.filter(S.registration_status.in_(_resolve_status_codes(status)))
+    if uf_code_value is not None:
+        query = query.filter(S.uf == uf_code_value)
     if is_mei is not None:
         query = query.filter(S.is_mei.is_(is_mei))
     if is_simples is not None:
@@ -575,20 +515,13 @@ def _rollup_query(
 @router.get("/stats", response_model=EstablishmentStatsOut)
 def stats(
     cnae_codes: list[str] | None = Query(None),
-    uf: list[str] | None = Query(None),
-    region: str | None = Query(None),
-    municipality_codes: list[str] | None = Query(None),
-    company_size: list[str] | None = Query(None),
+    uf: str | None = Query(None, description="Sigla do estado. Exclusivo com `municipality_code`."),
+    municipality_code: str | None = Query(None, description="Código IBGE da cidade. Exclusivo com `uf`."),
     is_mei: bool | None = Query(None),
     is_simples: bool | None = Query(None),
     is_headquarters: bool | None = Query(None),
-    name: str | None = Query(None),
-    status: list[str] | None = Query(None),
     only_with_cellphone: bool = Query(False),
     only_with_email: bool = Query(False),
-    has_phone: bool | None = Query(None),
-    opened_after: date | None = Query(None),
-    opened_before: date | None = Query(None),
     top_cnaes: int = Query(10, ge=1, le=50),
     include_breakdowns: bool = Query(
         False,
@@ -606,29 +539,17 @@ def stats(
         db.query(Establishment),
         cnae_codes=cnae_codes,
         uf=uf,
-        region=region,
-        municipality_codes=municipality_codes,
-        company_size=company_size,
+        municipality_code=municipality_code,
         is_mei=is_mei,
         is_simples=is_simples,
         is_headquarters=is_headquarters,
-        name=name,
-        status=status,
         only_with_cellphone=only_with_cellphone,
         only_with_email=only_with_email,
-        has_phone=has_phone,
-        opened_after=opened_after,
-        opened_before=opened_before,
     )
 
-    # As UFs que sobraram depois de resolver `region` -- mesma conta que
-    # `_apply_filters` faz. Serve pra saber quando `by_uf` e deduzivel do total
-    # em vez de precisar de um GROUP BY. `_apply_filters` ja validou os nomes,
-    # entao aqui nao ha UF desconhecida.
-    resolved_ufs = set(uf or [])
-    if region:
-        resolved_ufs |= set(ufs_for_region(region))
-    uf_codes = [uf_code(u) for u in sorted(resolved_ufs)]
+    # `_apply_filters` ja validou (exatamente um dos dois, e a UF existe).
+    kind, place = _resolve_place(uf, municipality_code)
+    uf_code_value = place if kind == "uf" else None
 
     # Um unico CNAE tem resposta exata no agregado por CNAE. Varios nao: uma
     # empresa que tenha dois deles esta em dois baldes e a soma a contaria duas
@@ -640,9 +561,10 @@ def stats(
             single_cnae = codes[0]
 
     # Filtros que agregado nenhum carrega -- ver models.EstablishmentStats.
+    # `municipality_code` nao e dimensao de nenhum dos dois agregados (o grao
+    # deles para na UF), entao busca por cidade sempre cai na tabela grande.
     uncovered = bool(
-        name or municipality_codes or opened_after or opened_before
-        or has_phone is not None
+        uf_code_value is None
         or (cnae_codes and single_cnae is None)
         # Com filtro de CNAE o `top_cnaes` seria "os CNAEs principais de quem
         # tem este CNAE", e `main_cnae` nao e dimensao do agregado por CNAE.
@@ -660,7 +582,7 @@ def stats(
     else:
         model = C if single_cnae is not None else S
         rollup = _rollup_query(
-            db, model, uf_codes=uf_codes, company_size=company_size, status=status,
+            db, model, uf_code_value=uf_code_value,
             is_mei=is_mei, is_simples=is_simples, is_headquarters=is_headquarters,
         )
         if single_cnae is not None:
@@ -707,9 +629,9 @@ def stats(
             .filter(Establishment.main_cnae.isnot(None))
             .group_by(Establishment.main_cnae).all()
         )
-    elif len(uf_codes) == 1:
+    elif uf_code_value is not None:
         # Filtrando por uma UF so, `by_uf` e o proprio total -- sem consulta.
-        by_uf_rows = [(uf_codes[0], total)]
+        by_uf_rows = [(uf_code_value, total)]
 
     # A ordenacao por contagem acontece aqui, sobre dezenas/centenas de linhas
     # ja agregadas -- de graca, e sem pedir sort nenhum ao banco.
