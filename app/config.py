@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     build_work_mem_mb: int = 512
     build_maintenance_work_mem_mb: int = 1024
 
+    # Chave usada para autenticar as rotas da API, enviada no header
+    # `Authorization` (sem prefixo Bearer, direto o valor da chave).
+    api_key: str = ""
+
     class Config:
         env_prefix = "APP_"
 

@@ -3,6 +3,7 @@ from datetime import date, datetime
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Computed,
     Date,
     DateTime,
     ForeignKey,
@@ -15,7 +16,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -514,11 +515,17 @@ class PostalCode(Base):
     """
 
     __tablename__ = "postal_codes"
-    __table_args__ = tuple(
-        # Os tres filtros de texto de /addresses/search sao ILIKE '%x%'.
-        Index(f"ix_postal_codes_{col}_trgm", col,
-              postgresql_using="gin", postgresql_ops={col: "gin_trgm_ops"})
-        for col in ("street", "district", "municipality")
+    __table_args__ = (
+        *(
+            # Os tres filtros de texto de /addresses/search sao ILIKE '%x%'.
+            Index(f"ix_postal_codes_{col}_trgm", col,
+                  postgresql_using="gin", postgresql_ops={col: "gin_trgm_ops"})
+            for col in ("street", "district", "municipality")
+        ),
+        # Busca livre de /addresses/search-text -- ver migration
+        # c9f3a6e1d5b7 pro motivo de ser tsvector e nao mais um ILIKE por
+        # palavra.
+        Index("ix_postal_codes_address_tsv", "address_tsv", postgresql_using="gin"),
     )
 
     cep: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
@@ -546,6 +553,20 @@ class PostalCode(Base):
     # 'brasilapi_sem_coordenada' pra marcar "ja perguntei e nao tem" e nao
     # bater na API de novo pelo mesmo CEP. NULL = nunca foi buscada.
     coord_source: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    # Gerada pelo banco (GENERATED ALWAYS ... STORED) a partir de
+    # street/district/municipality/uf -- nunca escrita pela ORM, so lida em
+    # SQL cru no `/addresses/search-text`. Ver migration c9f3a6e1d5b7.
+    address_tsv: Mapped[str | None] = mapped_column(
+        TSVECTOR,
+        Computed(
+            "to_tsvector('portuguese', "
+            "coalesce(street, '') || ' ' || coalesce(district, '') || ' ' || "
+            "coalesce(municipality, '') || ' ' || coalesce(uf, '') || ' ' || "
+            "coalesce(uf_full_name(uf), ''))",
+            persisted=True,
+        ),
+        nullable=True,
+    )
 
 
 class ImportFile(Base):

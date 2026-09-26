@@ -290,6 +290,95 @@ def search_address(
     return AddressPageOut(data=rows, next_cursor=encode_cursor(values, fingerprint), limit=limit)
 
 
+@router.get("/search-text", response_model=AddressPageOut)
+def search_address_free_text(
+    q: str = Query(..., min_length=1, description="Texto livre, ex: 'santa maria camobi rua 17 de maio'"),
+    lat: float | None = Query(None, description="Ordena por distância a partir daqui (combine com lon)"),
+    lon: float | None = Query(None, description="Ordena por distância a partir daqui (combine com lat)"),
+    cursor: str | None = Query(
+        None,
+        description="Cursor da página anterior (`next_cursor`). O texto (e lat/lon) precisam ser os mesmos que geraram o cursor.",
+    ),
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """Busca por texto livre, sem campo por campo: a pessoa digita algo como
+    "santa maria camobi rua 17 de maio" ou "rio de janeiro rua setembro azul"
+    e a busca acha o endereço mesmo sem saber (ou informar) o que é rua, bairro
+    ou município -- e nem em que ordem vêm.
+
+    Usa full-text search do Postgres (`websearch_to_tsquery`) contra uma
+    coluna `address_tsv` (gerada pelo banco a partir de
+    street+district+municipality+uf, incluindo o nome completo do estado --
+    "rs" e "rio grande do sul" acham a mesma coisa), indexada com GIN. Isso
+    resolve "fora de ordem" nativamente (é busca por conjunto de palavras, não
+    substring) e já ignora preposições sozinho, sem lista de stopwords mantida
+    à mão. Ver migration `c9f3a6e1d5b7` para o motivo de não ser mais um ILIKE
+    por palavra como a primeira versão desse endpoint.
+
+    Passando `lat`+`lon`, ordena por distância em vez de relevância textual --
+    mesmo mecanismo de `/addresses/search` (coordenada exata do CEP, ou
+    centroide do município como fallback; `exact` no resultado diz qual foi
+    usada). Paginada por cursor, igual aos outros endpoints de endereço."""
+    conditions = ["address_tsv @@ websearch_to_tsquery('portuguese', :q)"]
+    params: dict = {"limit": limit + 1, "q": q}
+
+    fingerprint = make_fingerprint(q=q, lat=lat, lon=lon)
+
+    order_by_distance = lat is not None and lon is not None
+    if order_by_distance:
+        params["lat"], params["lon"] = lat, lon
+        conditions = conditions + ["coord.lat_final IS NOT NULL"]
+        keys = [
+            SqlSortKey(_DISTANCE_KM_SQL, "distance_km", nullable=False),
+            SqlSortKey("e.cep", "cep", nullable=False),
+        ]
+    else:
+        # Full-text nao tem rank por indice (ts_rank exige calcular pra cada
+        # linha achada, nao e algo que um GIN resolve de graca) -- ordena pela
+        # PK, mesmo raciocinio do /addresses/search sem lat/lon.
+        keys = [SqlSortKey("cep", "cep", nullable=False)]
+
+    if cursor:
+        position = decode_cursor(cursor, fingerprint)
+        keyset = keyset_sql(keys, position.values, params)
+        if keyset is None:
+            return AddressPageOut(data=[], next_cursor=None, limit=limit)
+        conditions = conditions + [keyset]
+
+    where_sql = f"WHERE {' AND '.join(conditions)}"
+
+    if order_by_distance:
+        query_sql = f"""
+            SELECT {_POSTAL_CODES_COLUMNS_PREFIXED_E}, coord.exact, {_DISTANCE_KM_SQL} AS distance_km
+            FROM {POSTAL_CODES_TABLE} e
+            {_COORD_JOIN_SQL}
+            {where_sql}
+            ORDER BY {order_by_sql(keys)}
+            LIMIT :limit
+        """
+    else:
+        query_sql = f"""
+            SELECT {POSTAL_CODES_COLUMNS} FROM {POSTAL_CODES_TABLE}
+            {where_sql}
+            ORDER BY {order_by_sql(keys)}
+            LIMIT :limit
+        """
+
+    rows = [dict(row._mapping) for row in db.execute(text(query_sql), params)]
+
+    if len(rows) <= limit:
+        return AddressPageOut(data=rows, next_cursor=None, limit=limit)
+
+    rows = rows[:limit]
+    last = rows[-1]
+    values = tuple(
+        ceps.to_int(last[k.alias]) if k.alias == "cep" else last[k.alias]
+        for k in keys
+    )
+    return AddressPageOut(data=rows, next_cursor=encode_cursor(values, fingerprint), limit=limit)
+
+
 @router.get("/nearby")
 def addresses_nearby(
     lat: float = Query(..., description="Latitude do ponto de referência"),
